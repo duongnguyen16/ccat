@@ -1,4 +1,4 @@
-<p align="center"><img src="ccat.png" alt="ccat" width="120"></p>
+<p align="center"><img src="icon.png" alt="ccat" width="120"></p>
 
 # ccat
 
@@ -7,12 +7,12 @@
 <p align="center">
   <img src="docs/launcher.png" alt="ccat launcher: provider, folder, bypass permissions, Launch" width="360">
   &nbsp;
-  <img src="docs/config.png" alt="ccat config: an Antigravity provider with two Google accounts and per-tier models" width="330">
 </p>
 
 ```
 ccat              # pick provider + folder, then Claude Code starts in this terminal
 ccat --resume     # extra arguments go straight to claude
+ccat --version    # the only flag ccat keeps for itself
 ```
 
 ccat never edits your Claude config. Every override lives only in the child process's environment and flags, so a plain `claude` session stays exactly as it was.
@@ -28,20 +28,20 @@ ccat never edits your Claude config. Every override lives only in the child proc
 
 What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 
-| Capability | Antigravity | ccat (Claude Code) | Notes |
-|---|:---:|:---:|---|
-| Gemini models | ✅ | ✅ | Served by ccat's local proxy |
-| Claude / GPT-OSS on Antigravity quota | ✅ | ✅ | Same Cloud Code backend, same quota buckets |
-| Agent harness | Antigravity agent | ✅ Claude Code | Skills, hooks, plugins, subagents, MCP, plan mode, `/context` |
-| Web search (Google Search) | ✅ | ✅ | Google Search grounding; see [Special features](#special-features) |
-| Image generation / editing | ✅ `generate_image` | ✅ | Bundled MCP tool `mcp__antigravity__generate_image` |
-| Several Google accounts | One signed-in account | ✅ | Pool with automatic rotation when one runs out |
-| Quota in the status line | ✅ built-in | ✅ | `statusline/` script, next to your Claude plan limits |
-| Third-party providers | Google only | ✅ | Any Anthropic-compatible endpoint (OpenRouter, gateways, local servers) |
-| Exact token counts | ✅ | ✅ Gemini / ≈ others | Google's counter on Gemini routes; a calibrated estimate elsewhere |
-| Browser agent | ✅ | ❌ | Not bridged. Use a browser MCP server in Claude Code instead |
-| Knowledge / "brain" memory | ✅ | ➖ | Claude Code has its own memory (`CLAUDE.md`, auto memory) |
-| Voice input, remote control | ✅ | ❌ | Not bridged |
+| Capability                            |      Antigravity      |  ccat (Claude Code)  | Notes                                                                   |
+| ------------------------------------- | :-------------------: | :------------------: | ----------------------------------------------------------------------- |
+| Gemini models                         |          ✅           |          ✅          | Served by ccat's local proxy                                            |
+| Claude / GPT-OSS on Antigravity quota |          ✅           |          ✅          | Same Cloud Code backend, same quota buckets                             |
+| Agent harness                         |   Antigravity agent   |    ✅ Claude Code    | Skills, hooks, plugins, subagents, MCP, plan mode, `/context`           |
+| Web search (Google Search)            |          ✅           |          ✅          | Google Search grounding; see [Special features](#special-features)      |
+| Image generation / editing            |  ✅ `generate_image`  |          ✅          | Bundled MCP tool `mcp__antigravity__generate_image`                     |
+| Several Google accounts               | One signed-in account |          ✅          | Pool with automatic rotation when one runs out                          |
+| Quota in the status line              |      ✅ built-in      |          ✅          | `statusline/` script, next to your Claude plan limits                   |
+| Third-party providers                 |      Google only      |          ✅          | Any Anthropic-compatible endpoint (OpenRouter, gateways, local servers) |
+| Exact token counts                    |          ✅           | ✅ Gemini / ≈ others | Google's counter on Gemini routes; a calibrated estimate elsewhere      |
+| Browser agent                         |          ✅           |          ❌          | Not bridged. Use a browser MCP server in Claude Code instead            |
+| Knowledge / "brain" memory            |          ✅           |          ➖          | Claude Code has its own memory (`CLAUDE.md`, auto memory)               |
+| Voice input, remote control           |          ✅           |          ❌          | Not bridged                                                             |
 
 ✅ supported · ➖ covered differently by Claude Code · ❌ not supported
 
@@ -59,14 +59,15 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
   ```
 
   The Claude/GPT bucket (`◇`) appears only when a ccat Antigravity provider actually maps a non-Gemini model.
+
 - **Stays current.** The backend gates newer models on the client version, so ccat reports the live Antigravity release version, and the list of Claude model names to present as comes from [models.dev](https://models.dev) on every start.
 
 ## Providers
 
-| Provider | What it does |
-|---|---|
-| **Default** | No overrides. Plain `claude` with your normal login. |
-| **Google Antigravity** | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs. |
+| Provider                                   | What it does                                                                                                                                                                                                      |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Default**                                | No overrides. Plain `claude` with your normal login.                                                                                                                                                              |
+| **Google Antigravity**                     | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs.            |
 | **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. |
 
 Providers are profiles: add, clone, rename and delete them in **Config**, then pick one in the launcher. **Bypass permissions** adds `--dangerously-skip-permissions`. Next to Config, the GitHub button opens this repo, and the version label turns into `vX → vY` when a newer release is out (click it to open the release).

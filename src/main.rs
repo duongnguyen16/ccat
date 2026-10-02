@@ -32,8 +32,8 @@ const TIERS: [(&str, &str); 5] = [
     ("Haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
 ];
 const NO_PROVIDER: &str = "Default";
-const KIND_API: &str = "Anthropic-compatible endpoint";
-const KIND_AG: &str = "Google Antigravity (Google accounts)";
+/// The built-in profile's fixed name; every other profile is an Anthropic-compatible endpoint.
+const AG_NAME: &str = "Antigravity";
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
@@ -161,7 +161,7 @@ fn bare_id(m: &str) -> String {
 
 fn load() -> Config {
     let path = config_path();
-    let Ok(text) = fs::read_to_string(&path) else { return Config::default() };
+    let text = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
     let mut cfg: Config = serde_json::from_str(&text).unwrap_or_else(|e| {
         // Don't let the save-on-exit overwrite a file we couldn't read.
         let bad = path.with_extension("json.bad");
@@ -180,7 +180,43 @@ fn load() -> Config {
             *p.tier_mut(t) = v;
         }
     }
+    builtin_antigravity(&mut cfg);
     cfg
+}
+
+/// Antigravity is one built-in profile, always first and never deleted — not a type any profile can switch to
+/// (one stray click on the old Type box turned an OpenRouter profile into an empty Antigravity one).
+/// Older configs: an Antigravity profile with a URL but no accounts was really an endpoint and goes back to being
+/// one; the first with accounts becomes the built-in; any other's accounts merge into it.
+fn builtin_antigravity(cfg: &mut Config) {
+    for p in cfg.providers.iter_mut().filter(|p| p.antigravity && p.accounts.is_empty() && !p.url.trim().is_empty()) {
+        p.antigravity = false;
+    }
+    let main = cfg.providers.iter().position(|p| p.antigravity && !p.accounts.is_empty()).or_else(|| cfg.providers.iter().position(|p| p.antigravity));
+    let mut ag = main.map_or_else(|| Provider { antigravity: true, ..Default::default() }, |i| cfg.providers.remove(i));
+    if cfg.provider == ag.name {
+        cfg.provider = AG_NAME.into();
+    }
+    let mut rest = Vec::new();
+    for mut p in std::mem::take(&mut cfg.providers) {
+        if !p.antigravity {
+            if p.name == AG_NAME {
+                p.name = format!("{AG_NAME} endpoint");
+            }
+            rest.push(p);
+            continue;
+        }
+        for a in p.accounts {
+            if !ag.accounts.iter().any(|x| x.email == a.email) {
+                ag.accounts.push(a);
+            }
+        }
+        if cfg.provider == p.name {
+            cfg.provider = AG_NAME.into();
+        }
+    }
+    ag.name = AG_NAME.into();
+    cfg.providers = std::iter::once(ag).chain(rest).collect();
 }
 
 fn save(cfg: &Config) -> Result<(), String> {
@@ -788,19 +824,7 @@ impl App {
 
     fn providers_tab(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui);
-        if self.cfg.providers.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(28.0);
-                ui.label(RichText::new("No providers yet").size(14.0).strong());
-                hint(ui, "Add an Anthropic-compatible endpoint to route Claude Code through it.");
-                ui.add_space(8.0);
-                if ui.add(egui::Button::new(RichText::new("Add provider").color(p.bg)).fill(p.fg)).clicked() {
-                    self.add_provider();
-                }
-                ui.add_space(28.0);
-            });
-            return;
-        }
+        // Never empty: `load` always puts the built-in Antigravity profile first.
         self.edit = self.edit.min(self.cfg.providers.len() - 1);
 
         ui.horizontal(|ui| {
@@ -814,38 +838,40 @@ impl App {
                     }
                 }
             });
-            if icon_btn(ui, Icon::New).on_hover_text("New provider").clicked() {
+            if icon_btn(ui, Icon::New).on_hover_text("New endpoint provider").clicked() {
                 self.add_provider();
             }
-            if icon_btn(ui, Icon::Clone).on_hover_text("Clone this provider").clicked() {
-                self.clone_provider();
-            }
-            // A running sign-in reports back by provider index, so the list must not shift under it.
-            if icon_btn(ui, Icon::Delete).on_hover_text("Delete this provider").clicked() && self.login.is_none() {
-                let i = self.edit;
-                self.cfg.providers.remove(i);
-                self.sel = match self.sel {
-                    Some(s) if s == i => None,
-                    Some(s) if s > i => Some(s - 1),
-                    s => s,
-                };
-            }
+            // The built-in Antigravity profile is one of a kind: no copies, no deleting.
+            let builtin = self.cfg.providers[self.edit].antigravity;
+            ui.add_enabled_ui(!builtin, |ui| {
+                if icon_btn(ui, Icon::Clone).on_hover_text("Clone this provider").clicked() {
+                    self.clone_provider();
+                }
+                // A running sign-in reports back by provider index, so the list must not shift under it.
+                if icon_btn(ui, Icon::Delete).on_hover_text("Delete this provider").clicked() && self.login.is_none() {
+                    let i = self.edit;
+                    self.cfg.providers.remove(i);
+                    self.edit = i - 1;
+                    self.sel = match self.sel {
+                        Some(s) if s == i => None,
+                        Some(s) if s > i => Some(s - 1),
+                        s => s,
+                    };
+                }
+            })
+            .response
+            .on_disabled_hover_text("Antigravity is built in: it can't be copied or deleted.");
         });
-        if self.cfg.providers.is_empty() {
-            return;
-        }
         ui.add_space(8.0);
 
         let pr = &mut self.cfg.providers[self.edit];
-        label(ui, "Name");
-        ui.add(TextEdit::singleline(&mut pr.name).desired_width(f32::INFINITY));
-        ui.add_space(4.0);
-        label(ui, "Type");
-        egui::ComboBox::from_id_salt("kind").width(ui.available_width()).selected_text(if pr.antigravity { KIND_AG } else { KIND_API }).show_ui(ui, |ui| {
-            plain_rows(ui);
-            ui.selectable_value(&mut pr.antigravity, false, KIND_API);
-            ui.selectable_value(&mut pr.antigravity, true, KIND_AG);
-        });
+        if pr.antigravity {
+            hint(ui, "Built in: Google Antigravity, served through ccat's local proxy from your Google accounts.");
+        } else {
+            label(ui, "Name");
+            ui.add(TextEdit::singleline(&mut pr.name).desired_width(f32::INFINITY));
+            hint(ui, "Anthropic-compatible endpoint.");
+        }
         ui.add_space(4.0);
         if pr.antigravity {
             label(ui, "Google accounts");
@@ -1125,6 +1151,7 @@ impl App {
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut builder = egui::ViewportBuilder::default()
             .with_title("ccat — Providers")
+            .with_icon(app_icon())
             .with_decorations(false)
             .with_resizable(false)
             .with_inner_size([440.0, 480.0]);
@@ -1155,12 +1182,24 @@ impl Drop for App {
 
 // ---------------------------------------------------------------- main / spawn
 
+/// The window/taskbar icon: the repo logo, decoded once (the Providers viewport is rebuilt every frame).
+fn app_icon() -> Arc<egui::IconData> {
+    static ICON: std::sync::OnceLock<Arc<egui::IconData>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png is a valid PNG"))).clone()
+}
+
 fn main() {
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    // Everything else is forwarded to claude, so these two are the only flags ccat keeps for itself.
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("ccat {}", &VERSION[1..]);
+        return;
+    }
+    let cwd =std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let out = Arc::new(Mutex::new(None));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ccat")
+            .with_icon(app_icon())
             .with_decorations(false) // titlebar is drawn by App::titlebar
             .with_resizable(false)
             .with_inner_size([480.0, 400.0]),
@@ -1353,6 +1392,41 @@ mod tests {
         assert!(!is_newer("v0.1.0", "v0.1.0"));
         assert!(!is_newer("v0.1.0-beta", "v0.1.0"), "a pre-release suffix is ignored");
         assert!(!is_newer("garbage", "v0.1.0"));
+    }
+
+    #[test]
+    fn antigravity_is_one_builtin_profile() {
+        let acc = |e: &str| antigravity::Account { email: e.into(), refresh: "r".into(), project: "p".into() };
+        // The config this came from: OpenRouter flipped to Antigravity by a stray click on the old Type box.
+        let mut cfg = Config {
+            provider: "Gehihi".into(),
+            providers: vec![
+                Provider { name: "OpenRouter".into(), antigravity: true, url: "https://openrouter.ai/api/v1".into(), key: "k".into(), ..Default::default() },
+                Provider { name: "Gehihi".into(), antigravity: true, accounts: vec![acc("a@x")], default: "gemini-3.8-flash-tiered".into(), ..Default::default() },
+                Provider { name: "Provider 2".into(), ..Default::default() },
+                Provider { name: "Spare".into(), antigravity: true, accounts: vec![acc("a@x"), acc("b@x")], ..Default::default() },
+                Provider { name: AG_NAME.into(), url: "https://x.io".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        builtin_antigravity(&mut cfg);
+        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, [AG_NAME, "OpenRouter", "Provider 2", "Antigravity endpoint"], "built-in first, the rest keep their order");
+        let ag = &cfg.providers[0];
+        assert!(ag.antigravity && ag.default == "gemini-3.8-flash-tiered", "the profile with accounts became the built-in, tiers kept");
+        assert_eq!(ag.accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), ["a@x", "b@x"], "other Antigravity accounts merged, no duplicates");
+        assert!(!cfg.providers[1].antigravity && cfg.providers[1].key == "k", "OpenRouter is an endpoint again, key intact");
+        assert_eq!(cfg.provider, AG_NAME, "the launch selection follows the rename");
+        assert_eq!(cfg.providers.iter().filter(|p| p.antigravity).count(), 1);
+
+        // Idempotent, and a fresh install gets the built-in too.
+        let before: Vec<String> = cfg.providers.iter().map(|p| p.name.clone()).collect();
+        builtin_antigravity(&mut cfg);
+        assert_eq!(cfg.providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), before);
+        let mut fresh = Config::default();
+        builtin_antigravity(&mut fresh);
+        assert_eq!(fresh.providers.len(), 1);
+        assert!(fresh.providers[0].antigravity && fresh.providers[0].name == AG_NAME);
     }
 
     #[test]
