@@ -31,7 +31,7 @@ const TIERS: [(&str, &str); 5] = [
     ("Sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
     ("Haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
 ];
-const NO_PROVIDER: &str = "Claude — your account (no overrides)";
+const NO_PROVIDER: &str = "Default";
 const KIND_API: &str = "Anthropic-compatible endpoint";
 const KIND_AG: &str = "Google Antigravity (Google accounts)";
 
@@ -99,6 +99,35 @@ fn fetch_claude_models() -> Result<Vec<String>, String> {
         .collect();
     models.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     Ok(models.into_iter().map(|(id, _)| id.to_string()).collect())
+}
+
+const REPO_URL: &str = "https://github.com/duongnguyen16/ccat";
+const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
+/// Tag of the latest GitHub release, e.g. "v0.2.0" (public API, no key).
+fn fetch_latest_release() -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into();
+    let body = agent
+        .get("https://api.github.com/repos/duongnguyen16/ccat/releases/latest")
+        .header("User-Agent", "ccat")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    v["tag_name"].as_str().map(String::from).ok_or_else(|| "the latest release has no tag".into())
+}
+
+/// `v1.10.0` > `1.9.3`: major.minor.patch compared as numbers; a missing or non-numeric part counts as 0.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let parts = |s: &str| {
+        let mut v: Vec<u64> = s.trim_start_matches('v').split(['.', '-', '+']).take(3).map(|x| x.parse().unwrap_or(0)).collect();
+        v.resize(3, 0);
+        v
+    };
+    parts(latest) > parts(current)
 }
 
 /// Spoof candidates for tier `t`: its own family (Fable rows only Fable…); Default may take any.
@@ -476,6 +505,7 @@ enum Icon {
     New,
     Clone,
     Delete,
+    GitHub,
 }
 
 /// 28×28 icon button, drawn with strokes (no icon font): fill only on hover.
@@ -510,6 +540,16 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
             pt.line_segment([c + vec2(-2.0, -5.5), c + vec2(2.0, -5.5)], s);
             pt.rect_stroke(egui::Rect::from_min_max(c + vec2(-4.0, -3.5), c + vec2(4.0, 5.5)), 1.0, s, StrokeKind::Middle);
         }
+        Icon::GitHub => {
+            // The GitHub mark, simplified: a disc with the octocat (head, ears, body, tail) cut out in the background colour.
+            let cut = if hot { p.hover } else { p.bg };
+            pt.circle_filled(c, 7.0, color);
+            pt.circle_filled(c + vec2(0.0, -0.6), 3.4, cut);
+            pt.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -5.2), c + vec2(-0.6, -3.6), c + vec2(-3.4, -1.4)], cut, Stroke::NONE));
+            pt.add(egui::Shape::convex_polygon(vec![c + vec2(3.0, -5.2), c + vec2(3.4, -1.4), c + vec2(0.6, -3.6)], cut, Stroke::NONE));
+            pt.rect_filled(egui::Rect::from_min_max(c + vec2(-1.7, 2.0), c + vec2(1.7, 7.5)), 0.0, cut);
+            pt.line_segment([c + vec2(-1.7, 4.3), c + vec2(-4.2, 2.8)], Stroke::new(1.2, cut));
+        }
     }
     resp
 }
@@ -542,6 +582,9 @@ struct App {
     login: Option<LoginJob>,
     login_err: String,
     claude_list: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    release_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Latest GitHub release tag, once the background check is back.
+    latest: Option<Result<String, String>>,
     out: Arc<Mutex<Option<Launch>>>,
 }
 
@@ -573,6 +616,12 @@ impl App {
             let _ = tx.send(fetch_claude_models());
             repaint.request_repaint();
         });
+        let (rtx, release_rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = rtx.send(fetch_latest_release());
+            repaint.request_repaint();
+        });
         let sel = cfg.providers.iter().position(|p| p.name == cfg.provider);
         // Most recently launched folder first and preselected; the terminal's cwd stays one click away.
         let mut folders = cfg.recents.clone();
@@ -598,6 +647,8 @@ impl App {
             login: None,
             login_err: String::new(),
             claude_list: Some(rx),
+            release_rx: Some(release_rx),
+            latest: None,
             out,
         }
     }
@@ -688,6 +739,19 @@ impl App {
                     .stroke(Stroke::NONE);
                 if ui.add(cfg).clicked() {
                     self.settings = !self.settings;
+                }
+                if icon_btn(ui, Icon::GitHub).on_hover_text(REPO_URL).clicked() {
+                    open_browser(REPO_URL);
+                }
+                let (text, color, tip) = match &self.latest {
+                    None => (VERSION.to_string(), p.subtle, "Checking for updates…".to_string()),
+                    Some(Ok(tag)) if is_newer(tag, VERSION) => (format!("{VERSION} → {tag}"), p.accent, format!("{tag} is available — open the release")),
+                    Some(Ok(_)) => (VERSION.to_string(), p.subtle, "Up to date".to_string()),
+                    Some(Err(e)) => (VERSION.to_string(), p.subtle, format!("Could not check for updates: {e}")),
+                };
+                let v = ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).sense(Sense::click()));
+                if v.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    open_browser(&format!("{REPO_URL}/releases"));
                 }
             });
         });
@@ -902,7 +966,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let choices = claude_choices(&self.cfg.claude_models, t);
                     let mut on = !pr.claude_as[t].is_empty();
-                    if switch(ui, &mut on, "Claude name").on_hover_text("Claude Code treats this tier as the Claude model you pick (context window, thinking) and sends the real id via modelOverrides.").changed() {
+                    if switch(ui, &mut on, "Spoofing").on_hover_text("Claude Code treats this tier as the Claude model you pick (context window, thinking) and sends the real id via modelOverrides.").changed() {
                         pr.claude_as[t] = if on { choices.first().cloned().unwrap_or_default() } else { String::new() };
                     }
                     if on {
@@ -1001,6 +1065,10 @@ impl eframe::App for App {
                 Err(e) => eprintln!("ccat: could not refresh Claude models from models.dev ({e}); using the saved list"),
             }
             self.claude_list = None;
+        }
+        if let Some(r) = self.release_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.latest = Some(r);
+            self.release_rx = None;
         }
         if let Some((i, rx)) = &self.fetch {
             if let Ok(r) = rx.try_recv() {
@@ -1275,6 +1343,16 @@ mod tests {
         assert_eq!(claude_choices(&models, 2), ["claude-opus-5-5"]);
         assert_eq!(claude_choices(&models, 0).len(), 4);
         assert!(claude_choices(&[], 3).iter().all(|m| m.contains("sonnet")), "offline list is used when none was fetched");
+    }
+
+    #[test]
+    fn release_tags_compare_numerically() {
+        assert!(is_newer("v0.2.0", "v0.1.0"));
+        assert!(is_newer("v1.10.0", "v1.9.3"), "10 > 9 as numbers, not text");
+        assert!(is_newer("0.1.1", "v0.1"), "missing parts count as 0");
+        assert!(!is_newer("v0.1.0", "v0.1.0"));
+        assert!(!is_newer("v0.1.0-beta", "v0.1.0"), "a pre-release suffix is ignored");
+        assert!(!is_newer("garbage", "v0.1.0"));
     }
 
     #[test]

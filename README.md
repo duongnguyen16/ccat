@@ -1,6 +1,14 @@
+<p align="center"><img src="ccat.png" alt="ccat" width="120"></p>
+
 # ccat
 
-**Claude Code, any model.** ccat is a small native launcher: pick a provider and a folder, and it runs `claude` in your terminal against that provider. The main target is **Google Antigravity**: your Google accounts' Antigravity quota (Gemini, Claude, GPT-OSS) behind the Claude Code harness you already know. Any Anthropic-compatible endpoint works as well.
+**Claude Code, any model.** ccat is a small native launcher written in Rust: pick a provider and a folder, and it runs `claude` in your terminal against that provider. The main target is **Google Antigravity**: your Google accounts' Antigravity quota (Gemini, Claude, GPT-OSS) behind the Claude Code harness you already know. Any Anthropic-compatible endpoint works as well.
+
+<p align="center">
+  <img src="docs/launcher.png" alt="ccat launcher: provider, folder, bypass permissions, Launch" width="360">
+  &nbsp;
+  <img src="docs/config.png" alt="ccat config: an Antigravity provider with two Google accounts and per-tier models" width="330">
+</p>
 
 ```
 ccat              # pick provider + folder, then Claude Code starts in this terminal
@@ -11,7 +19,10 @@ ccat never edits your Claude config. Every override lives only in the child proc
 
 ## Why
 
-Antigravity's quota is generous, but its agent isn't Claude Code. ccat gives you both: Claude Code's skills, hooks, plugins, subagents, MCP servers and permission model, running on Antigravity models. It also brings over the Antigravity abilities Claude Code has no tool for.
+- **All in one app.** No editing `settings.json`, no exporting `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / model variables by hand. URLs, keys, Google accounts and per-tier models live in profiles you set up once in the UI. Switching between them is one click before launch.
+- **A proxy built in.** Antigravity is served by a proxy inside ccat itself. For this use case you don't need a separate router such as 9Router or OmniRoute to sit between Claude Code and the model.
+- **Claude Code on Antigravity.** Antigravity's quota is generous, but its agent isn't Claude Code. ccat gives you both: Claude Code's skills, hooks, plugins, subagents, MCP servers and permission model, running on Antigravity models, plus the Antigravity abilities Claude Code has no tool for.
+- **Small and fast.** One native Rust binary: egui UI, plain blocking HTTP, no Node, no Python, no Docker, no background service. The proxy is a thin translation layer that only runs while your Claude Code session does.
 
 ## ccat vs Antigravity
 
@@ -54,11 +65,11 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 
 | Provider | What it does |
 |---|---|
-| **Claude: your account** | No overrides. Plain `claude` with your normal login. |
+| **Default** | No overrides. Plain `claude` with your normal login. |
 | **Google Antigravity** | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs. |
 | **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. |
 
-Providers can be cloned, renamed and switched from the launcher. **Bypass permissions** in the launcher adds `--dangerously-skip-permissions`.
+Providers are profiles: add, clone, rename and delete them in **Config**, then pick one in the launcher. **Bypass permissions** adds `--dangerously-skip-permissions`. Next to Config, the GitHub button opens this repo, and the version label turns into `vX → vY` when a newer release is out (click it to open the release).
 
 ## Install
 
