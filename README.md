@@ -74,13 +74,27 @@ Providers are profiles: add, clone, rename and delete them in **Config**, then p
 
 ## Install
 
-Needs [Rust](https://rustup.rs) and [Claude Code](https://docs.claude.com/en/docs/claude-code) on your `PATH`.
+You need [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`) on your `PATH`. ccat itself is a single `ccat.exe`.
+
+**winget** (Windows):
+
+```powershell
+winget install duongnguyen16.ccat
+```
+
+> The winget package was submitted to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/pulls?q=duongnguyen16.ccat) and goes live once that review is merged. Until then, use one of the options below.
+
+**Download:** grab `ccat-v<version>-x86_64-windows.zip` from the [latest release](https://github.com/duongnguyen16/ccat/releases/latest), unzip it, and put `ccat.exe` somewhere on your `PATH`. The binary is not code-signed, so Windows SmartScreen may ask you to confirm the first run.
+
+**From source** (needs [Rust](https://rustup.rs)):
 
 ```bash
 git clone https://github.com/duongnguyen16/ccat
 cd ccat
 cargo install --path .
 ```
+
+Check it with `ccat --version`. Then run `ccat` in any terminal: add your first provider under **Config**, pick a folder and press **Launch**.
 
 Developed and used on Windows. The UI (egui) and the proxy are cross-platform, but macOS and Linux are untested.
 
