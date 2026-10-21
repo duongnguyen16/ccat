@@ -28,9 +28,6 @@ pub struct Bar {
     pub resets: u64,
     /// Window length in seconds (5 h or a week).
     pub window: u64,
-    /// Merged accounts: the soonest of their resets (`resets` is the latest); 0 = a single source.
-    #[serde(default)]
-    pub earliest: u64,
 }
 
 impl Bar {
@@ -39,9 +36,14 @@ impl Bar {
         (self.resets > 0 && self.window > 0).then(|| (1.0 - self.resets.saturating_sub(now) as f64 / self.window as f64).clamp(0.0, 1.0))
     }
 
+    /// Used up as far as anyone can tell: it reads 100% (99.96% left nothing worth a request).
+    pub fn out(&self) -> bool {
+        self.used.round() >= 100.0
+    }
+
     /// How worried to look: used up (red), past 90% or ahead of the time passed (orange), else fine (blue).
     pub fn level(&self, now: u64) -> Level {
-        if self.used >= 100.0 {
+        if self.out() {
             Level::Full
         } else if self.used > 90.0 || self.elapsed(now).is_some_and(|e| self.used > e * 100.0 + 0.5) {
             Level::Warn
@@ -271,7 +273,7 @@ fn plan_name(kind: &str, tier: &str) -> String {
 
 /// Bars from `/api/oauth/usage`: its `limits` list (session, weekly, per-model weekly), or the older top-level fields.
 pub fn parse_claude(v: &Value) -> Vec<Bar> {
-    let bar = |label: String, used: f64, resets: &Value, window| Bar { label, used, resets: resets.as_str().map_or(0, parse_time), window, earliest: 0 };
+    let bar = |label: String, used: f64, resets: &Value, window| Bar { label, used, resets: resets.as_str().map_or(0, parse_time), window };
     let mut bars: Vec<Bar> = v["limits"]
         .as_array()
         .into_iter()
@@ -340,7 +342,7 @@ pub fn parse_wham(v: &Value, now: u64) -> (String, Vec<Bar>) {
     let window = |w: &Value, label: &str, default: u64| {
         let used = w["used_percent"].as_f64()?;
         let resets = w["reset_at"].as_u64().filter(|r| *r > 0).or_else(|| w["reset_after_seconds"].as_u64().map(|s| now + s)).unwrap_or(0);
-        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default), earliest: 0 })
+        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default) })
     };
     let limit = &v["rate_limit"];
     let bars = [window(&limit["primary_window"], "Session (5hr)", FIVE_HOURS), window(&limit["secondary_window"], "Weekly (7 day)", WEEK)].into_iter().flatten().collect();
@@ -409,7 +411,7 @@ pub fn parse_ag(v: &Value) -> Vec<Bar> {
         let group = if id.starts_with("gemini") { "Gemini" } else { "Claude" };
         let (window, label) = if b["window"] == "5h" || id.ends_with("5h") { (FIVE_HOURS, "5hr") } else { (WEEK, "Weekly") };
         let used = (1.0 - b["remainingFraction"].as_f64().unwrap_or(1.0)) * 100.0;
-        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window, earliest: 0 });
+        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window });
     }
     // Session before weekly within a group, as in the Claude section.
     bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
@@ -429,60 +431,77 @@ fn google_token(refresh: &str) -> Result<String, String> {
     Ok(t)
 }
 
-/// "General" (all accounts): per bar, the average use across the accounts that answered, and the latest reset (when every
-/// account is free again).
-pub fn combined<'a>(sources: impl Iterator<Item = &'a Source>) -> Vec<Bar> {
-    merge(sources.filter(|s| s.error.is_empty()))
+/// One model group (Gemini, Claude) across several accounts: how many can serve it right now, per plan, and which
+/// account the bars show.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pool {
+    pub group: String,
+    /// "Free 0/4 · Plus 0/1 · Pro 1/2": accounts with quota left, of those that answered.
+    pub ready: String,
+    /// The account the group's bars are: "duongn (Pro)".
+    pub shown: String,
 }
 
-/// `combined` over whatever last answers the sources hold, failed ones included (the popup shows those greyed out).
-fn merge<'a>(sources: impl Iterator<Item = &'a Source>) -> Vec<Bar> {
-    let sources: Vec<&Source> = sources.collect();
-    let each: Vec<Vec<Bar>> = sources.iter().map(|s| if sources.len() > 1 { effective(&s.bars) } else { s.bars.clone() }).collect();
-    let mut out: Vec<(Bar, u32)> = Vec::new();
-    for b in each.iter().flatten() {
-        match out.iter_mut().find(|(o, _)| o.label == b.label) {
-            Some((o, n)) => {
-                o.used += b.used;
-                let soonest = |a: u64, r: u64| if a == 0 || r == 0 { a.max(r) } else { a.min(r) };
-                o.earliest = soonest(if *n == 1 { o.resets } else { o.earliest }, b.resets);
-                o.resets = match (o.resets, b.resets) {
-                    (0, r) | (r, 0) => r,
-                    (a, r) => a.max(r),
-                };
-                *n += 1;
+/// "General": per group, the bars of the account with the most left right now (none ready: the one back soonest),
+/// so every bar is one real account's 5-hour and weekly buckets. Averaging accounts mixed plans with different
+/// windows and sizes (a free account has no 5-hour bucket) into numbers no account had.
+pub fn pool(sources: &[(&antigravity::Account, &Source)]) -> (Vec<Bar>, Vec<Pool>) {
+    if sources.len() < 2 {
+        return (sources.first().map(|(_, s)| s.bars.clone()).unwrap_or_default(), Vec::new());
+    }
+    let group = |b: &Bar| b.label.split(" (").next().unwrap_or("").to_string();
+    let mut groups: Vec<String> = Vec::new();
+    for b in sources.iter().flat_map(|(_, s)| &s.bars) {
+        if !groups.contains(&group(b)) {
+            groups.push(group(b));
+        }
+    }
+    let (mut bars, mut pools) = (Vec::new(), Vec::new());
+    for g in groups {
+        // (account, its bars of this group, highest use, back at: the latest reset among its used-up buckets)
+        let each: Vec<_> = sources
+            .iter()
+            .map(|(a, s)| {
+                let gb: Vec<Bar> = s.bars.iter().filter(|b| group(b) == g).cloned().collect();
+                let used = gb.iter().map(|b| if b.out() { 100.0 } else { b.used }).fold(0.0, f64::max);
+                let back = gb.iter().filter(|b| b.out()).map(|b| if b.resets == 0 { u64::MAX } else { b.resets }).max().unwrap_or(0);
+                (*a, gb, used, back)
+            })
+            .filter(|(_, gb, ..)| !gb.is_empty())
+            .collect();
+        let best = each.iter().filter(|e| e.2 < 100.0).min_by(|x, y| x.2.total_cmp(&y.2)).or_else(|| each.iter().min_by_key(|e| e.3));
+        let Some((a, gb, ..)) = best else { continue };
+        bars.extend(gb.iter().cloned());
+        // (plan rank, ready, accounts), lowest plan first: the order the proxy spends them in.
+        let mut tiers: Vec<(u8, usize, usize)> = Vec::new();
+        for (a, _, used, _) in &each {
+            let (r, ok) = (antigravity::rank(&a.plan), (*used < 100.0) as usize);
+            match tiers.iter_mut().find(|t| t.0 == r) {
+                Some(t) => (t.1, t.2) = (t.1 + ok, t.2 + 1),
+                None => tiers.push((r, ok, 1)),
             }
-            None => out.push((b.clone(), 1)),
         }
+        tiers.sort();
+        let name = |r: u8| ["Free", "Unknown", "Plus", "Pro", "Ultra"][r as usize];
+        let ready = tiers.iter().map(|(r, n, of)| format!("{} {n}/{of}", name(*r))).collect::<Vec<_>>().join(" · ");
+        let alias = a.email.split('@').next().unwrap_or(&a.email);
+        let plan = antigravity::plan_label(&a.plan);
+        pools.push(Pool { group: g, ready, shown: if plan.is_empty() { alias.to_string() } else { format!("{alias} ({plan})") } });
     }
-    let mut bars: Vec<Bar> = out.into_iter().map(|(mut b, n)| {
-        b.used /= n as f64;
-        b
-    }).collect();
     bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
-    bars
+    (bars, pools)
 }
 
-/// One account's bars for a merge: its 5-hour bar stands for how blocked the account is right now, the higher of
-/// its 5-hour and weekly use. An account with only a weekly limit (free plans) gets one from its weekly use, so its
-/// use moves the merged 5-hour bar too, and an account out for the week doesn't look free for five hours.
-fn effective(bars: &[Bar]) -> Vec<Bar> {
-    let mut out = bars.to_vec();
-    for w in bars.iter().filter(|b| b.window == WEEK) {
-        let group = w.label.split(" (").next().unwrap_or("");
-        match out.iter_mut().find(|b| b.window == FIVE_HOURS && b.label.split(" (").next() == Some(group)) {
-            Some(f) => f.used = f.used.max(w.used),
-            // No 5-hour window of its own: it doesn't set the merged reset times.
-            None => out.push(Bar { label: format!("{group} (5hr)"), used: w.used, resets: 0, window: FIVE_HOURS, earliest: 0 }),
-        }
-    }
-    out
+/// The Antigravity bars and pools for `view` ("" = all accounts, else one account's email). Failed accounts are left
+/// out unless `stale` (every one failed: their last answers, greyed out).
+pub fn ag_pool(u: &Usage, accounts: &[antigravity::Account], view: &str, stale: bool) -> (Vec<Bar>, Vec<Pool>) {
+    let mine: Vec<_> = accounts.iter().filter(|a| view.is_empty() || a.email == view).filter_map(|a| u.antigravity.get(&a.email).map(|s| (a, s))).filter(|(_, s)| stale || s.error.is_empty()).collect();
+    pool(&mine)
 }
 
-/// The Antigravity bars to show for `view` ("" = all accounts combined, else one account's email).
+/// The Antigravity bars for `view`: what the tray dial and tooltip show, the same as the popup.
 pub fn ag_view(u: &Usage, accounts: &[antigravity::Account], view: &str) -> Vec<Bar> {
-    let mine = accounts.iter().filter(|a| view.is_empty() || a.email == view).filter_map(|a| u.antigravity.get(&a.email));
-    combined(mine)
+    ag_pool(u, accounts, view, false).0
 }
 
 // ---------------------------------------------------------------- refresh
@@ -1066,6 +1085,7 @@ const RESET_H: f32 = 18.0;
 const BAR_GAP: f32 = 4.0;
 const BAR_BLOCK: f32 = 6.0 + LABEL_H + BAR_GAP + BAR_H + BAR_GAP + RESET_H;
 const ERROR_H: f32 = 17.0;
+const POOL_H: f32 = 6.0 + 18.0;
 /// Between sections, with a 1px rule across its middle; the footer has one above it too.
 const SECTION_GAP: f32 = 21.0;
 const FOOTER_H: f32 = 12.0 + 18.0;
@@ -1101,8 +1121,8 @@ struct Section {
     errors: Vec<String>,
     /// The last fetch failed: the bars are the last answers, drawn greyed out.
     stale: bool,
-    /// The bars merge several accounts, so their reset is the latest of them.
-    latest: bool,
+    /// Antigravity's groups across several accounts, each drawn above its group's bars.
+    pools: Vec<Pool>,
 }
 
 /// The Usage tab's blocks: the shown sources, in the saved order.
@@ -1111,10 +1131,10 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
     let alias = |e: &str| e.split('@').next().unwrap_or(e).to_string();
     let mut out = Vec::new();
     if claude {
-        out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: u.claude.bars.clone(), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty(), latest: false });
+        out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: u.claude.bars.clone(), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty(), pools: Vec::new() });
     }
     if u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty()) {
-        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: u.chatgpt.bars.clone(), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty(), latest: false });
+        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: u.chatgpt.bars.clone(), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty(), pools: Vec::new() });
     }
     if !accounts.is_empty() {
         let mine = accounts.iter().filter(|a| cfg.usage_view.is_empty() || a.email == cfg.usage_view);
@@ -1122,9 +1142,8 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
         let sources: Vec<&Source> = mine.filter_map(|a| u.antigravity.get(&a.email)).collect();
         // Every account failed: show what they last said, greyed out, rather than nothing.
         let stale = !sources.is_empty() && sources.iter().all(|s| !s.error.is_empty());
-        let bars = if stale { merge(sources.iter().copied()) } else { ag_view(u, &accounts, &cfg.usage_view) };
-        let answering = if stale { sources.len() } else { sources.iter().filter(|s| s.error.is_empty()).count() };
-        out.push(Section { src: Src::Antigravity, title: "Antigravity", which: 1, bars, errors, stale, latest: answering > 1 });
+        let (bars, pools) = ag_pool(u, &accounts, &cfg.usage_view, stale);
+        out.push(Section { src: Src::Antigravity, title: "Antigravity", which: 1, bars, errors, stale, pools });
     }
     let keep = shown(cfg, cfg.usage_view_mode, Src::ALL.map(|s| out.iter().any(|x| x.src == s)));
     keep.iter().filter_map(|s| out.iter().position(|x| x.src == *s).map(|i| out.swap_remove(i))).collect()
@@ -1132,7 +1151,7 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
 
 /// The window height the sections need, in points: the same sums the layout below adds up.
 fn height(sections: &[Section]) -> f32 {
-    let body: f32 = sections.iter().map(|s| SECTION_H + s.errors.len() as f32 * ERROR_H + s.bars.len() as f32 * BAR_BLOCK).sum();
+    let body: f32 = sections.iter().map(|s| SECTION_H + s.errors.len() as f32 * ERROR_H + s.bars.len() as f32 * BAR_BLOCK + s.pools.len() as f32 * POOL_H).sum();
     let gaps = sections.len().saturating_sub(1) as f32 * SECTION_GAP;
     let empty = if sections.is_empty() { ERROR_H * 2.0 } else { 0.0 };
     (PAD + HEADER_H + body + gaps + empty + FOOTER_H + PAD).ceil()
@@ -1169,23 +1188,17 @@ fn row<R>(ui: &mut egui::Ui, h: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
     .inner
 }
 
-/// Under a bar. Several accounts whose resets are apart: the soonest and the last ("Earliest in 1h 5m (19:38) ·
-/// latest in 4h 2m (22:35)"); within ten minutes of each other they read as one, like Claude's.
-fn reset_line(b: &Bar, now: u64, merged: bool) -> String {
-    let apart = merged && b.earliest > now && b.resets > b.earliest + 600;
-    if !apart {
-        return reset_text(b.resets, now);
-    }
-    let part = |t| reset_text(t, now).replacen("Resets ", "", 1);
-    format!("Earliest {} · latest {}", part(b.earliest), part(b.resets))
-}
-
-fn bar_ui(ui: &mut egui::Ui, b: &Bar, now: u64, stale: bool, latest: bool) {
+/// `who`: the account a merged group's bars are, beside the first one's label.
+fn bar_ui(ui: &mut egui::Ui, b: &Bar, now: u64, stale: bool, who: Option<&str>) {
     let p = crate::pal(ui);
     let ink = if stale { p.muted } else { p.fg };
     ui.add_space(6.0);
     row(ui, LABEL_H, |ui| {
         ui.label(egui::RichText::new(&b.label).size(13.0).color(ink));
+        if let Some(w) = who {
+            ui.add(egui::Label::new(egui::RichText::new(format!("· {w}")).size(11.5).color(p.subtle)).truncate())
+                .on_hover_text("These bars are this account's: the one with the most left now, or the first back when none has any.");
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{:.0}%", b.used)).size(13.0).color(ink)));
     });
     ui.add_space(BAR_GAP);
@@ -1215,7 +1228,7 @@ fn bar_ui(ui: &mut egui::Ui, b: &Bar, now: u64, stale: bool, latest: bool) {
         pt.line_segment([egui::pos2(x, rect.top() - 1.0), egui::pos2(x, rect.bottom() + 1.0)], egui::Stroke::new(2.0, if stale { p.muted } else { egui::Color32::WHITE }));
     }
     ui.add_space(BAR_GAP);
-    let text = reset_line(b, now, latest);
+    let text = reset_text(b.resets, now);
     row(ui, RESET_H, |ui| ui.label(egui::RichText::new(text).size(11.5).color(p.subtle)));
 }
 
@@ -1608,8 +1621,15 @@ impl Popup {
                 // One line, cut to the window with the whole text on hover: a long message must not widen the window.
                 row(ui, ERROR_H, |ui| ui.add(egui::Label::new(egui::RichText::new(e.replace(['\n', '\r'], " ")).size(12.0).color(p.danger)).truncate()).on_hover_text(e));
             }
-            for b in &s.bars {
-                bar_ui(ui, b, now, s.stale, s.latest);
+            for (i, b) in s.bars.iter().enumerate() {
+                // A group's pool line goes above its first bar.
+                let first = |g: &str| s.bars.iter().position(|x| x.label.starts_with(&format!("{g} ("))) == Some(i);
+                let pl = s.pools.iter().find(|pl| first(&pl.group));
+                if let Some(pl) = pl {
+                    ui.add_space(6.0);
+                    row(ui, 18.0, |ui| ui.label(egui::RichText::new(format!("{} ready: {}", pl.group, pl.ready)).size(11.5).color(p.subtle)));
+                }
+                bar_ui(ui, b, now, s.stale, pl.map(|pl| pl.shown.as_str()));
             }
         }
         if blocks.is_empty() {
@@ -1896,8 +1916,8 @@ mod tests {
         let (plan, bars) = parse_wham(&v, 1_792_300_000);
         assert_eq!(plan, "Plus");
         assert_eq!(bars, [
-            Bar { label: "Session (5hr)".into(), used: 12.0, resets: 1_792_303_000, window: 18_000, earliest: 0 },
-            Bar { label: "Weekly (7 day)".into(), used: 40.5, resets: 1_792_390_000, window: 604_800, earliest: 0 },
+            Bar { label: "Session (5hr)".into(), used: 12.0, resets: 1_792_303_000, window: 18_000 },
+            Bar { label: "Weekly (7 day)".into(), used: 40.5, resets: 1_792_390_000, window: 604_800 },
         ], "a missing reset_at falls back to now + reset_after_seconds");
         assert!(parse_wham(&serde_json::json!({}), 0).1.is_empty());
 
@@ -1910,27 +1930,12 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_groups_become_bars_and_combine() {
-        let mut a = parse_ag(&ag_summary(0.98, 0.73));
+    fn antigravity_groups_become_bars() {
+        let a = parse_ag(&ag_summary(0.98, 0.73));
         let labels: Vec<&str> = a.iter().map(|b| b.label.as_str()).collect();
         assert_eq!(labels, ["Gemini (5hr)", "Gemini (Weekly)", "Claude (5hr)", "Claude (Weekly)"]);
         assert!((a[1].used - 27.0).abs() < 0.01);
 
-        let mut b = parse_ag(&ag_summary(0.5, 0.73));
-        a[0].resets = 1_792_300_000;
-        b[0].resets = 1_792_400_000; // resets later
-        let failed = Source { error: "x".into(), bars: parse_ag(&ag_summary(0.0, 0.0)), ..Default::default() };
-        let all = combined([Source { bars: a, ..Default::default() }, Source { bars: b, ..Default::default() }, failed].iter());
-        assert!((all[0].used - 38.5).abs() < 0.01, "5hr counts each account's higher of 5h and weekly (27% and 50%); the failed account doesn't count");
-        assert_eq!(all[0].resets, 1_792_400_000, "the latest reset: when every account is free again");
-        assert!(all[0].earliest > 0 && all[0].earliest <= all[0].resets, "and the soonest one too");
-        let now = 1_792_300_000;
-        let mut b = Bar { label: "x".into(), used: 1.0, resets: now + 4 * 3600, window: FIVE_HOURS, earliest: now + 3600 };
-        assert!(reset_line(&b, now, true).starts_with("Earliest in 1h 0m ("), "{}", reset_line(&b, now, true));
-        assert!(reset_line(&b, now, true).contains(" · latest in 4h 0m ("));
-        b.earliest = b.resets - 300;
-        assert!(reset_line(&b, now, true).starts_with("Resets in 4h 0m"), "five minutes apart reads as one reset");
-        assert!(reset_line(&b, now, false).starts_with("Resets in"), "a single account");
     }
 
     #[test]
@@ -1944,11 +1949,11 @@ mod tests {
         u.antigravity.insert("a@x".into(), src(""));
         u.antigravity.insert("b@x".into(), src("boom"));
         let s = &sections(&cfg, &u, false)[0];
-        assert!(!s.stale && !s.latest && !s.bars.is_empty(), "one account answered: its bars, normal, from a single account");
+        assert!(!s.stale && s.pools.is_empty() && !s.bars.is_empty(), "one account answered: its bars, normal, no pool line");
 
         u.antigravity.insert("a@x".into(), src(""));
         u.antigravity.insert("b@x".into(), src(""));
-        assert!(sections(&cfg, &u, false)[0].latest, "two accounts merge: the reset shown is the latest");
+        assert_eq!(sections(&cfg, &u, false)[0].pools.len(), 2, "two accounts: a pool line per group");
 
         u.antigravity.insert("a@x".into(), src("down"));
         u.antigravity.insert("b@x".into(), src("down"));
@@ -1975,24 +1980,31 @@ mod tests {
     }
 
     #[test]
-    fn weekly_only_accounts_count_in_the_merged_5hr_bar() {
-        let bar = |label: &str, used, window| Bar { label: label.into(), used, resets: 0, window, earliest: 0 };
-        let free = Source { bars: vec![bar("Gemini (Weekly)", 40.0, WEEK)], ..Default::default() };
-        let pro = Source { bars: vec![bar("Gemini (5hr)", 10.0, FIVE_HOURS), bar("Gemini (Weekly)", 20.0, WEEK)], ..Default::default() };
-        let all = combined([free.clone(), pro.clone()].iter());
-        let used = |l: &str| all.iter().find(|b| b.label == l).map(|b| b.used);
-        assert_eq!(used("Gemini (5hr)"), Some(30.0), "the free account's 40% weekly counts, with the Pro's higher of 10% and 20%");
-        assert_eq!(used("Gemini (Weekly)"), Some(30.0));
-        assert_eq!(all[0].label, "Gemini (5hr)", "5hr stays above weekly");
-        let one = combined([free].iter());
-        assert!(one.iter().all(|b| b.window == WEEK), "one account on its own: its own buckets only");
-        assert_eq!(combined([pro].iter())[0].used, 10.0);
+    fn general_shows_the_account_with_the_most_left_and_who_is_ready() {
+        // The live mix: free accounts out for the week, a Pro out for the week despite an unused 5 hours, a Pro with a
+        // quarter of its 5 hours left; Claude out everywhere.
+        let bar = |label: &str, used, resets, window| Bar { label: label.into(), used, resets, window };
+        let acct = |e: &str, plan: &str| antigravity::Account { email: e.into(), plan: plan.into(), ..Default::default() };
+        let src = |bars: Vec<Bar>| Source { bars, ..Default::default() };
+        let (h, d) = (3600, 24 * 3600);
+        let free = src(vec![bar("Gemini (Weekly)", 100.0, 165 * h, WEEK), bar("Claude (Weekly)", 99.96, 167 * h, WEEK)]);
+        let pro_a = src(vec![bar("Gemini (5hr)", 2.7, 2 * h, FIVE_HOURS), bar("Gemini (Weekly)", 100.0, 74 * h, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 99.96, 167 * h, WEEK)]);
+        let pro_b = src(vec![bar("Gemini (5hr)", 75.5, 4 * h, FIVE_HOURS), bar("Gemini (Weekly)", 72.7, 6 * d, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 100.0, 154 * h, WEEK)]);
+        let (f1, f2, a, b) = (acct("f1@x", "free-tier"), acct("f2@x", "free-tier"), acct("pa@x", "g1-pro-tier"), acct("pb@x", "g1-pro-tier"));
+        let (bars, pools) = pool(&[(&f1, &free), (&f2, &free), (&a, &pro_a), (&b, &pro_b)]);
+        let used: Vec<(&str, f64)> = bars.iter().map(|b| (b.label.as_str(), b.used)).collect();
+        assert_eq!(used, [("Gemini (5hr)", 75.5), ("Gemini (Weekly)", 72.7), ("Claude (5hr)", 100.0), ("Claude (Weekly)", 100.0)], "Gemini: pb's own buckets, not an average");
+        assert_eq!(pools[0], Pool { group: "Gemini".into(), ready: "Free 0/2 · Pro 1/2".into(), shown: "pb (Pro)".into() }, "pa's spare 5 hours don't count: its week is used up");
+        assert_eq!(pools[1].ready, "Free 0/2 · Pro 0/2");
+        assert_eq!((pools[1].shown.as_str(), bars[3].resets), ("pb (Pro)", 154 * h), "none ready: the one back soonest, by its weekly reset, not the 5-hour one");
+        let (one, none) = pool(&[(&f1, &free)]);
+        assert!(one.iter().all(|b| b.window == WEEK) && none.is_empty(), "one account: its own buckets, no pool line");
     }
 
     #[test]
     fn colors_follow_pace_and_limits() {
         let now = 1_000_000;
-        let bar = |used, left: u64| Bar { label: "x".into(), used, resets: now + left, window: FIVE_HOURS, earliest: 0 };
+        let bar = |used, left: u64| Bar { label: "x".into(), used, resets: now + left, window: FIVE_HOURS };
         assert_eq!(bar(30.0, FIVE_HOURS / 2).level(now), Level::Ok, "30% used, half the time gone");
         assert_eq!(bar(60.0, FIVE_HOURS / 2).level(now), Level::Warn, "ahead of the time passed");
         assert_eq!(bar(92.0, 60).level(now), Level::Warn, "past 90% even though on pace");
@@ -2002,7 +2014,7 @@ mod tests {
 
     #[test]
     fn dial_arcs_fill_from_the_left() {
-        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window, earliest: 0 });
+        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window });
         let dial = |five, week| Dial { five: bar(five, FIVE_HOURS), week: bar(week, WEEK) };
         let size = 32;
         let px = icon_pixels(size, &[dial(30.0, 50.0), dial(20.0, 100.0)], false, 0);
@@ -2034,7 +2046,7 @@ mod tests {
 
     #[test]
     fn three_sources_split_the_dial_into_sectors() {
-        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window, earliest: 0 });
+        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window });
         let dial = |five, week| Dial { five: bar(five, FIVE_HOURS), week: bar(week, WEEK) };
         let size = 32;
         let px = icon_pixels(size, &[dial(50.0, 50.0), dial(0.0, 0.0), dial(100.0, 100.0)], false, 0);
