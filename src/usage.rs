@@ -28,6 +28,9 @@ pub struct Bar {
     pub resets: u64,
     /// Window length in seconds (5 h or a week).
     pub window: u64,
+    /// One plan's share of a merged row ("Free", "Pro"): bars with the same label and a part sit side by side.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub part: String,
 }
 
 impl Bar {
@@ -41,12 +44,16 @@ impl Bar {
         self.used.round() >= 100.0
     }
 
-    /// How worried to look: used up (red), past 90% or ahead of the time passed (orange), else fine (blue).
+    /// How it looks: used up (red), 75% or more (orange), a week nearly over with much of it left, so likely to go
+    /// to waste (purple), else fine (green).
     pub fn level(&self, now: u64) -> Level {
         if self.out() {
             Level::Full
-        } else if self.used > 90.0 || self.elapsed(now).is_some_and(|e| self.used > e * 100.0 + 0.5) {
+        } else if self.used >= 75.0 {
             Level::Warn
+        // ponytail: a rule of thumb (the last quarter of the week, 25 points behind an even pace)
+        } else if self.window == WEEK && self.elapsed(now).is_some_and(|e| e >= 0.75 && self.used + 25.0 < e * 100.0) {
+            Level::Low
         } else {
             Level::Ok
         }
@@ -56,6 +63,7 @@ impl Bar {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Level {
     Ok,
+    Low,
     Warn,
     Full,
 }
@@ -273,7 +281,7 @@ fn plan_name(kind: &str, tier: &str) -> String {
 
 /// Bars from `/api/oauth/usage`: its `limits` list (session, weekly, per-model weekly), or the older top-level fields.
 pub fn parse_claude(v: &Value) -> Vec<Bar> {
-    let bar = |label: String, used: f64, resets: &Value, window| Bar { label, used, resets: resets.as_str().map_or(0, parse_time), window };
+    let bar = |label: String, used: f64, resets: &Value, window| Bar { label, used, resets: resets.as_str().map_or(0, parse_time), window, ..Default::default() };
     let mut bars: Vec<Bar> = v["limits"]
         .as_array()
         .into_iter()
@@ -342,7 +350,7 @@ pub fn parse_wham(v: &Value, now: u64) -> (String, Vec<Bar>) {
     let window = |w: &Value, label: &str, default: u64| {
         let used = w["used_percent"].as_f64()?;
         let resets = w["reset_at"].as_u64().filter(|r| *r > 0).or_else(|| w["reset_after_seconds"].as_u64().map(|s| now + s)).unwrap_or(0);
-        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default) })
+        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default), ..Default::default() })
     };
     let limit = &v["rate_limit"];
     let bars = [window(&limit["primary_window"], "Session (5hr)", FIVE_HOURS), window(&limit["secondary_window"], "Weekly (7 day)", WEEK)].into_iter().flatten().collect();
@@ -411,7 +419,7 @@ pub fn parse_ag(v: &Value) -> Vec<Bar> {
         let group = if id.starts_with("gemini") { "Gemini" } else { "Claude" };
         let (window, label) = if b["window"] == "5h" || id.ends_with("5h") { (FIVE_HOURS, "5hr") } else { (WEEK, "Weekly") };
         let used = (1.0 - b["remainingFraction"].as_f64().unwrap_or(1.0)) * 100.0;
-        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window });
+        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window, ..Default::default() });
     }
     // Session before weekly within a group, as in the Claude section.
     bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
@@ -431,62 +439,64 @@ fn google_token(refresh: &str) -> Result<String, String> {
     Ok(t)
 }
 
-/// One model group (Gemini, Claude) across several accounts: which account the bars show.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Pool {
-    pub group: String,
-    /// The account the group's bars are: "duongn (Pro)".
-    pub shown: String,
-}
-
-/// "General": per group, the bars of the account with the most left right now (none ready: the one back soonest),
-/// so every bar is one real account's 5-hour and weekly buckets. Averaging accounts mixed plans with different
-/// windows and sizes (a free account has no 5-hour bucket) into numbers no account had.
-pub fn pool(sources: &[(&antigravity::Account, &Source)]) -> (Vec<Bar>, Vec<Pool>) {
-    if sources.len() < 2 {
-        return (sources.first().map(|(_, s)| s.bars.clone()).unwrap_or_default(), Vec::new());
-    }
-    let group = |b: &Bar| b.label.split(" (").next().unwrap_or("").to_string();
+/// The Antigravity bars of `group` ("" = every group, each label led by its name). Per group: a session bar, the
+/// 5-hour use of the accounts that still have some of their week (none: no bar, the week decides), and a weekly row
+/// with one bar per plan. Accounts are averaged only within a plan: they have the same quota, so their average means
+/// something, while one across plans (a free account has no 5-hour bucket at all) is a number no account has.
+pub fn ag_bars(sources: &[(&antigravity::Account, &Source)], group: &str) -> Vec<Bar> {
+    let name = |b: &Bar| b.label.split(" (").next().unwrap_or("").to_string();
     let mut groups: Vec<String> = Vec::new();
-    for b in sources.iter().flat_map(|(_, s)| &s.bars) {
-        if !groups.contains(&group(b)) {
-            groups.push(group(b));
+    for g in sources.iter().flat_map(|(_, s)| &s.bars).map(name) {
+        if !groups.contains(&g) && (group.is_empty() || g == group) {
+            groups.push(g);
         }
     }
-    let (mut bars, mut pools) = (Vec::new(), Vec::new());
-    for g in groups {
-        // (account, its bars of this group, highest use, back at: the latest reset among its used-up buckets)
-        let each: Vec<_> = sources
-            .iter()
-            .map(|(a, s)| {
-                let gb: Vec<Bar> = s.bars.iter().filter(|b| group(b) == g).cloned().collect();
-                let used = gb.iter().map(|b| if b.out() { 100.0 } else { b.used }).fold(0.0, f64::max);
-                let back = gb.iter().filter(|b| b.out()).map(|b| if b.resets == 0 { u64::MAX } else { b.resets }).max().unwrap_or(0);
-                (*a, gb, used, back)
-            })
-            .filter(|(_, gb, ..)| !gb.is_empty())
-            .collect();
-        let best = each.iter().filter(|e| e.2 < 100.0).min_by(|x, y| x.2.total_cmp(&y.2)).or_else(|| each.iter().min_by_key(|e| e.3));
-        let Some((a, gb, ..)) = best else { continue };
-        bars.extend(gb.iter().cloned());
-        let alias = a.email.split('@').next().unwrap_or(&a.email);
-        let plan = antigravity::plan_label(&a.plan);
-        pools.push(Pool { group: g, shown: if plan.is_empty() { alias.to_string() } else { format!("{alias} ({plan})") } });
+    groups.sort_by_key(|g| g != "Gemini");
+    let mut out = Vec::new();
+    for g in &groups {
+        let label = |what: &str| if group.is_empty() { format!("{g} · {what}") } else { what.to_string() };
+        fn find<'a>(s: &'a Source, g: &str, w: u64) -> Option<&'a Bar> {
+            s.bars.iter().find(|b| b.label.split(" (").next() == Some(g) && b.window == w)
+        }
+        // (5-hour, weekly, plan rank) per account
+        let each: Vec<_> = sources.iter().map(|(a, s)| (find(s, g, FIVE_HOURS), find(s, g, WEEK), antigravity::rank(&a.plan))).collect();
+        // The average use and the soonest reset.
+        let avg = |bars: Vec<&Bar>| {
+            (!bars.is_empty()).then(|| (bars.iter().map(|b| b.used).sum::<f64>() / bars.len() as f64, bars.iter().map(|b| b.resets).filter(|r| *r > 0).min().unwrap_or(0)))
+        };
+        if let Some((used, resets)) = avg(each.iter().filter(|e| !e.1.is_some_and(Bar::out)).filter_map(|e| e.0).collect()) {
+            out.push(Bar { label: label("Session (5hr)"), used, resets, window: FIVE_HOURS, part: String::new() });
+        }
+        let mut ranks: Vec<u8> = each.iter().filter(|e| e.1.is_some()).map(|e| e.2).collect();
+        ranks.sort();
+        ranks.dedup();
+        for r in ranks {
+            if let Some((used, resets)) = avg(each.iter().filter(|e| e.2 == r).filter_map(|e| e.1).collect()) {
+                let part = if sources.len() > 1 { ["Free", "Other", "Plus", "Pro", "Ultra"][r as usize].to_string() } else { String::new() };
+                out.push(Bar { label: label("Weekly (7 day)"), used, resets, window: WEEK, part });
+            }
+        }
     }
-    bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
-    (bars, pools)
+    out
 }
 
-/// The Antigravity bars and pools for `view` ("" = all accounts, else one account's email). Failed accounts are left
-/// out unless `stale` (every one failed: their last answers, greyed out).
-pub fn ag_pool(u: &Usage, accounts: &[antigravity::Account], view: &str, stale: bool) -> (Vec<Bar>, Vec<Pool>) {
-    let mine: Vec<_> = accounts.iter().filter(|a| view.is_empty() || a.email == view).filter_map(|a| u.antigravity.get(&a.email).map(|s| (a, s))).filter(|(_, s)| stale || s.error.is_empty()).collect();
-    pool(&mine)
+/// The Antigravity accounts of `view` ("" = all, else one email) with their last answers; failed ones only if
+/// `stale` (every one failed: their last answers, greyed out).
+fn ag_sources<'a>(u: &'a Usage, accounts: &'a [antigravity::Account], view: &str, stale: bool) -> Vec<(&'a antigravity::Account, &'a Source)> {
+    accounts.iter().filter(|a| view.is_empty() || a.email == view).filter_map(|a| u.antigravity.get(&a.email).map(|s| (a, s))).filter(|(_, s)| stale || s.error.is_empty()).collect()
 }
 
-/// The Antigravity bars for `view`: what the tray dial and tooltip show, the same as the popup.
-pub fn ag_view(u: &Usage, accounts: &[antigravity::Account], view: &str) -> Vec<Bar> {
-    ag_pool(u, accounts, view, false).0
+/// The Antigravity bars the popup shows, which the tray dial and tooltip follow.
+pub fn ag_view(u: &Usage, accounts: &[antigravity::Account], view: &str, group: &str) -> Vec<Bar> {
+    ag_bars(&ag_sources(u, accounts, view, false), group)
+}
+
+/// What a Claude or ChatGPT section shows: once the week is used up only the weekly bar (the week decides), and
+/// per-model weekly bars (Fable) only when `models`.
+fn tidy(bars: &[Bar], models: bool) -> Vec<Bar> {
+    let week = |b: &Bar| b.label == "Weekly (7 day)";
+    let week_out = bars.iter().any(|b| week(b) && b.out());
+    bars.iter().filter(|b| week(b) || (!week_out && (models || b.window != WEEK))).cloned().collect()
 }
 
 // ---------------------------------------------------------------- refresh
@@ -628,7 +638,15 @@ pub fn icon_dials(u: &Usage, shown: &[Src], ag: &[Bar]) -> Vec<Dial> {
         .map(|s| match s {
             Src::Claude => dial(&u.claude),
             Src::ChatGpt => dial(&u.chatgpt),
-            Src::Antigravity => Dial { five: find(ag, FIVE_HOURS), week: find(ag, WEEK) },
+            // Antigravity: within a row the plan with the most room (any of them serves those models), across model
+            // groups the fullest (each group is different models)
+            Src::Antigravity => {
+                let pick = |w: u64| {
+                    let row_best = |l: &str| ag.iter().filter(|b| b.window == w && b.label == l).min_by(|a, b| a.used.total_cmp(&b.used));
+                    ag.iter().filter(|b| b.window == w).filter_map(|b| row_best(&b.label)).max_by(|a, b| a.used.total_cmp(&b.used)).cloned()
+                };
+                Dial { five: pick(FIVE_HOURS), week: pick(WEEK) }
+            }
         })
         .collect()
 }
@@ -748,7 +766,9 @@ pub fn tooltip(u: &Usage, shown: &[Src], ag: &[Bar]) -> String {
     };
     let mut lines = vec!["ccat usage".to_string()];
     for s in shown {
-        let ag_src = Source { bars: ag.to_vec(), ..Default::default() };
+        // Antigravity reads as its dial does.
+        let d = icon_dials(u, &[Src::Antigravity], ag).pop().unwrap_or_default();
+        let ag_src = Source { bars: d.five.into_iter().chain(d.week).collect(), ..Default::default() };
         let src = match s {
             Src::Claude => &u.claude,
             Src::ChatGpt => &u.chatgpt,
@@ -929,7 +949,7 @@ pub fn run_tray() {
     let draw = |u: &Usage| {
         let cfg = read_config();
         let accounts: Vec<antigravity::Account> = cfg.providers.iter().filter(|p| p.antigravity).flat_map(|p| p.accounts.clone()).collect();
-        let ag = ag_view(u, &accounts, &cfg.usage_view);
+        let ag = ag_view(u, &accounts, &cfg.usage_view, &cfg.ag_group);
         let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on, !ag.is_empty()]);
         let size = win::icon_size();
         let icon = Icon::from_rgba(icon_pixels(size, &icon_dials(u, &src, &ag), win::light_taskbar(), now()), size, size).ok();
@@ -1022,7 +1042,10 @@ pub fn run_tray() {
 
 const POPUP_W: f32 = 340.0;
 const BLUE: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x78, 0xd6);
-const TRACK: egui::Color32 = egui::Color32::from_rgb(0x03, 0x20, 0x42);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xa8, 0x5f);
+const GREEN_TRACK: egui::Color32 = egui::Color32::from_rgb(0x0d, 0x2e, 0x18);
+const PURPLE: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x6c, 0xe0);
+const PURPLE_TRACK: egui::Color32 = egui::Color32::from_rgb(0x28, 0x1a, 0x42);
 const ORANGE: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x8a, 0x2e);
 const ORANGE_TRACK: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x26, 0x0c);
 const RED: egui::Color32 = egui::Color32::from_rgb(0xcf, 0x3b, 0x3b);
@@ -1070,6 +1093,8 @@ const RESET_H: f32 = 18.0;
 const BAR_GAP: f32 = 4.0;
 const BAR_BLOCK: f32 = 6.0 + LABEL_H + BAR_GAP + BAR_H + BAR_GAP + RESET_H;
 const ERROR_H: f32 = 17.0;
+/// A split row's plan line, between its bars and their resets.
+const PART_H: f32 = 18.0;
 /// Between sections, with a 1px rule across its middle; the footer has one above it too.
 const SECTION_GAP: f32 = 21.0;
 const FOOTER_H: f32 = 12.0 + 18.0;
@@ -1105,8 +1130,6 @@ struct Section {
     errors: Vec<String>,
     /// The last fetch failed: the bars are the last answers, drawn greyed out.
     stale: bool,
-    /// Antigravity's groups across several accounts: whose bars each group shows.
-    pools: Vec<Pool>,
 }
 
 /// The Usage tab's blocks: the shown sources, in the saved order.
@@ -1115,10 +1138,10 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
     let alias = |e: &str| e.split('@').next().unwrap_or(e).to_string();
     let mut out = Vec::new();
     if claude {
-        out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: u.claude.bars.clone(), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty(), pools: Vec::new() });
+        out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: tidy(&u.claude.bars, cfg.show_fable), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty() });
     }
     if u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty()) {
-        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: u.chatgpt.bars.clone(), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty(), pools: Vec::new() });
+        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
     }
     if !accounts.is_empty() {
         let mine = accounts.iter().filter(|a| cfg.usage_view.is_empty() || a.email == cfg.usage_view);
@@ -1126,8 +1149,8 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
         let sources: Vec<&Source> = mine.filter_map(|a| u.antigravity.get(&a.email)).collect();
         // Every account failed: show what they last said, greyed out, rather than nothing.
         let stale = !sources.is_empty() && sources.iter().all(|s| !s.error.is_empty());
-        let (bars, pools) = ag_pool(u, &accounts, &cfg.usage_view, stale);
-        out.push(Section { src: Src::Antigravity, title: "Antigravity", which: 1, bars, errors, stale, pools });
+        let bars = ag_bars(&ag_sources(u, &accounts, &cfg.usage_view, stale), &cfg.ag_group);
+        out.push(Section { src: Src::Antigravity, title: "Antigravity", which: 1, bars, errors, stale });
     }
     let keep = shown(cfg, cfg.usage_view_mode, Src::ALL.map(|s| out.iter().any(|x| x.src == s)));
     keep.iter().filter_map(|s| out.iter().position(|x| x.src == *s).map(|i| out.swap_remove(i))).collect()
@@ -1135,7 +1158,7 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
 
 /// The window height the sections need, in points: the same sums the layout below adds up.
 fn height(sections: &[Section]) -> f32 {
-    let body: f32 = sections.iter().map(|s| SECTION_H + s.errors.len() as f32 * ERROR_H + s.bars.len() as f32 * BAR_BLOCK).sum();
+    let body: f32 = sections.iter().map(|s| SECTION_H + s.errors.len() as f32 * ERROR_H + rows(&s.bars).iter().map(|r| if r[0].part.is_empty() { BAR_BLOCK } else { BAR_BLOCK + PART_H }).sum::<f32>()).sum();
     let gaps = sections.len().saturating_sub(1) as f32 * SECTION_GAP;
     let empty = if sections.is_empty() { ERROR_H * 2.0 } else { 0.0 };
     (PAD + HEADER_H + body + gaps + empty + FOOTER_H + PAD).ceil()
@@ -1172,48 +1195,87 @@ fn row<R>(ui: &mut egui::Ui, h: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
     .inner
 }
 
-/// `who`: the account a merged group's bars are, beside the first one's label.
-fn bar_ui(ui: &mut egui::Ui, b: &Bar, now: u64, stale: bool, who: Option<&str>) {
+/// Consecutive bars with the same label and a plan part share a row; any other bar is a row of its own.
+fn rows(bars: &[Bar]) -> Vec<&[Bar]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bars.len() {
+        let mut j = i + 1;
+        while j < bars.len() && !bars[i].part.is_empty() && bars[j].label == bars[i].label && !bars[j].part.is_empty() {
+            j += 1;
+        }
+        out.push(&bars[i..j]);
+        i = j;
+    }
+    out
+}
+
+/// One row: its label, then its bars side by side (one bar: the whole width, its use beside the label; several: a
+/// line under each with its plan and use), each with its reset below.
+fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool) {
     let p = crate::pal(ui);
     let ink = if stale { p.muted } else { p.fg };
+    let split = !bars[0].part.is_empty();
     ui.add_space(6.0);
     row(ui, LABEL_H, |ui| {
-        ui.label(egui::RichText::new(&b.label).size(13.0).color(ink));
-        if let Some(w) = who {
-            ui.add(egui::Label::new(egui::RichText::new(format!("· {w}")).size(11.5).color(p.subtle)).truncate())
-                .on_hover_text("These bars are this account's: the one with the most left now, or the first back when none has any.");
+        ui.label(egui::RichText::new(&bars[0].label).size(13.0).color(ink));
+        if !split {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{:.0}%", bars[0].used)).size(13.0).color(ink)));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{:.0}%", b.used)).size(13.0).color(ink)));
     });
     ui.add_space(BAR_GAP);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BAR_H), egui::Sense::hover());
+    let gap = 10.0;
+    let width = ui.available_width();
+    let col = (width - gap * (bars.len() - 1) as f32) / bars.len() as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, BAR_H), egui::Sense::hover());
     let pt = ui.painter();
-    // Each fill sits on a dark track of its own hue.
-    let (fill_color, track) = match b.level(now) {
-        _ if stale => (p.border_strong, p.sunken),
-        Level::Full => (RED, RED_TRACK),
-        Level::Warn => (ORANGE, ORANGE_TRACK),
-        Level::Ok => (BLUE, TRACK),
-    };
-    pt.rect_filled(rect, 2.0, track);
-    let fill = rect.width() * (b.used.clamp(0.0, 100.0) / 100.0) as f32;
-    if fill > 0.0 {
-        pt.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(fill, rect.height())), 2.0, fill_color);
-    }
-    // A week reads in days: a notch between each.
-    if b.window == WEEK {
-        for d in 1..7 {
-            let x = rect.left() + rect.width() * d as f32 / 7.0;
-            pt.line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)], egui::Stroke::new(1.0, p.bg));
+    let cols: Vec<egui::Rect> = (0..bars.len()).map(|i| egui::Rect::from_min_size(rect.min + egui::vec2(i as f32 * (col + gap), 0.0), egui::vec2(col, BAR_H))).collect();
+    for (b, r) in bars.iter().zip(&cols) {
+        // Each fill sits on a dark track of its own hue.
+        let (fill_color, track) = match b.level(now) {
+            _ if stale => (p.border_strong, p.sunken),
+            Level::Full => (RED, RED_TRACK),
+            Level::Warn => (ORANGE, ORANGE_TRACK),
+            Level::Low => (PURPLE, PURPLE_TRACK),
+            Level::Ok => (GREEN, GREEN_TRACK),
+        };
+        pt.rect_filled(*r, 2.0, track);
+        let fill = r.width() * (b.used.clamp(0.0, 100.0) / 100.0) as f32;
+        if fill > 0.0 {
+            pt.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(fill, r.height())), 2.0, fill_color);
+        }
+        // A week reads in days: a notch between each.
+        if b.window == WEEK {
+            for d in 1..7 {
+                let x = r.left() + r.width() * d as f32 / 7.0;
+                pt.line_segment([egui::pos2(x, r.top() + 2.0), egui::pos2(x, r.bottom() - 2.0)], egui::Stroke::new(1.0, p.bg));
+            }
         }
     }
-    if let Some(e) = b.elapsed(now) {
-        let x = rect.left() + rect.width() * e as f32;
-        pt.line_segment([egui::pos2(x, rect.top() - 1.0), egui::pos2(x, rect.bottom() + 1.0)], egui::Stroke::new(2.0, if stale { p.muted } else { egui::Color32::WHITE }));
-    }
     ui.add_space(BAR_GAP);
-    let text = reset_text(b.resets, now);
-    row(ui, RESET_H, |ui| ui.label(egui::RichText::new(text).size(11.5).color(p.subtle)));
+    // The text under each column, cut to its width.
+    let line = |ui: &mut egui::Ui, h: f32, text: &dyn Fn(&Bar) -> (String, String), size: f32, color: egui::Color32| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+        for (b, c) in bars.iter().zip(&cols) {
+            let (left, right) = text(b);
+            let cell = egui::Rect::from_x_y_ranges(c.x_range(), r.y_range());
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            if !right.is_empty() {
+                child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(right).size(size).color(color));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(egui::Label::new(egui::RichText::new(&left).size(size).color(color)).truncate()));
+                });
+            } else {
+                child.add(egui::Label::new(egui::RichText::new(&left).size(size).color(color)).truncate()).on_hover_text(&left);
+            }
+        }
+    };
+    if split {
+        line(ui, PART_H, &|b: &Bar| (b.part.clone(), format!("{:.0}%", b.used)), 12.0, ink);
+    }
+    // Narrow columns drop the "Resets" and the clock time: "on Wed, 00:09", "in 3h 0m".
+    let reset = |b: &Bar| if split { reset_text(b.resets, now).replacen("Resets ", "", 1).split(" (").next().unwrap_or("").to_string() } else { reset_text(b.resets, now) };
+    line(ui, RESET_H, &|b: &Bar| (reset(b), String::new()), 11.5, p.subtle);
 }
 
 // ---------------------------------------------------------------- analytics
@@ -1388,102 +1450,140 @@ fn legend(ui: &mut egui::Ui, st: &Stats, more: &mut bool) {
 
 // ---------------------------------------------------------------- live
 
-/// The Live chart's ranges: (name, bucket seconds). 60 buckets each: an hour by the minute, a day by 24 minutes, a
-/// week by 2.8 hours, a month (30 days) by 12 hours.
-const RANGES: [(&str, u64); 4] = [("Hour", 60), ("Day", 24 * 60), ("Week", 7 * 24 * 60), ("Month", 30 * 24 * 60)];
-const BUCKETS: u64 = 60;
+/// Live's ranges, in the order its list shows them reversed: the last hour by the minute (sliding), today since
+/// local midnight by 15 minutes, this week since Monday by the hour.
+const RANGES: [&str; 3] = ["Recently", "Today", "This week"];
 
-/// Each request the proxy finished over the last 30 days: (unix time, model), oldest first.
-fn load_calls(text: &str, since: u64) -> Vec<(u64, String)> {
-    let mut calls: Vec<(u64, String)> = text
+/// (first bucket's start, bucket seconds, buckets) of range `r` at `now`.
+fn range_span(r: u8, now: u64) -> (u64, u64, usize) {
+    let (wd, h, m) = local(now);
+    let midnight = now - u64::from(h) * 3600 - u64::from(m) * 60 - now % 60;
+    match r {
+        1 => (midnight, 900, 96),
+        // ponytail: seven 24-hour days back from midnight; a week with a DST change is an hour off
+        2 => (midnight.saturating_sub(u64::from((wd + 6) % 7) * 86_400), 3600, 168),
+        _ => ((now / 60 + 1).saturating_sub(60) * 60, 60, 60),
+    }
+}
+
+/// One finished request: (unix time, model, provider, tokens in and out).
+type Call = (u64, String, String, u64);
+
+/// The proxy's requests since `since`, oldest first.
+fn load_calls(text: &str, since: u64) -> Vec<Call> {
+    let mut calls: Vec<Call> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| v["t"].as_u64().filter(|t| *t >= since).map(|t| (t, pretty_model(v["model"].as_str().unwrap_or("?")))))
+        .filter_map(|v| {
+            let t = v["t"].as_u64().filter(|t| *t >= since)?;
+            let n = |k: &str| v[k].as_u64().unwrap_or(0);
+            let tokens = n("input") + n("cache_read") + n("cache_write") + n("output");
+            Some((t, pretty_model(v["model"].as_str().unwrap_or("?")), v["provider"].as_str().unwrap_or("?").to_string(), tokens))
+        })
         .collect();
     calls.sort_by_key(|c| c.0);
     calls
 }
 
-/// Calls per bucket per model over the `BUCKETS` buckets ending with the one holding `now` (bucket `w` seconds,
-/// aligned to the clock so they don't shift as time passes), running totals if `cumulative`. Models most calls first.
-fn live_series(calls: &[(u64, String)], now: u64, w: u64, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
-    let first = (now / w + 1).saturating_sub(BUCKETS);
-    let mut models: Vec<(String, usize)> = Vec::new();
-    let mut cells: Vec<(usize, String)> = Vec::new();
-    for (t, m) in calls.iter().filter(|(t, _)| *t / w >= first && *t <= now) {
-        match models.iter_mut().find(|x| x.0 == *m) {
-            Some(x) => x.1 += 1,
-            None => models.push((m.clone(), 1)),
+/// Per key ("Total", or each model, or each provider: `by` 0, 1, 2), its calls or tokens per bucket of `span`, running
+/// totals if `cumulative`. Keys biggest first.
+fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, tokens: bool, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
+    let (start, w, n) = span;
+    let key = |c: &Call| match by {
+        1 => c.1.clone(),
+        2 => c.2.clone(),
+        _ => "Total".to_string(),
+    };
+    let mut keys: Vec<(String, f64)> = Vec::new();
+    let mut cells: Vec<(usize, String, f64)> = Vec::new();
+    for c in calls.iter().filter(|c| c.0 >= start && c.0 < start + w * n as u64) {
+        let (k, v) = (key(c), if tokens { c.3 as f64 } else { 1.0 });
+        match keys.iter_mut().find(|x| x.0 == k) {
+            Some(x) => x.1 += v,
+            None => keys.push((k.clone(), v)),
         }
-        cells.push(((t / w - first) as usize, m.clone()));
+        cells.push((((c.0 - start) / w) as usize, k, v));
     }
-    models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let names: Vec<String> = models.into_iter().map(|m| m.0).collect();
-    let mut series = vec![vec![0.0; BUCKETS as usize]; names.len()];
-    for (k, m) in cells {
-        if let Some(i) = names.iter().position(|n| *n == m) {
-            series[i][k] += 1.0;
+    keys.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let names: Vec<String> = keys.into_iter().map(|k| k.0).collect();
+    let mut series = vec![vec![0.0; n]; names.len()];
+    for (b, k, v) in cells {
+        if let Some(i) = names.iter().position(|x| *x == k) {
+            series[i][b] += v;
         }
     }
     if cumulative {
         for s in &mut series {
-            for k in 1..s.len() {
-                s[k] += s[k - 1];
+            for b in 1..n {
+                s[b] += s[b - 1];
             }
         }
     }
     (names, series)
 }
 
-/// Stacked areas, one layer per model, sliding left as time passes; the scale eases to new heights. A model that
-/// finished a request in the last minute pulses at the right edge.
-fn live_chart(ui: &mut egui::Ui, calls: &[(u64, String)], range: usize, cumulative: bool) {
+/// Stacked areas, one layer per key, up to now; Recently slides left with the clock. The scale eases to new heights,
+/// and a key with a request finished in the last minute pulses at its edge and reads "running".
+fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool, cumulative: bool) {
     let p = crate::pal(ui);
-    let w = RANGES[range].1;
     let exact = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let now = exact as u64;
-    let (names, series) = live_series(calls, now, w, cumulative);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 160.0), egui::Sense::hover());
-    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(34.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
-    let n = BUCKETS as usize;
-    let totals: Vec<f64> = (0..n).map(|k| series.iter().map(|s| s[k]).sum()).collect();
-    let max = totals.iter().cloned().fold(0.0, f64::max).max(1.0);
-    let step = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0].into_iter().find(|s| max / s <= 4.0).unwrap_or(max / 4.0);
+    let span @ (start, w, n) = range_span(range, now);
+    let (names, series) = live_series(calls, span, by, tokens, cumulative);
+    let cur = (now.saturating_sub(start) / w).min(n as u64 - 1) as usize;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 170.0), egui::Sense::hover());
+    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(38.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
+    let max = (0..=cur).map(|k| series.iter().map(|s| s[k]).sum::<f64>()).fold(0.0, f64::max).max(if tokens { 1000.0 } else { 4.0 });
+    // A round step: 1, 2 or 5 × 10^n, about four lines high.
+    let raw = max / 4.0;
+    let mag = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(raw);
     let target = (max / step).ceil() * step;
-    let top = ui.ctx().animate_value_with_time(egui::Id::new(("live-top", range, cumulative)), target as f32, 0.35).max(1.0) as f64;
+    let top = ui.ctx().animate_value_with_time(egui::Id::new(("live-top", range, by, tokens, cumulative)), target as f32, 0.35).max(1.0) as f64;
     let pt = ui.painter_at(rect);
     let y_of = |v: f64| plot.bottom() - (v / top).min(1.05) as f32 * plot.height();
+    let fmt = |v: f64| if tokens { fmt_tokens(v) } else { format!("{v:.0}") };
     let mut v = 0.0;
-    while v <= top + 0.01 {
+    while v <= top + step * 0.01 {
         let y = y_of(v);
         if v > 0.0 {
             pt.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, p.border));
         }
-        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, format!("{v:.0}"), egui::FontId::proportional(10.5), p.subtle);
+        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    // Bucket k's centre sits at its real time, so the whole chart drifts left as the clock runs.
-    let first = (now / w + 1).saturating_sub(BUCKETS);
-    let span = (BUCKETS * w) as f64;
-    let x_of = |k: usize| plot.right() - (((exact - ((first + k as u64) as f64 + 0.5) * w as f64) / span) as f32 * plot.width());
+    // Recently: each bucket's centre sits at its real time, so the chart drifts left as the clock runs. The others
+    // keep their day or week across the width and fill in towards the right.
+    let x_of = |k: usize| match range {
+        0 => plot.right() - (((exact - (start + k as u64 * w) as f64 - w as f64 / 2.0) / (n as u64 * w) as f64) as f32 * plot.width()),
+        _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
+    };
     let clip = pt.with_clip_rect(plot);
+    let running = |name: &str| calls.iter().rev().take_while(|c| c.0 + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.1 } else { &c.2 }) == name);
     let mut base = vec![0.0; n];
     for (i, s) in series.iter().enumerate() {
-        let c = shade(i, p);
-        for k in 0..n.saturating_sub(1) {
-            let (b0, b1, t0, t1) = (base[k], base[k + 1], base[k] + s[k], base[k + 1] + s[k + 1]);
-            if t0 == b0 && t1 == b1 {
-                continue;
+        let c = hue(i, p);
+        // One mesh per layer: no anti-aliased seams between its slices. Its top edge is a line of its own.
+        let mut mesh = egui::Mesh::default();
+        let mut edge = Vec::new();
+        for k in 0..=cur {
+            let x = x_of(k);
+            let at = mesh.vertices.len() as u32;
+            mesh.colored_vertex(egui::pos2(x, y_of(base[k] + s[k])), c.gamma_multiply(0.8));
+            mesh.colored_vertex(egui::pos2(x, y_of(base[k])), c.gamma_multiply(0.8));
+            if k > 0 {
+                mesh.add_triangle(at - 2, at - 1, at);
+                mesh.add_triangle(at - 1, at + 1, at);
             }
-            let (x0, x1) = (x_of(k), x_of(k + 1));
-            let quad = vec![egui::pos2(x0, y_of(t0)), egui::pos2(x1, y_of(t1)), egui::pos2(x1, y_of(b1)), egui::pos2(x0, y_of(b0))];
-            clip.add(egui::Shape::convex_polygon(quad, c.gamma_multiply(0.85), egui::Stroke::NONE));
-            clip.line_segment([egui::pos2(x0, y_of(t0)), egui::pos2(x1, y_of(t1))], egui::Stroke::new(1.5, c));
+            edge.push(egui::pos2(x, y_of(base[k] + s[k])));
         }
-        // Running now: a call finished within the last minute.
-        if calls.iter().rev().take_while(|(t, _)| *t + 60 >= now).any(|(_, m)| *m == names[i]) {
+        if s[..=cur].iter().any(|v| *v > 0.0) {
+            clip.add(mesh);
+            clip.add(egui::Shape::line(edge, egui::Stroke::new(1.5, c)));
+        }
+        if running(&names[i]) {
             let pulse = (exact.fract() * std::f64::consts::TAU).sin() as f32 * 0.5 + 0.5;
-            let at = egui::pos2(x_of(n - 1), y_of(base[n - 1] + s[n - 1]));
+            let at = egui::pos2(x_of(cur), y_of(base[cur] + s[cur]));
             pt.circle_filled(at, 3.0 + 3.0 * pulse, c.gamma_multiply(0.35 * (1.0 - pulse)));
             pt.circle_filled(at, 3.0, c);
         }
@@ -1491,48 +1591,55 @@ fn live_chart(ui: &mut egui::Ui, calls: &[(u64, String)], range: usize, cumulati
             base[k] += s[k];
         }
     }
-    // Time along the bottom: the start, the middle, now.
-    let ago = |secs: u64| match secs {
-        0 => "now".to_string(),
-        s if s < 3600 => format!("-{}m", s / 60),
-        s if s < 86_400 * 2 => format!("-{}h", s / 3600),
-        s => format!("-{}d", s / 86_400),
+    // Time along the bottom.
+    let clock = |t: u64| {
+        let (_, h, m) = local(t);
+        format!("{h:02}:{m:02}")
     };
-    for (frac, align) in [(0.0, egui::Align2::LEFT_TOP), (0.5, egui::Align2::CENTER_TOP), (1.0, egui::Align2::RIGHT_TOP)] {
-        let x = plot.left() + plot.width() * frac;
-        pt.text(egui::pos2(x, plot.bottom() + 4.0), align, ago(((1.0 - frac as f64) * span) as u64), egui::FontId::proportional(10.5), p.subtle);
+    let marks: Vec<(f32, String)> = match range {
+        0 => vec![(0.0, "-60m".into()), (0.5, "-30m".into()), (1.0, "now".into())],
+        1 => (0..=4).map(|q| (q as f32 / 4.0, format!("{:02}:00", q * 6))).collect(),
+        _ => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate().map(|(d, n)| ((d as f32 + 0.5) / 7.0, n.to_string())).collect(),
+    };
+    for (frac, text) in marks {
+        let align = if frac <= 0.0 { egui::Align2::LEFT_TOP } else if frac >= 1.0 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
+        pt.text(egui::pos2(plot.left() + plot.width() * frac, plot.bottom() + 4.0), align, text, egui::FontId::proportional(10.5), p.subtle);
     }
-    // Hover: the bucket under the pointer, per model.
+    // Hover: the bucket under the pointer, per key.
     if let Some(h) = resp.hover_pos().filter(|h| plot.contains(*h)) {
-        let k = (0..n).min_by(|a, b| (x_of(*a) - h.x).abs().total_cmp(&(x_of(*b) - h.x).abs())).unwrap_or(0);
+        let k = (0..=cur).min_by(|a, b| (x_of(*a) - h.x).abs().total_cmp(&(x_of(*b) - h.x).abs())).unwrap_or(0);
         clip.line_segment([egui::pos2(x_of(k), plot.top()), egui::pos2(x_of(k), plot.bottom())], egui::Stroke::new(1.0, p.border_strong));
-        let start = (first + k as u64) * w;
+        let at = start + k as u64 * w;
+        let when = match range {
+            0 => format!("{} ({})", clock(at), match now.saturating_sub(at) / 60 { 0 => "this minute".to_string(), m => format!("{m}m ago") }),
+            1 => format!("{} – {}", clock(at), clock(at + w)),
+            _ => format!("{} {}", ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][local(at).0 as usize % 7], clock(at)),
+        };
         let rows: Vec<(usize, f64)> = series.iter().enumerate().map(|(i, s)| (i, s[k])).filter(|(_, v)| *v > 0.0).collect();
         resp.on_hover_ui_at_pointer(|ui| {
-            let what = if cumulative { "calls so far" } else { "calls" };
-            ui.label(egui::RichText::new(format!("{} {what}", ago(now.saturating_sub(start)))).strong().color(p.fg));
+            ui.label(egui::RichText::new(if cumulative { format!("{when}, so far") } else { when }).strong().color(p.fg));
             if rows.is_empty() {
                 ui.label(egui::RichText::new("None").color(p.subtle));
             }
             for (i, v) in rows {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 3.5, shade(i, p));
-                    ui.label(format!("{}: {v:.0}", names[i]));
+                    ui.painter().circle_filled(dot.center(), 3.5, hue(i, p));
+                    ui.label(format!("{}: {}", names[i], fmt(v)));
                 });
             }
         });
     }
-    // The legend: calls in the range, live dot for what is running.
-    let totals: Vec<f64> = series.iter().map(|s| if cumulative { s[n - 1] } else { s.iter().sum() }).collect();
+    ui.add_space(6.0);
+    let unit = if tokens { "" } else { " calls" };
     for (i, name) in names.iter().enumerate() {
+        let total = if cumulative { series[i][cur] } else { series[i].iter().sum() };
         row(ui, 20.0, |ui| {
             let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().rect_filled(dot, 2.0, shade(i, p));
+            ui.painter().rect_filled(dot, 2.0, hue(i, p));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(format!("{:.0} calls", totals[i])).size(12.0).color(p.fg));
-                let live = calls.iter().rev().take_while(|(t, _)| *t + 60 >= now).any(|(_, m)| m == name);
-                if live {
+                ui.label(egui::RichText::new(format!("{}{unit}", fmt(total))).size(12.0).color(p.fg));
+                if running(name) {
                     ui.label(egui::RichText::new("running").size(11.0).color(BLUE));
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1542,8 +1649,24 @@ fn live_chart(ui: &mut egui::Ui, calls: &[(u64, String)], range: usize, cumulati
         });
     }
     if names.is_empty() {
-        ui.label(egui::RichText::new(format!("No calls in the last {}.", RANGES[range].0.to_lowercase())).size(11.5).color(p.subtle));
+        ui.label(egui::RichText::new(format!("Nothing {} yet.", ["in the last hour", "today", "this week"][range as usize])).size(11.5).color(p.subtle));
     }
+}
+
+/// Live's colours: one clearly different hue per key, so a moving layer is easy to tell; the rest share a grey.
+fn hue(i: usize, p: &crate::Pal) -> egui::Color32 {
+    [0x3c6fd6, 0xe08a2e, 0x3fa85f, 0x9a6ce0, 0x2ab3b0, 0xd65c8f].get(i).map_or(p.subtle, |&v| crate::hex(v))
+}
+
+/// The ⋮ button: three dots, a little brighter on hover.
+fn dots(ui: &mut egui::Ui) -> egui::Response {
+    let p = crate::pal(ui);
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(20.0, 26.0), egui::Sense::click());
+    let color = if resp.hovered() { p.fg } else { p.muted };
+    for d in [-5.0, 0.0, 5.0] {
+        ui.painter().circle_filled(r.center() + egui::vec2(0.0, d), 1.6, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // ---------------------------------------------------------------- popup window
@@ -1584,8 +1707,8 @@ fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &
     changed
 }
 
-/// Height of `display_block`: its gap, heading and three rows.
-const DISPLAY_H: f32 = 14.0 + 20.0 + 3.0 * 30.0 + 4.0;
+/// Height of `display_block`: its gap, heading and four rows.
+const DISPLAY_H: f32 = 14.0 + 20.0 + 4.0 * 30.0 + 4.0;
 
 /// One reorder chip: the name between two chevrons; returns -1 / 1 when the left / right one is clicked.
 fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
@@ -1650,6 +1773,17 @@ fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
             cfg.source_order = list.iter().map(|s| s.name().to_string()).collect();
         }
     });
+    row(ui, 30.0, |ui| {
+        label(ui, "Claude");
+        crate::switch(ui, &mut cfg.show_fable, "Show Fable limit bar");
+    });
+}
+
+/// A small down chevron after a word that opens a list.
+fn chevron(ui: &mut egui::Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+    let c = r.center() + egui::vec2(0.0, 1.0);
+    ui.painter().add(egui::Shape::line(vec![c + egui::vec2(-3.5, -2.0), c + egui::vec2(0.0, 1.5), c + egui::vec2(3.5, -2.0)], egui::Stroke::new(1.5, color)));
 }
 
 /// Settings has two views: the tier pickers, and the providers behind them.
@@ -1676,11 +1810,8 @@ struct Popup {
     providers: crate::providers_ui::ProvidersEditor,
     /// Analytics: by model (else by provider), the shown data and the file stamp it was read at, "show more".
     by_model: bool,
-    /// Analytics → Live: shown, its range (an index into `RANGES`), running totals, and the calls with their file stamp.
-    live: bool,
-    range: usize,
-    cumulative: bool,
-    calls: Option<(Vec<(u64, String)>, Option<std::time::SystemTime>)>,
+    /// Analytics → Live: the requests read and the file stamp they were read at.
+    calls: Option<(Vec<Call>, Option<std::time::SystemTime>)>,
     stats: Option<(Stats, bool, Option<std::time::SystemTime>)>,
     more: bool,
     /// Content height measured last frame, for the tabs whose height isn't known up front.
@@ -1727,6 +1858,23 @@ impl Popup {
             }
             row(ui, SECTION_H, |ui| {
                 ui.label(egui::RichText::new(s.title).family(crate::anthropic()).size(15.0).color(p.fg));
+                if s.which == 1 {
+                    // Which model group: a title-sized word that opens a list.
+                    let group = &mut self.cfg.ag_group;
+                    let shown = if group.is_empty() { "All" } else { group.as_str() };
+                    let at = ui.add(egui::Label::new(egui::RichText::new(shown).family(crate::anthropic()).size(15.0).color(p.muted)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    chevron(ui, p.muted);
+                    egui::Popup::menu(&at).show(|ui| {
+                        ui.set_min_width(140.0);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for (v, name) in [("", "All"), ("Gemini", "Gemini"), ("Claude", "Claude")] {
+                            if crate::pick_row(ui, group == v, name, false, "").clicked() {
+                                *group = v.to_string();
+                                ui.close();
+                            }
+                        }
+                    });
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.busy[s.which].load(std::sync::atomic::Ordering::SeqCst) {
                         ui.add_sized([28.0, 28.0], egui::Spinner::new().size(14.0));
@@ -1770,11 +1918,8 @@ impl Popup {
                 // One line, cut to the window with the whole text on hover: a long message must not widen the window.
                 row(ui, ERROR_H, |ui| ui.add(egui::Label::new(egui::RichText::new(e.replace(['\n', '\r'], " ")).size(12.0).color(p.danger)).truncate()).on_hover_text(e));
             }
-            for (i, b) in s.bars.iter().enumerate() {
-                // A merged group names its account beside its first bar.
-                let first = |g: &str| s.bars.iter().position(|x| x.label.starts_with(&format!("{g} ("))) == Some(i);
-                let pl = s.pools.iter().find(|pl| first(&pl.group));
-                bar_ui(ui, b, now, s.stale, pl.map(|pl| pl.shown.as_str()));
+            for r in rows(&s.bars) {
+                bar_row(ui, r, now, s.stale);
             }
         }
         if blocks.is_empty() {
@@ -1794,29 +1939,21 @@ impl Popup {
     fn analytics_tab(&mut self, ui: &mut egui::Ui) {
         let p = crate::pal(ui);
         ui.add_space(8.0);
-        let mut view = if self.live { 2 } else { self.by_model as u8 };
+        // The view last open, kept for the next time the window opens.
+        let mut view = self.cfg.analytics_view;
         row(ui, 26.0, |ui| {
-            segmented(ui, &mut view, &[(0, "Overview"), (1, "Models"), (2, "Live")]);
+            segmented(ui, &mut view, &[(1, "Overview"), (0, "Models"), (2, "Live")]);
             if view != 2 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("Last {DAYS} days")).size(11.5).color(p.subtle)));
             }
         });
-        (self.live, self.by_model) = (view == 2, if view == 2 { self.by_model } else { view == 1 });
+        self.cfg.analytics_view = view;
+        if view != 2 {
+            self.by_model = view == 0;
+        }
         ui.add_space(8.0);
-        if self.live {
-            row(ui, 26.0, |ui| {
-                segmented(ui, &mut self.range, &[(0, "Hour"), (1, "Day"), (2, "Week"), (3, "Month")]);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.checkbox(&mut self.cumulative, "Cumulative"));
-            });
-            ui.add_space(8.0);
-            let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
-            if self.calls.as_ref().is_none_or(|(_, s)| *s != stamp) {
-                let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-                self.calls = Some((load_calls(&text, now().saturating_sub(RANGES[3].1 * BUCKETS)), stamp));
-            }
-            live_chart(ui, &self.calls.as_ref().unwrap().0, self.range, self.cumulative);
-            // It moves: about 30 frames a second while it is shown.
-            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        if view == 2 {
+            self.live_tab(ui);
             return;
         }
         let mut more = self.more;
@@ -1829,6 +1966,57 @@ impl Popup {
         ui.add_space(8.0);
         legend(ui, st, &mut more);
         self.more = more;
+    }
+
+    fn live_tab(&mut self, ui: &mut egui::Ui) {
+        let p = crate::pal(ui);
+        let c = &mut self.cfg;
+        let range = (c.live_range as usize).min(RANGES.len() - 1);
+        row(ui, 28.0, |ui| {
+            // The range: a title that opens a list.
+            let at = ui.add(egui::Label::new(egui::RichText::new(RANGES[range]).family(crate::anthropic()).size(15.0).color(p.fg)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+            chevron(ui, p.muted);
+            egui::Popup::menu(&at).show(|ui| {
+                ui.set_min_width(140.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for r in (0..RANGES.len()).rev() {
+                    if crate::pick_row(ui, range == r, RANGES[r], false, "").clicked() {
+                        c.live_range = r as u8;
+                        ui.close();
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = dots(ui);
+                egui::Popup::menu(&more).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_min_width(200.0);
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(egui::RichText::new("Show by").size(11.0).color(p.subtle));
+                    for (v, name) in [(0, "Total usage"), (1, "Each model"), (2, "Each provider")] {
+                        if crate::pick_row(ui, c.live_by == v, name, false, "").clicked() {
+                            c.live_by = v;
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.separator();
+                    row(ui, 28.0, |ui| {
+                        ui.label(egui::RichText::new("Cumulative").size(13.0).color(p.fg));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::switch(ui, &mut c.live_cumulative, ""));
+                    });
+                });
+                segmented(ui, &mut c.live_calls, &[(false, "Tokens"), (true, "Calls")]);
+            });
+        });
+        ui.add_space(8.0);
+        let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
+        if self.calls.as_ref().is_none_or(|(_, s)| *s != stamp) {
+            let text = fs::read_to_string(tokens_path()).unwrap_or_default();
+            self.calls = Some((load_calls(&text, now().saturating_sub(8 * 86_400)), stamp));
+        }
+        let c = &self.cfg;
+        live_chart(ui, &self.calls.as_ref().unwrap().0, range as u8, c.live_by, !c.live_calls, c.live_cumulative);
+        // It moves: about 30 frames a second while it is shown.
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui, win: &eframe::Frame) {
@@ -1913,7 +2101,7 @@ impl eframe::App for Popup {
         }
 
         let mut reload = None;
-        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()));
+        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, [c.popup_tab, c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
         let before = snapshot(&self.cfg);
         self.providers.poll(&mut self.cfg);
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
@@ -1942,6 +2130,8 @@ impl eframe::App for Popup {
             self.measured = measured;
             ctx.request_repaint();
         }
+        // The tab open now is the one the window opens on next time.
+        self.cfg.popup_tab = self.tab as u8;
         if snapshot(&self.cfg) != before {
             self.save(); // running sessions follow the config file
         }
@@ -1984,6 +2174,8 @@ pub fn run_popup(click: (f64, f64)) {
         options,
         Box::new(move |cc| {
             crate::setup(&cc.egui_ctx);
+            let by_model = cfg.analytics_view == 0;
+            let tab = [Tab::Usage, Tab::Analytics, Tab::Settings].get(cfg.popup_tab as usize).copied().unwrap_or(Tab::Usage);
             let app = Popup {
                 cfg,
                 loaded,
@@ -1994,14 +2186,11 @@ pub fn run_popup(click: (f64, f64)) {
                 anchor,
                 focused_once: false,
                 styled: false,
-                tab: Tab::Usage,
+                tab,
                 sub: Sub::Models,
                 editor: Default::default(),
                 providers: Default::default(),
-                by_model: true,
-                live: false,
-                range: 0,
-                cumulative: true,
+                by_model,
                 calls: None,
                 stats: None,
                 more: false,
@@ -2085,8 +2274,8 @@ mod tests {
         let (plan, bars) = parse_wham(&v, 1_792_300_000);
         assert_eq!(plan, "Plus");
         assert_eq!(bars, [
-            Bar { label: "Session (5hr)".into(), used: 12.0, resets: 1_792_303_000, window: 18_000 },
-            Bar { label: "Weekly (7 day)".into(), used: 40.5, resets: 1_792_390_000, window: 604_800 },
+            Bar { label: "Session (5hr)".into(), used: 12.0, resets: 1_792_303_000, window: 18_000, ..Default::default() },
+            Bar { label: "Weekly (7 day)".into(), used: 40.5, resets: 1_792_390_000, window: 604_800, ..Default::default() },
         ], "a missing reset_at falls back to now + reset_after_seconds");
         assert!(parse_wham(&serde_json::json!({}), 0).1.is_empty());
 
@@ -2118,11 +2307,11 @@ mod tests {
         u.antigravity.insert("a@x".into(), src(""));
         u.antigravity.insert("b@x".into(), src("boom"));
         let s = &sections(&cfg, &u, false)[0];
-        assert!(!s.stale && s.pools.is_empty() && !s.bars.is_empty(), "one account answered: its bars, normal, no pool line");
+        assert!(!s.stale && !s.bars.is_empty() && s.bars.iter().all(|b| b.part.is_empty()), "one account answered: its bars, normal, not split");
 
         u.antigravity.insert("a@x".into(), src(""));
         u.antigravity.insert("b@x".into(), src(""));
-        assert_eq!(sections(&cfg, &u, false)[0].pools.len(), 2, "two accounts: a pool line per group");
+        assert!(sections(&cfg, &u, false)[0].bars.iter().any(|b| !b.part.is_empty()), "two accounts: weekly split by plan");
 
         u.antigravity.insert("a@x".into(), src("down"));
         u.antigravity.insert("b@x".into(), src("down"));
@@ -2149,57 +2338,72 @@ mod tests {
     }
 
     #[test]
-    fn general_shows_the_account_with_the_most_left_and_who_is_ready() {
+    fn general_splits_the_week_by_plan_and_drops_used_up_sessions() {
         // The live mix: free accounts out for the week, a Pro out for the week despite an unused 5 hours, a Pro with a
         // quarter of its 5 hours left; Claude out everywhere.
-        let bar = |label: &str, used, resets, window| Bar { label: label.into(), used, resets, window };
+        let bar = |label: &str, used, resets, window| Bar { label: label.into(), used, resets, window, ..Default::default() };
         let acct = |e: &str, plan: &str| antigravity::Account { email: e.into(), plan: plan.into(), ..Default::default() };
         let src = |bars: Vec<Bar>| Source { bars, ..Default::default() };
-        let (h, d) = (3600, 24 * 3600);
-        let free = src(vec![bar("Gemini (Weekly)", 100.0, 165 * h, WEEK), bar("Claude (Weekly)", 99.96, 167 * h, WEEK)]);
-        let pro_a = src(vec![bar("Gemini (5hr)", 2.7, 2 * h, FIVE_HOURS), bar("Gemini (Weekly)", 100.0, 74 * h, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 99.96, 167 * h, WEEK)]);
-        let pro_b = src(vec![bar("Gemini (5hr)", 75.5, 4 * h, FIVE_HOURS), bar("Gemini (Weekly)", 72.7, 6 * d, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 100.0, 154 * h, WEEK)]);
+        let h = 3600;
+        let free = src(vec![bar("Gemini (Weekly)", 100.0, 165 * h, WEEK), bar("Claude (Weekly)", 100.0, 167 * h, WEEK)]);
+        let free2 = src(vec![bar("Gemini (Weekly)", 60.0, 100 * h, WEEK), bar("Claude (Weekly)", 100.0, 167 * h, WEEK)]);
+        let pro_a = src(vec![bar("Gemini (5hr)", 2.7, 2 * h, FIVE_HOURS), bar("Gemini (Weekly)", 99.96, 74 * h, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 100.0, 167 * h, WEEK)]);
+        let pro_b = src(vec![bar("Gemini (5hr)", 75.5, 4 * h, FIVE_HOURS), bar("Gemini (Weekly)", 72.0, 150 * h, WEEK), bar("Claude (5hr)", 100.0, 4 * h, FIVE_HOURS), bar("Claude (Weekly)", 100.0, 154 * h, WEEK)]);
         let (f1, f2, a, b) = (acct("f1@x", "free-tier"), acct("f2@x", "free-tier"), acct("pa@x", "g1-pro-tier"), acct("pb@x", "g1-pro-tier"));
-        let (bars, pools) = pool(&[(&f1, &free), (&f2, &free), (&a, &pro_a), (&b, &pro_b)]);
-        let used: Vec<(&str, f64)> = bars.iter().map(|b| (b.label.as_str(), b.used)).collect();
-        assert_eq!(used, [("Gemini (5hr)", 75.5), ("Gemini (Weekly)", 72.7), ("Claude (5hr)", 100.0), ("Claude (Weekly)", 100.0)], "Gemini: pb's own buckets, not an average");
-        assert_eq!(pools[0], Pool { group: "Gemini".into(), shown: "pb (Pro)".into() }, "pa's spare 5 hours don't count: its week is used up");
-        assert_eq!((pools[1].shown.as_str(), bars[3].resets), ("pb (Pro)", 154 * h), "none ready: the one back soonest, by its weekly reset, not the 5-hour one");
-        let (one, none) = pool(&[(&f1, &free)]);
-        assert!(one.iter().all(|b| b.window == WEEK) && none.is_empty(), "one account: its own buckets, no pool line");
+        let all = [(&f1, &free), (&f2, &free2), (&a, &pro_a), (&b, &pro_b)];
+        let gemini = ag_bars(&all, "Gemini");
+        let got: Vec<(&str, &str, f64, u64)> = gemini.iter().map(|b| (b.label.as_str(), b.part.as_str(), (b.used * 100.0).round() / 100.0, b.resets)).collect();
+        assert_eq!(got, [("Session (5hr)", "", 75.5, 4 * h), ("Weekly (7 day)", "Free", 80.0, 100 * h), ("Weekly (7 day)", "Pro", 85.98, 74 * h)], "pa's week reads 100%, so its 5 hours don't count; each plan averaged, its soonest reset");
+        let claude = ag_bars(&all, "Claude");
+        assert!(claude.iter().all(|b| b.window == WEEK), "every Claude week used up: no session bar");
+        let both = ag_bars(&all, "");
+        assert_eq!((both[0].label.as_str(), both.last().unwrap().label.as_str()), ("Gemini · Session (5hr)", "Claude · Weekly (7 day)"));
+        let one = ag_bars(&[(&b, &pro_b)], "Gemini");
+        assert!(one.len() == 2 && one.iter().all(|b| b.part.is_empty()), "one account: its own two bars, not split");
+        assert_eq!(rows(&gemini).iter().map(|r| r.len()).collect::<Vec<_>>(), [1, 2], "the plans share a row");
+
+        // Claude and ChatGPT: a used-up week hides the session, and Fable shows only when asked.
+        let claude_code = vec![bar("Session (5hr)", 10.0, 0, FIVE_HOURS), bar("Weekly (7 day)", 50.0, 0, WEEK), bar("Weekly Fable", 3.0, 0, WEEK)];
+        assert_eq!(tidy(&claude_code, false).len(), 2);
+        assert_eq!(tidy(&claude_code, true).len(), 3);
+        let mut out = claude_code.clone();
+        out[1].used = 100.0;
+        assert_eq!(tidy(&out, true).iter().map(|b| b.label.as_str()).collect::<Vec<_>>(), ["Weekly (7 day)"]);
     }
 
     #[test]
-    fn live_counts_calls_per_bucket_and_runs_totals() {
-        let text = [(100, "claude-opus-5-5"), (130, "claude-opus-5-5"), (170, "gpt-6.1-sol"), (3_000, "claude-opus-5-5"), (3_650, "x")]
-            .iter()
-            .map(|(t, m)| json!({ "t": t, "model": m }).to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+    fn live_counts_per_bucket_by_key_and_runs_totals() {
+        let line = |t: u64, m: &str, prov: &str, n: u64| json!({ "t": t, "model": m, "provider": prov, "input": n, "output": 1 }).to_string();
+        let text = [line(100, "claude-opus-5-5", "Claude", 9), line(130, "claude-opus-5-5", "Claude", 9), line(170, "gpt-6.1-sol", "ChatGPT", 99), line(3_000, "claude-opus-5-5", "Antigravity", 9)].join("\n");
         let calls = load_calls(&text, 120);
-        assert_eq!(calls.len(), 4, "older than `since` is left out");
-        // An hour by the minute ending at 3 659: buckets from minute 1 (60 s) on; 130 and 170 fall in minute 2.
-        let (names, s) = live_series(&calls, 3_659, 60, false);
-        assert_eq!(names, ["Opus 5.5", "gpt-6.1-sol", "x"], "most calls first");
-        assert_eq!((s[0][1], s[1][1], s[0][49], s[2][59]), (1.0, 1.0, 1.0, 1.0));
-        let (_, c) = live_series(&calls, 3_659, 60, true);
-        assert_eq!((c[0][0], c[0][1], c[0][48], c[0][59]), (0.0, 1.0, 1.0, 2.0), "cumulative: only ever rises");
+        assert_eq!(calls.len(), 3, "older than `since` is left out");
+        let span = (60, 60, 60); // minutes 1 to 60
+        let (names, s) = live_series(&calls, span, 1, false, false);
+        assert_eq!(names, ["Opus 5.5", "gpt-6.1-sol"], "most first");
+        assert_eq!((s[0][1], s[1][1], s[0][49]), (1.0, 1.0, 1.0));
+        let (names, s) = live_series(&calls, span, 0, true, false);
+        assert_eq!((names.len(), s[0][1], s[0][49]), (1, 110.0, 10.0), "total tokens, in and out");
+        let (names, c) = live_series(&calls, span, 2, false, true);
+        assert_eq!(names, ["Antigravity", "ChatGPT", "Claude"]);
+        assert_eq!((c[2][0], c[2][1], c[2][59], c[0][48], c[0][49]), (0.0, 1.0, 1.0, 0.0, 1.0), "cumulative: only ever rises");
     }
 
     #[test]
-    fn colors_follow_pace_and_limits() {
+    fn colors_follow_use_and_waste() {
         let now = 1_000_000;
-        let bar = |used, left: u64| Bar { label: "x".into(), used, resets: now + left, window: FIVE_HOURS };
-        assert_eq!(bar(30.0, FIVE_HOURS / 2).level(now), Level::Ok, "30% used, half the time gone");
-        assert_eq!(bar(60.0, FIVE_HOURS / 2).level(now), Level::Warn, "ahead of the time passed");
-        assert_eq!(bar(92.0, 60).level(now), Level::Warn, "past 90% even though on pace");
-        assert_eq!(bar(100.0, 60).level(now), Level::Full, "red only when used up");
+        let bar = |used, left: u64, window| Bar { label: "x".into(), used, resets: now + left, window, ..Default::default() };
+        assert_eq!(bar(70.0, 60, FIVE_HOURS).level(now), Level::Ok, "green below 75%, whatever the pace");
+        assert_eq!(bar(75.0, FIVE_HOURS, FIVE_HOURS).level(now), Level::Warn, "orange from 75%");
+        assert_eq!(bar(99.96, 60, FIVE_HOURS).level(now), Level::Full, "red when it reads 100%");
+        assert_eq!(bar(30.0, WEEK / 10, WEEK).level(now), Level::Low, "purple: 90% of the week gone, 30% used");
+        assert_eq!(bar(70.0, WEEK / 10, WEEK).level(now), Level::Ok, "near enough the pace");
+        assert_eq!(bar(10.0, WEEK / 10, FIVE_HOURS).level(now), Level::Ok, "weekly only");
         assert_eq!((ago(0, now), ago(now - 5, now), ago(now - 125, now)), ("never".into(), "just now".into(), "2m ago".into()));
     }
 
     #[test]
     fn dial_arcs_fill_from_the_left() {
-        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window });
+        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window, ..Default::default() });
         let dial = |five, week| Dial { five: bar(five, FIVE_HOURS), week: bar(week, WEEK) };
         let size = 32;
         let px = icon_pixels(size, &[dial(30.0, 50.0), dial(20.0, 100.0)], false, 0);
@@ -2231,7 +2435,7 @@ mod tests {
 
     #[test]
     fn three_sources_split_the_dial_into_sectors() {
-        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window });
+        let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window, ..Default::default() });
         let dial = |five, week| Dial { five: bar(five, FIVE_HOURS), week: bar(week, WEEK) };
         let size = 32;
         let px = icon_pixels(size, &[dial(50.0, 50.0), dial(0.0, 0.0), dial(100.0, 100.0)], false, 0);
