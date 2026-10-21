@@ -1,19 +1,23 @@
-//! A local Anthropic Messages endpoint for Claude Code, served from Google Antigravity accounts.
-//! Claude Code → `POST /v1/messages` → Cloud Code Assist `streamGenerateContent` (Gemini wire) → Anthropic SSE.
+//! A local Anthropic Messages endpoint for Claude Code that routes each model tier to its own provider:
+//! Antigravity (Claude Code → Cloud Code Assist `streamGenerateContent` → Anthropic SSE), an Anthropic-compatible
+//! endpoint (forwarded with its key), or the official API (forwarded with Claude Code's own login).
 //! Also serves `/mcp` (see `mcp`) for Antigravity abilities Claude Code has no built-in tool for.
-//! Binds 127.0.0.1 on a random port and only answers requests carrying the per-launch token.
+//! Binds 127.0.0.1 on a random port. Routes that spend ccat's accounts or keys need the per-launch token;
+//! official routes only ever carry the caller's own credentials, so they don't.
 
 use crate::antigravity::{self, family, Account, Failure, Pool};
+use crate::chatgpt::{self, ChatgptAccount, ChatgptModel};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
@@ -39,19 +43,77 @@ const SEARCH_MODEL: &str = "gemini-3.8-flash-low";
 pub struct Proxy {
     pub url: String,
     pub token: String,
+    /// Swappable while the session runs: a model switched in ccat's settings reaches the next request.
+    pub routes: Arc<RwLock<Vec<Route>>>,
+    /// Emails of the Antigravity accounts to skip; swappable like `routes`.
+    pub disabled: Arc<RwLock<HashSet<String>>>,
+    /// The ChatGPT accounts (their on/off switches included); swappable like `routes`.
+    pub chatgpt: Arc<RwLock<Vec<ChatgptAccount>>>,
+    /// What the config knows of each ChatGPT model (efforts, fast tier); swappable too.
+    pub chatgpt_models: Arc<RwLock<Vec<ChatgptModel>>>,
 }
+
+/// The official API: requests go there with the login Claude Code itself sends.
+const ANTHROPIC_API: &str = "https://api.anthropic.com";
+
+/// The official API, or in tests a fake one.
+fn anthropic_api() -> String {
+    #[cfg(test)]
+    if let Some(u) = tests::FAKE_API.lock().unwrap().clone() {
+        return u;
+    }
+    ANTHROPIC_API.into()
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Upstream {
+    Official,
+    /// `name` is the provider's, for the token log.
+    Endpoint { name: String, url: String, key: String },
+    Antigravity,
+    /// The ChatGPT plan: Anthropic Messages translated to the Responses API.
+    ChatGPT,
+}
+
+/// Names the provider and never the key, so a route can be logged.
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Upstream::Official => "Claude",
+            Upstream::Endpoint { name, .. } => name,
+            Upstream::Antigravity => "Antigravity",
+            Upstream::ChatGPT => "ChatGPT",
+        })
+    }
+}
+
+/// One model tier: the names Claude Code may send for it (fixed at launch), where it goes, the model it runs there
+/// ("" keeps the asked name: an official tier left at Claude Code's own pick), and where it goes when that fails.
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub tier: &'static str,
+    pub names: Vec<String>,
+    pub upstream: Upstream,
+    pub model: String,
+    /// Tried in order when the one before fails before anything streamed.
+    pub fallbacks: Vec<(Upstream, String)>,
+}
+
+/// Where one request goes: upstream, model, tier (for the token log), and the fallbacks.
+type Target = (Upstream, String, &'static str, Vec<(Upstream, String)>);
 
 struct Ctx {
     pool: Pool,
+    gpt: chatgpt::Pool,
     token: String,
     agent_id: String,
     trajectory: String,
     step: AtomicU64,
     /// Gemini puts thought signatures on function calls, which Anthropic tool_use blocks can't carry: tool id → tagged signature.
     sigs: Mutex<HashMap<String, String>>,
-    /// Spoofed Claude name → Antigravity model. With aliases set, any other name falls back to the default alias's model.
-    aliases: HashMap<String, String>,
-    fallback: Option<String>,
+    routes: Arc<RwLock<Vec<Route>>>,
+    /// For official and endpoint tiers: one agent, so their connections (and TLS sessions) are reused.
+    http: ureq::Agent,
     /// The folder Claude Code runs in: MCP tools resolve relative paths against it.
     folder: PathBuf,
     /// Tokens per text byte of an Anthropic request, learned per model family from Google's real prompt counts.
@@ -81,6 +143,24 @@ fn weigh(v: &Value) -> (u64, u64) {
 }
 
 impl Ctx {
+    /// Where a model name goes. An exact name wins, then an explicit `@tier` suffix, then the tier named in it
+    /// (`claude-haiku-…` → Haiku), then — for names Claude Code picks on its own — the official API when a tier
+    /// uses it (the login is there), else the first tier. No routes at all: the name runs on Antigravity as-is.
+    fn resolve(&self, asked: &str) -> Target {
+        let routes = self.routes.read().unwrap();
+        let (base, suffix) = asked.rsplit_once('@').unwrap_or((asked, ""));
+        let low = base.to_lowercase();
+        let route = (routes.iter().find(|r| r.names.iter().any(|n| n == asked)))
+            .or_else(|| routes.iter().find(|r| !suffix.is_empty() && r.tier == suffix))
+            .or_else(|| routes.iter().find(|r| low.contains(r.tier)));
+        match route {
+            Some(r) => (r.upstream.clone(), if r.model.is_empty() { asked.to_string() } else { r.model.clone() }, r.tier, r.fallbacks.clone()),
+            // The official API knows (or rejects) the name itself.
+            None if routes.iter().any(|r| r.upstream == Upstream::Official) => (Upstream::Official, asked.to_string(), "", Vec::new()),
+            None => routes.first().map_or((Upstream::Antigravity, asked.to_string(), "", Vec::new()), |r| (r.upstream.clone(), r.model.clone(), r.tier, r.fallbacks.clone())),
+        }
+    }
+
     /// Remembers how a real request of `fam` tokenized; a moving average so one odd turn doesn't swing it.
     fn learn(&self, fam: &'static str, req: &Value, prompt_tokens: u64) {
         let (bytes, images) = weigh(req);
@@ -100,25 +180,27 @@ impl Ctx {
     }
 }
 
-/// `aliases` maps the Claude names Claude Code was told about to real Antigravity models; `fallback` catches names it
-/// picks on its own (background tasks). Both empty means names pass through unchanged.
-pub fn start(accounts: Vec<Account>, aliases: HashMap<String, String>, fallback: Option<String>, folder: PathBuf) -> io::Result<Proxy> {
-    serve_pool(Pool::new(accounts), aliases, fallback, folder)
+/// `accounts` serve the Antigravity routes, `chatgpt` the ChatGPT ones; `routes` say where each tier goes (see `Ctx::resolve`).
+pub fn start(accounts: Vec<Account>, chatgpt: Vec<ChatgptAccount>, models: Vec<ChatgptModel>, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+    serve_with(Pool::new(accounts), chatgpt::Pool::new(chatgpt, models), routes, folder)
 }
 
-fn serve_pool(pool: Pool, aliases: HashMap<String, String>, fallback: Option<String>, folder: PathBuf) -> io::Result<Proxy> {
+fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+    let routes = Arc::new(RwLock::new(routes));
+    let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
     let token = antigravity::random_hex(24);
     let ctx = Arc::new(Ctx {
         pool,
+        gpt,
         token: token.clone(),
         agent_id: antigravity::uuid(),
         trajectory: antigravity::uuid(),
         step: AtomicU64::new(0),
         sigs: Mutex::new(HashMap::new()),
-        aliases,
-        fallback,
+        routes: routes.clone(),
+        http: ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into(),
         folder,
         ratio: Mutex::new(HashMap::new()),
     });
@@ -128,7 +210,7 @@ fn serve_pool(pool: Pool, aliases: HashMap<String, String>, fallback: Option<Str
             std::thread::spawn(move || serve(conn, &ctx));
         }
     });
-    Ok(Proxy { url, token })
+    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models })
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -233,13 +315,39 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
     if req.path == "/api/hello" {
         return respond(&mut s, 200, &json!({}), "");
     }
+    // With an official tier Claude Code keeps its login in `authorization`, so the token comes as a custom header.
     let bearer = req.header("authorization").and_then(|a| a.strip_prefix("Bearer "));
-    if req.header("x-api-key") != Some(&ctx.token) && bearer != Some(&ctx.token) {
-        return respond_error(&mut s, &Failure { status: 401, message: "ccat proxy: wrong token".into(), retry_after: None });
-    }
+    let authed = [req.header("x-ccat-token"), req.header("x-api-key"), bearer].contains(&Some(ctx.token.as_str()));
+    let denied = |s: &mut TcpStream| respond_error(s, &Failure { status: 401, message: "ccat proxy: wrong token".into(), retry_after: None });
     match (req.method.as_str(), req.path.split('?').next().unwrap_or("")) {
-        ("POST", "/v1/messages") => messages(s, ctx, &req.body),
-        ("POST", "/v1/messages/count_tokens") => count_tokens(s, ctx, &req.body),
+        ("POST", path @ ("/v1/messages" | "/v1/messages/count_tokens")) => {
+            let body: Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => return respond_error(&mut s, &Failure { status: 400, message: format!("body is not JSON: {e}"), retry_after: None }),
+            };
+            // Claude Code may tag a name with a context hint such as `[1m]`.
+            let asked = body["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
+            let counted = path == "/v1/messages";
+            let (up, model, tier, fallbacks) = ctx.resolve(&asked);
+            // Each try spends ccat's keys or accounts unless it's Claude: those need the token.
+            let tries: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).filter(|(u, _)| *u == Upstream::Official || authed).collect();
+            if tries.is_empty() {
+                return denied(&mut s);
+            }
+            // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
+            for (n, (u, m)) in tries.iter().enumerate() {
+                let last = n + 1 == tries.len();
+                if n > 0 {
+                    antigravity::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+                }
+                match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, !last) {
+                    Ok(()) => return,
+                    Err(f) if last => return respond_error(&mut s, &f),
+                    Err(f) => antigravity::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message)),
+                }
+            }
+        }
+        (_, "/mcp") if !authed => denied(&mut s),
         ("POST", "/mcp") => match serde_json::from_slice::<Value>(&req.body) {
             Ok(msg) => match crate::mcp::handle(&ctx.pool, &ctx.folder, &msg) {
                 Some(reply) => respond(&mut s, 200, &reply, ""),
@@ -251,6 +359,9 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
         },
         // No server-initiated stream and no sessions: the MCP spec's answer for both is 405.
         ("GET" | "DELETE", "/mcp") => respond_error(&mut s, &Failure { status: 405, message: "no SSE stream".into(), retry_after: None }),
+        // Anything else Claude Code asks its API for, with its own login, goes to the real one.
+        _ if bearer.is_some_and(|b| b != ctx.token) => drop(forward(&mut s, &ctx.http, &req, &anthropic_api(), None, req.body.clone(), None, false)),
+        _ if !authed => denied(&mut s),
         _ => {
             antigravity::log(&format!("404 {} {} (Claude Code asked for something the proxy doesn't serve)", req.method, req.path));
             respond_error(&mut s, &Failure { status: 404, message: format!("ccat proxy has no {} {}", req.method, req.path), retry_after: None })
@@ -258,11 +369,185 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
     }
 }
 
-/// The Antigravity model a request runs on. Claude Code may tag a model with a context hint such as `[1m]`.
-fn resolve_model(ctx: &Ctx, req: &Value) -> (String, String) {
-    let asked = req["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
-    let model = ctx.aliases.get(&asked).or(ctx.fallback.as_ref()).cloned().unwrap_or_else(|| asked.clone());
-    (asked, model)
+/// Runs a request on one upstream. With `may_fail` a failure that left nothing written comes back as `Err`
+/// (so a fallback can take over); without, it answers Claude Code with the upstream's own error.
+#[allow(clippy::too_many_arguments)]
+fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &Upstream, model: &str, tier: &'static str, counted: bool, may_fail: bool) -> Result<(), Failure> {
+    match up {
+        Upstream::Official => {
+            let meter = counted.then_some((tier, "Claude", model));
+            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body.clone(), model), meter, may_fail)
+        }
+        Upstream::Endpoint { name, url, key } => {
+            let base = url.trim().trim_end_matches('/');
+            let meter = counted.then_some((tier, name.as_str(), model));
+            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body.clone(), model), meter, may_fail)
+        }
+        Upstream::Antigravity if !counted => {
+            count_tokens(s, ctx, body, model);
+            Ok(())
+        }
+        Upstream::Antigravity => messages(s, ctx, body, asked, model.to_string(), tier, may_fail),
+        // The count has no ChatGPT endpoint: the estimate, calibrated on this session's real answers.
+        Upstream::ChatGPT if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("gpt", body) }), "");
+            Ok(())
+        }
+        Upstream::ChatGPT => chatgpt_messages(s, ctx, req, body, asked, model, tier, may_fail),
+    }
+}
+
+/// Worth trying the fallback for: the upstream is down, out of quota, or doesn't know the model or the key.
+/// A malformed request (400) would fail there too.
+fn worth_falling_back(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404 | 408 | 429) || status >= 500
+}
+
+/// The request body for an official or endpoint route: the tier's real model, and no thinking blocks another
+/// provider signed (Antigravity's `ag:` and ChatGPT's `oa:` tags, or none at all): Anthropic rejects a signature it didn't make.
+/// ponytail: an assistant turn that was nothing but such thinking would be left empty; Claude Code always follows
+/// thinking with text or a tool call, so it hasn't come up.
+fn upstream_body(mut body: Value, model: &str) -> Vec<u8> {
+    if body.is_null() {
+        return Vec::new();
+    }
+    body["model"] = json!(model);
+    for m in body["messages"].as_array_mut().into_iter().flatten() {
+        if let Some(blocks) = m["content"].as_array_mut() {
+            blocks.retain(|b| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:")));
+        }
+    }
+    body.to_string().into_bytes()
+}
+
+/// Token usage read off an answer as it passes through: SSE `message_start` / `message_delta` events, or a plain
+/// JSON message. The highest value seen per field wins (`output_tokens` grows through the stream).
+#[derive(Default)]
+struct Meter {
+    sse: bool,
+    tail: Vec<u8>,
+    usage: Map<String, Value>,
+}
+
+impl Meter {
+    fn feed(&mut self, bytes: &[u8]) {
+        if !self.sse {
+            // A whole JSON message; past a few MB it isn't one worth counting.
+            if self.tail.len() < 8 << 20 {
+                self.tail.extend_from_slice(bytes);
+            }
+            return;
+        }
+        self.tail.extend_from_slice(bytes);
+        while let Some(i) = self.tail.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.tail.drain(..=i).collect();
+            if let Some(v) = line.strip_prefix(b"data: ").filter(|d| d.windows(7).any(|w| w == b"\"usage\"")).and_then(|d| serde_json::from_slice::<Value>(d).ok()) {
+                self.take(&v);
+            }
+        }
+    }
+
+    fn take(&mut self, v: &Value) {
+        let u = if v["message"]["usage"].is_object() { &v["message"]["usage"] } else { &v["usage"] };
+        for (k, n) in u.as_object().into_iter().flatten().filter(|(_, n)| n.is_u64()) {
+            if self.usage.get(k).and_then(Value::as_u64) < n.as_u64() {
+                self.usage.insert(k.clone(), n.clone());
+            }
+        }
+    }
+
+    fn finish(mut self) -> Value {
+        if !self.sse {
+            if let Ok(v) = serde_json::from_slice::<Value>(&self.tail) {
+                self.take(&v);
+            }
+        }
+        Value::Object(self.usage)
+    }
+}
+
+/// One line per answered request in `tokens.jsonl` next to the config: when, which tier and provider, which model,
+/// and the tokens. Only routed launches pass through the proxy, so only they are counted. (Kept for future builds.)
+fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
+    let n = |k: &str| usage[k].as_u64().unwrap_or(0);
+    if cfg!(test) || n("input_tokens") + n("output_tokens") + n("cache_read_input_tokens") == 0 {
+        return;
+    }
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let line = json!({ "t": t, "tier": tier, "provider": provider, "model": model, "input": n("input_tokens"), "output": n("output_tokens"),
+                       "cache_read": n("cache_read_input_tokens"), "cache_write": n("cache_creation_input_tokens") });
+    let path = antigravity::log_path().with_file_name("tokens.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(format!("{line}\n").as_bytes()); // one write per line: several sessions can append at once
+    }
+}
+
+/// Official and endpoint routes: the request goes on unchanged except for `body` (and the endpoint's own key),
+/// and the answer, SSE included, streams back as it arrives, rate-limit headers and all. With `meter` (tier,
+/// provider, model) the answer's token usage goes to the token log.
+#[allow(clippy::too_many_arguments)]
+fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: bool) -> Result<(), Failure> {
+    let mut b = ureq::http::Request::builder().method(req.method.as_str()).uri(format!("{base}{}", req.path));
+    for (k, v) in &req.headers {
+        let hop = matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding" | "accept-encoding" | "x-ccat-token");
+        if hop || (key.is_some() && matches!(k.as_str(), "authorization" | "x-api-key")) {
+            continue;
+        }
+        // An endpoint gets its key, not Claude Code's login, so the login's beta flag goes too.
+        let v = match key {
+            Some(_) if k == "anthropic-beta" => v.split(',').map(str::trim).filter(|f| !f.starts_with("oauth-")).collect::<Vec<_>>().join(","),
+            _ => v.clone(),
+        };
+        if !v.is_empty() {
+            b = b.header(k.as_str(), v);
+        }
+    }
+    if let Some(key) = key {
+        b = b.header("x-api-key", key).header("authorization", format!("Bearer {key}"));
+    }
+    let sent = if body.is_empty() { b.body(()).map(|r| agent.run(r)) } else { b.body(body).map(|r| agent.run(r)) };
+    let fail = |s: &mut TcpStream, f: Failure| if may_fail { Err(f) } else { Ok(respond_error(s, &f)) };
+    let mut res = match sent {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return fail(s, Failure { status: 502, message: format!("ccat proxy → {base}: {e}"), retry_after: None }),
+        Err(e) => return fail(s, Failure { status: 400, message: format!("ccat proxy: {e}"), retry_after: None }),
+    };
+    let status = res.status();
+    if may_fail && worth_falling_back(status.as_u16()) {
+        let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
+        let text = res.body_mut().with_config().limit(64 << 10).read_to_string().unwrap_or_default();
+        let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or(text);
+        return Err(Failure { status: status.as_u16(), message, retry_after });
+    }
+    let mut head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or("Status"));
+    for (k, v) in res.headers() {
+        if !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection" | "content-encoding") {
+            head.push_str(&format!("{k}: {}\r\n", v.to_str().unwrap_or("")));
+        }
+    }
+    let bodyless = req.method == "HEAD" || matches!(status.as_u16(), 204 | 304);
+    head.push_str(if bodyless { "Connection: close\r\n\r\n" } else { "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" });
+    if s.write_all(head.as_bytes()).is_err() || bodyless {
+        return Ok(());
+    }
+    let sse = res.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("event-stream"));
+    let mut tokens = (meter.is_some() && status.as_u16() == 200).then(|| Meter { sse, ..Default::default() });
+    let mut reader = res.into_body().into_reader();
+    let mut buf = vec![0u8; 16 << 10];
+    while let Ok(n @ 1..) = reader.read(&mut buf) {
+        let chunk = s.write_all(format!("{n:x}\r\n").as_bytes()).and_then(|_| s.write_all(&buf[..n])).and_then(|_| s.write_all(b"\r\n"));
+        if chunk.is_err() {
+            return Ok(()); // Claude Code hung up
+        }
+        if let Some(m) = tokens.as_mut() {
+            m.feed(&buf[..n]);
+        }
+    }
+    let _ = s.write_all(b"0\r\n\r\n");
+    if let (Some(m), Some((tier, provider, model))) = (tokens, meter) {
+        record(tier, provider, model, &m.finish());
+    }
+    Ok(())
 }
 
 /// The `web_search_*` server tool, when it is the request's only tool — Claude Code's WebSearch sub-request.
@@ -276,12 +561,10 @@ fn web_search(req: &Value) -> Option<&Value> {
 /// Gemini routes: Google counts exactly what `build` would send. Cloud Code's counter only takes `contents`, so the
 /// translated system prompt and function declarations lead them as text. Everything else (Claude/GPT routes, a
 /// failed count) gets the estimate calibrated on this session's real responses.
-fn count_tokens(mut s: TcpStream, ctx: &Ctx, body: &[u8]) {
-    let req: Value = serde_json::from_slice(body).unwrap_or_default();
-    let (_, model) = resolve_model(ctx, &req);
-    let fam = family(&model);
-    let exact = (fam == "gemini").then(|| google_count(ctx, &req, &model)).flatten();
-    respond(&mut s, 200, &json!({ "input_tokens": exact.unwrap_or_else(|| ctx.estimate(fam, &req)) }), "");
+fn count_tokens(s: &mut TcpStream, ctx: &Ctx, req: &Value, model: &str) {
+    let fam = family(model);
+    let exact = (fam == "gemini").then(|| google_count(ctx, req, model)).flatten();
+    respond(s, 200, &json!({ "input_tokens": exact.unwrap_or_else(|| ctx.estimate(fam, req)) }), "");
 }
 
 fn google_count(ctx: &Ctx, req: &Value, model: &str) -> Option<u64> {
@@ -306,18 +589,15 @@ fn google_count(ctx: &Ctx, req: &Value, model: &str) -> Option<u64> {
     }
 }
 
-fn messages(mut s: TcpStream, ctx: &Ctx, body: &[u8]) {
-    let req: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => return respond_error(&mut s, &Failure { status: 400, message: format!("body is not JSON: {e}"), retry_after: None }),
-    };
-    let (asked, model) = resolve_model(ctx, &req);
+#[allow(clippy::too_many_arguments)]
+fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, model: String, tier: &str, may_fail: bool) -> Result<(), Failure> {
     if model.is_empty() {
-        return respond_error(&mut s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
     }
-    let model = if web_search(&req).is_some() && family(&model) != "gemini" { SEARCH_MODEL.to_string() } else { model };
+    let model = if web_search(req).is_some() && family(&model) != "gemini" { SEARCH_MODEL.to_string() } else { model };
     let stream = req["stream"].as_bool().unwrap_or(false);
-    let (cca, beta) = build(&req, &model, ctx);
+    let (cca, beta) = build(req, &model, ctx);
     let mut last = None;
     // Up to three tries while nothing has reached Claude Code: empty answers and in-band quota errors.
     for _ in 0..3 {
@@ -328,23 +608,24 @@ fn messages(mut s: TcpStream, ctx: &Ctx, body: &[u8]) {
                 break;
             }
         };
-        let mut tx = Tx::new(&model, &asked, stream.then_some(&mut s), &ctx.sigs);
+        let mut tx = Tx::new(&model, asked, stream.then_some(&mut *s), &ctx.sigs);
         match tx.run(reader) {
             Ok(()) => {
                 let msg = tx.message();
                 let prompt = tx.usage.0;
                 drop(tx);
+                record(tier, "Antigravity", &model, &msg["usage"]);
                 // Search answers carry Google's page text, which the request never had: they'd skew the ratio.
-                if web_search(&req).is_none() {
-                    ctx.learn(family(&model), &req, prompt);
+                if web_search(req).is_none() {
+                    ctx.learn(family(&model), req, prompt);
                 }
                 if !stream {
-                    respond(&mut s, 200, &msg, "");
+                    respond(s, 200, &msg, "");
                 }
-                return;
+                return Ok(());
             }
             Err(Stop::Retry(f, block)) => {
-                let kind = if web_search(&req).is_some() { " [web search]" } else { "" };
+                let kind = if web_search(req).is_some() { " [web search]" } else { "" };
                 // A client error won't heal on a retry.
                 let fatal = (400..500).contains(&f.status) && f.status != 429;
                 antigravity::log(&format!("{model}{kind}: {} after {} {}", if fatal { "giving up" } else { "retrying" }, f.status, f.message));
@@ -356,11 +637,278 @@ fn messages(mut s: TcpStream, ctx: &Ctx, body: &[u8]) {
                     break;
                 }
             }
-            Err(Stop::Gone) => return,
+            Err(Stop::Gone) => return Ok(()),
         }
     }
-    if let Some(f) = last {
-        respond_error(&mut s, &f);
+    match last {
+        Some(f) if may_fail && worth_falling_back(f.status) => Err(f),
+        Some(f) => Ok(respond_error(s, &f)),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------- Anthropic → ChatGPT (Responses API)
+
+/// What the incoming HTTP request says beyond its body.
+struct Hints {
+    /// Claude Code's session id (else a hash of the system prompt): the prompt-cache key, so a session's turns share a cache.
+    session: String,
+}
+
+fn gpt_hints(req: &Req, body: &Value) -> Hints {
+    let session = req.header("x-claude-code-session-id").filter(|s| !s.is_empty()).map_or_else(
+        || {
+            let mut h = DefaultHasher::new();
+            body["system"].to_string().hash(&mut h);
+            format!("ccat-{:x}", h.finish())
+        },
+        String::from,
+    );
+    Hints { session }
+}
+
+/// The reasoning effort to send: Claude Code's `output_config.effort` (low … max), else its thinking budget, else the
+/// model's own default (as in Codex); always a level the model takes, and never Codex's "ultra".
+fn wanted_effort(req: &Value, meta: Option<&chatgpt::ChatgptModel>) -> String {
+    let asked = match req["output_config"]["effort"].as_str() {
+        Some(e @ ("low" | "medium" | "high" | "xhigh" | "max")) => Some(e),
+        _ => match req["thinking"]["type"].as_str() {
+            Some("enabled") => Some(match req["thinking"]["budget_tokens"].as_u64() {
+                Some(b) if b < 4096 => "low",
+                Some(b) if b < 16384 => "medium",
+                Some(_) => "high",
+                None => "medium",
+            }),
+            Some("disabled") => Some("low"),
+            _ => None,
+        },
+    };
+    let efforts = meta.map_or(&[][..], |m| &m.efforts[..]);
+    match (asked, meta.map(|m| m.default_effort.as_str()).filter(|d| !d.is_empty() && *d != "ultra")) {
+        (Some(e), _) => chatgpt::clamp_effort(e, efforts),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => chatgpt::clamp_effort("medium", efforts),
+    }
+}
+
+fn input_image(b: &Value) -> Option<Value> {
+    let src = &b["source"];
+    let url = match src["type"].as_str()? {
+        "base64" => format!("data:{};base64,{}", src["media_type"].as_str()?, src["data"].as_str()?),
+        "url" => src["url"].as_str()?.to_string(),
+        _ => return None,
+    };
+    Some(json!({ "type": "input_image", "image_url": url }))
+}
+
+fn input_file(b: &Value) -> Option<Value> {
+    let src = &b["source"];
+    match src["type"].as_str()? {
+        "base64" => Some(json!({ "type": "input_file", "filename": b["title"].as_str().unwrap_or("document.pdf"), "file_data": format!("data:{};base64,{}", src["media_type"].as_str()?, src["data"].as_str()?) })),
+        "text" => Some(json!({ "type": "input_text", "text": src["data"] })),
+        _ => None,
+    }
+}
+
+/// The conversation as Responses `input` items: the full history, every time (nothing is stored upstream).
+fn response_input(req: &Value, wrap: bool) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in req["messages"].as_array().into_iter().flatten() {
+        let content = blocks(&m["content"]);
+        if m["role"] == "assistant" {
+            let mut parts: Vec<Value> = Vec::new();
+            let flush = |out: &mut Vec<Value>, parts: &mut Vec<Value>| {
+                if !parts.is_empty() {
+                    out.push(json!({ "type": "message", "role": "assistant", "content": std::mem::take(parts) }));
+                }
+            };
+            for b in &content {
+                match b["type"].as_str() {
+                    Some("text") => parts.extend(b["text"].as_str().filter(|t| !t.trim().is_empty()).map(|t| json!({ "type": "output_text", "text": t }))),
+                    // Only reasoning ChatGPT itself produced comes back; anything else (Claude's, Gemini's) is dropped.
+                    Some("thinking") => {
+                        let held = b["signature"].as_str().and_then(|s| s.strip_prefix("oa:")).and_then(|s| B64.decode(s).ok()).and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+                        if let Some(r) = held.filter(|r| r["encrypted_content"].is_string()) {
+                            flush(&mut out, &mut parts);
+                            out.push(json!({ "type": "reasoning", "id": r["id"], "encrypted_content": r["encrypted_content"], "summary": [] }));
+                        }
+                    }
+                    Some("tool_use") => {
+                        flush(&mut out, &mut parts);
+                        let args = if b["input"].is_object() { b["input"].to_string() } else { "{}".into() };
+                        let mut call = json!({ "type": "function_call", "call_id": b["id"], "name": b["name"], "arguments": args });
+                        if wrap {
+                            call["namespace"] = json!("claude_code");
+                        }
+                        out.push(call);
+                    }
+                    _ => {}
+                }
+            }
+            flush(&mut out, &mut parts);
+        } else {
+            let (mut results, mut rest) = (Vec::new(), Vec::new());
+            for b in &content {
+                match b["type"].as_str() {
+                    Some("tool_result") => {
+                        let (mut text, mut images) = (Vec::new(), Vec::new());
+                        for c in blocks(&b["content"]) {
+                            match c["type"].as_str() {
+                                Some("text") => text.extend(c["text"].as_str().map(String::from)),
+                                Some("image") => images.extend(input_image(&c)),
+                                _ => {}
+                            }
+                        }
+                        let output = if !text.is_empty() { text.join("\n") } else if !images.is_empty() { "(see attached image)".into() } else { String::new() };
+                        results.push(json!({ "type": "function_call_output", "call_id": b["tool_use_id"], "output": output }));
+                        rest.extend(images);
+                    }
+                    Some("text") => rest.extend(b["text"].as_str().filter(|t| !t.trim().is_empty()).map(|t| json!({ "type": "input_text", "text": t }))),
+                    Some("image") => rest.extend(input_image(b)),
+                    Some("document") => rest.extend(input_file(b)),
+                    _ => {}
+                }
+            }
+            out.extend(results);
+            if !rest.is_empty() {
+                out.push(json!({ "type": "message", "role": "user", "content": rest }));
+            }
+        }
+    }
+    out
+}
+
+/// Client tools as function tools (or inside one namespace when the API refused them bare); a web-search server tool as
+/// `web_search`; other server tools have no equivalent and are dropped.
+fn response_tools(req: &Value, wrap: bool) -> Vec<Value> {
+    let tools = req["tools"].as_array().cloned().unwrap_or_default();
+    let fns: Vec<Value> = tools
+        .iter()
+        .filter(|t| t.get("input_schema").is_some())
+        .map(|t| {
+            let mut params = t["input_schema"].clone();
+            if let Some(o) = params.as_object_mut() {
+                o.remove("$schema");
+            }
+            json!({ "type": "function", "name": t["name"], "description": t["description"].as_str().unwrap_or(""), "parameters": params, "strict": false })
+        })
+        .collect();
+    let mut out = if wrap && !fns.is_empty() { vec![json!({ "type": "namespace", "name": "claude_code", "description": "Claude Code tools", "tools": fns })] } else { fns };
+    if tools.iter().any(|t| t["type"].as_str().is_some_and(|k| k.starts_with("web_search"))) {
+        out.push(json!({ "type": "web_search" }));
+    }
+    out
+}
+
+/// The Responses request, built from scratch so no field of Claude Code's can leak through (the plan route rejects a
+/// list of them). Always `store: false` and `stream: true`; never a `service_tier` (fast mode is off on purpose).
+fn responses_body(req: &Value, model: &str, meta: Option<&chatgpt::ChatgptModel>, hints: &Hints, pool: &chatgpt::Pool, codex: bool) -> Value {
+    // What the official route refused is learned per process, but only that route is affected by it.
+    let wrap = pool.wrap.load(Ordering::Relaxed) && !codex;
+    let instructions = system_parts(req).iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n");
+    let mut body = json!({
+        "model": model, "instructions": instructions, "input": response_input(req, wrap), "store": false, "stream": true,
+        "include": ["reasoning.encrypted_content"], "reasoning": { "effort": wanted_effort(req, meta), "summary": "auto" },
+    });
+    let tools = response_tools(req, wrap);
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        let choice = &req["tool_choice"];
+        body["tool_choice"] = match choice["type"].as_str() {
+            Some("any") => json!("required"),
+            Some("tool") => json!({ "type": "function", "name": choice["name"] }),
+            Some("none") => json!("none"),
+            _ => json!("auto"),
+        };
+    }
+    if codex || !pool.no_cache_key.load(Ordering::Relaxed) {
+        body["prompt_cache_key"] = json!(hints.session);
+    }
+    if codex {
+        // The Codex client sends replayed items without their ids.
+        for item in body["input"].as_array_mut().into_iter().flatten().filter(|i| i["type"] == "reasoning") {
+            item.as_object_mut().map(|o| o.remove("id"));
+        }
+        // The Codex backend runs independent tool calls side by side, as the Codex CLI asks it to.
+        body["parallel_tool_calls"] = json!(true);
+    }
+    body
+}
+
+/// A ChatGPT route: the request goes to the first usable account, and on a refusal to the next (see `chatgpt::classify`).
+#[allow(clippy::too_many_arguments)]
+fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, model: &str, tier: &str, may_fail: bool) -> Result<(), Failure> {
+    if model.is_empty() {
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
+    }
+    let pool = &ctx.gpt;
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let meta = pool.models.read().unwrap().iter().find(|m| m.slug == model).cloned();
+    let hints = gpt_hints(req, body);
+    let mut last: Option<Failure> = None;
+    let mut turns = pool.accounts.read().unwrap().len() + 2;
+    while turns > 0 {
+        turns -= 1;
+        let Some(acc) = pool.pick() else {
+            last = Some(match last.take() {
+                Some(f) if f.status != 429 => f,
+                _ => pool.exhausted(),
+            });
+            break;
+        };
+        let payload = responses_body(body, model, meta.as_ref(), &hints, pool, acc.codex());
+        // (what an unsupported_capability named, seconds to block the account, the failure)
+        let (refused, block, failure) = match pool.open(&acc, &payload, &hints.session) {
+            Err(d) => (d.param, d.block, d.failure),
+            Ok(reader) => {
+                let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+                tx.wrap = pool.wrap.load(Ordering::Relaxed) && !acc.codex();
+                match tx.run_responses(reader) {
+                    Ok(()) => {
+                        let msg = tx.message();
+                        let prompt = tx.usage.0;
+                        drop(tx);
+                        record(tier, "ChatGPT", model, &msg["usage"]);
+                        if web_search(body).is_none() {
+                            ctx.learn("gpt", body, prompt);
+                        }
+                        if !stream {
+                            respond(s, 200, &msg, "");
+                        }
+                        return Ok(());
+                    }
+                    Err(Stop::Retry(f, block)) => (tx.param.clone(), block, f),
+                    Err(Stop::Gone) => return Ok(()),
+                }
+            }
+        };
+        antigravity::log(&format!("{model} via {}: {} {}", acc.email, failure.status, failure.message));
+        // An optional field the plan route doesn't take: drop it for the rest of this process and try again.
+        let has_fns = payload["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "function"));
+        let flag = match refused.as_str() {
+            _ if acc.codex() => None,
+            p if p.contains("tools") && has_fns => Some(&pool.wrap),
+            p if p.contains("prompt_cache_key") => Some(&pool.no_cache_key),
+            _ => None,
+        };
+        if let Some(f) = flag.filter(|f| !f.load(Ordering::Relaxed)) {
+            f.store(true, Ordering::Relaxed);
+            turns += 1;
+            continue;
+        }
+        if let Some(secs) = block {
+            pool.block(&acc.key, secs);
+        }
+        last = Some(failure);
+        if block.is_none() {
+            break;
+        }
+    }
+    match last {
+        Some(f) if may_fail && worth_falling_back(f.status) => Err(f),
+        Some(f) => Ok(respond_error(s, &f)),
+        None => Ok(()),
     }
 }
 
@@ -810,7 +1358,7 @@ struct Tx<'a> {
     started: bool,
     blocks: Vec<Value>,
     open: Option<&'static str>,
-    /// Signature for the open thinking block, emitted as `signature_delta` when it closes.
+    /// Signature for the open thinking block (already tagged: `ag:…` or `oa:…`), emitted as `signature_delta` when it closes.
     sig: String,
     /// Leading whitespace held back so an empty answer can still be retried.
     pending: String,
@@ -821,6 +1369,16 @@ struct Tx<'a> {
     /// Google Search grounding: the queries run and the pages cited, (url, title), replayed as Anthropic web-search blocks.
     queries: Vec<String>,
     links: Vec<(String, String)>,
+    // ---- ChatGPT (Responses API) only
+    /// Arguments streamed so far into the open function call.
+    args: String,
+    /// `response.completed` / `response.incomplete` arrived.
+    done: bool,
+    max_tokens: bool,
+    /// Tools go out in a namespace, so a returned call name may carry its prefix.
+    wrap: bool,
+    /// What an `unsupported_capability` failure named (`error.param`): the caller may retry without it.
+    param: String,
 }
 
 impl<'a> Tx<'a> {
@@ -843,6 +1401,11 @@ impl<'a> Tx<'a> {
             stop_reason: "end_turn",
             queries: Vec::new(),
             links: Vec::new(),
+            args: String::new(),
+            done: false,
+            max_tokens: false,
+            wrap: false,
+            param: String::new(),
         }
     }
 
@@ -878,15 +1441,20 @@ impl<'a> Tx<'a> {
     fn close(&mut self) -> Result<(), Stop> {
         let Some(kind) = self.open.take() else { return Ok(()) };
         let index = self.blocks.len() - 1;
+        if kind == "tool" {
+            let args = std::mem::take(&mut self.args);
+            self.blocks[index]["input"] = serde_json::from_str(&args).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
+        }
         if kind == "thinking" && !self.sig.is_empty() {
-            let sig = tag(self.fam, &std::mem::take(&mut self.sig));
+            let sig = std::mem::take(&mut self.sig);
             self.blocks[index]["signature"] = json!(sig);
             self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "signature_delta", "signature": sig } }))?;
         }
         self.send("content_block_stop", json!({ "type": "content_block_stop", "index": index }))
     }
 
-    fn delta(&mut self, kind: &'static str, text: &str) -> Result<(), Stop> {
+    /// Opens a `text` or `thinking` block unless one of that kind is open.
+    fn open_block(&mut self, kind: &'static str) -> Result<(), Stop> {
         if self.open != Some(kind) {
             self.close()?;
             self.begin()?;
@@ -895,6 +1463,11 @@ impl<'a> Tx<'a> {
             self.blocks.push(block);
             self.open = Some(kind);
         }
+        Ok(())
+    }
+
+    fn delta(&mut self, kind: &'static str, text: &str) -> Result<(), Stop> {
+        self.open_block(kind)?;
         let index = self.blocks.len() - 1;
         let block = &mut self.blocks[index][kind];
         *block = json!(format!("{}{text}", block.as_str().unwrap_or("")));
@@ -945,6 +1518,157 @@ impl<'a> Tx<'a> {
         self.send("content_block_stop", json!({ "type": "content_block_stop", "index": index }))?;
         self.blocks.push(block);
         Ok(())
+    }
+
+    // ---- ChatGPT: Responses API events → Anthropic. Nothing is written until the first output event, so a failure
+    // before it is still a retry (account rotation, the tier's fallbacks).
+
+    /// A function call opens a `tool_use` block; its arguments stream into it.
+    fn call_start(&mut self, id: &str, name: &str) -> Result<(), Stop> {
+        self.close()?;
+        self.begin()?;
+        let index = self.blocks.len();
+        let block = json!({ "type": "tool_use", "id": id, "name": name, "input": {} });
+        self.send("content_block_start", json!({ "type": "content_block_start", "index": index, "content_block": block }))?;
+        self.blocks.push(block);
+        (self.open, self.args) = (Some("tool"), String::new());
+        Ok(())
+    }
+
+    fn call_args(&mut self, part: &str) -> Result<(), Stop> {
+        if self.open != Some("tool") || part.is_empty() {
+            return Ok(());
+        }
+        self.args.push_str(part);
+        let index = self.blocks.len() - 1;
+        self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": part } }))
+    }
+
+    /// The model may hand back a name still carrying the namespace its tools were sent in.
+    fn call_name(&self, name: &str) -> String {
+        let rest = name.strip_prefix("claude_code").filter(|_| self.wrap);
+        rest.and_then(|r| r.strip_prefix(['.', '/', ':']).or_else(|| r.strip_prefix("__"))).unwrap_or(name).to_string()
+    }
+
+    fn cite(&mut self, a: &Value) {
+        if let Some(url) = a["url"].as_str().filter(|u| a["type"] == "url_citation" && !self.links.iter().any(|(x, _)| x == u)) {
+            self.links.push((url.to_string(), a["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(url).to_string()));
+        }
+    }
+
+    fn item_done(&mut self, item: &Value) -> Result<(), Stop> {
+        match item["type"].as_str() {
+            Some("reasoning") => {
+                self.open_block("thinking")?;
+                if let Some(enc) = item["encrypted_content"].as_str().filter(|e| !e.is_empty()) {
+                    self.sig = format!("oa:{}", B64.encode(json!({ "id": item["id"], "encrypted_content": enc }).to_string()));
+                }
+            }
+            Some("function_call") => {
+                if self.open != Some("tool") {
+                    // Never announced (no `added` event): open it now, whole.
+                    let id = item["call_id"].as_str().or(item["id"].as_str()).unwrap_or("");
+                    self.call_start(id, &self.call_name(item["name"].as_str().unwrap_or("")))?;
+                }
+                if self.args.is_empty() {
+                    self.call_args(item["arguments"].as_str().unwrap_or(""))?;
+                }
+            }
+            Some("web_search_call") => {
+                let a = &item["action"];
+                for q in a["query"].as_str().into_iter().chain(a["queries"].as_array().into_iter().flatten().filter_map(Value::as_str)) {
+                    if !q.is_empty() && !self.queries.iter().any(|x| x == q) {
+                        self.queries.push(q.to_string());
+                    }
+                }
+            }
+            Some("message") => {
+                for a in item["content"].as_array().into_iter().flatten().flat_map(|c| c["annotations"].as_array().into_iter().flatten()) {
+                    self.cite(a);
+                }
+            }
+            _ => {}
+        }
+        self.close()
+    }
+
+    /// A failure the API reported, before the stream (`status`) or inside it (0).
+    fn gpt_fail(&mut self, status: u16, v: &Value) -> Stop {
+        let (code, message, param) = chatgpt::error_fields(v);
+        let d = chatgpt::with_reset(chatgpt::classify(status, &code, if message.is_empty() { "the request failed" } else { &message }, &param), v);
+        self.param = d.param;
+        self.fail(d.failure, d.block)
+    }
+
+    fn event(&mut self, v: &Value) -> Result<(), Stop> {
+        let s = |k: &str| v[k].as_str().unwrap_or("");
+        match s("type") {
+            "response.output_item.added" if v["item"]["type"] == "function_call" => {
+                let i = &v["item"];
+                let id = i["call_id"].as_str().or(i["id"].as_str()).filter(|x| !x.is_empty()).map_or_else(|| format!("toolu_{}", antigravity::random_hex(12)), String::from);
+                self.call_start(&id, &self.call_name(i["name"].as_str().unwrap_or("")))
+            }
+            "response.output_text.delta" => self.text(s("delta")),
+            "response.reasoning_summary_text.delta" => self.delta("thinking", s("delta")),
+            "response.reasoning_summary_part.added" if v["summary_index"].as_u64().unwrap_or(0) > 0 && self.open == Some("thinking") => self.delta("thinking", "\n\n"),
+            "response.function_call_arguments.delta" => self.call_args(s("delta")),
+            "response.output_item.done" => self.item_done(&v["item"]),
+            "response.output_text.annotation.added" => {
+                self.cite(&v["annotation"]);
+                Ok(())
+            }
+            "response.completed" | "response.incomplete" => {
+                let u = &v["response"]["usage"];
+                let n = |x: &Value| x.as_u64().unwrap_or(0);
+                let input = n(&u["input_tokens"]);
+                self.usage = (input, n(&u["input_tokens_details"]["cached_tokens"]).min(input), n(&u["output_tokens"]));
+                self.done = true;
+                if s("type") == "response.incomplete" {
+                    match v["response"]["incomplete_details"]["reason"].as_str().unwrap_or("") {
+                        "max_output_tokens" => self.max_tokens = true,
+                        other => return Err(self.fail(Failure { status: 400, message: format!("ChatGPT stopped generating ({other})"), retry_after: None }, None)),
+                    }
+                }
+                Ok(())
+            }
+            "response.failed" => Err(self.gpt_fail(0, v)),
+            "error" => Err(self.gpt_fail(0, v)),
+            _ => Ok(()),
+        }
+    }
+
+    fn run_responses(&mut self, reader: Box<dyn BufRead + Send>) -> Result<(), Stop> {
+        let mut data = String::new();
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("ChatGPT stream broke: {e}"), retry_after: None }, Some(0))),
+            };
+            if let Some(d) = line.strip_prefix("data:") {
+                data.push_str(d.trim_start());
+            } else if line.trim().is_empty() && !data.is_empty() {
+                let v: Value = serde_json::from_str(&std::mem::take(&mut data)).unwrap_or_default();
+                self.event(&v)?;
+            }
+        }
+        if !data.is_empty() {
+            let v: Value = serde_json::from_str(&data).unwrap_or_default();
+            self.event(&v)?;
+        }
+        if !self.done {
+            return Err(self.fail(Failure { status: 502, message: "ChatGPT stream ended before the response finished".into(), retry_after: None }, Some(0)));
+        }
+        if !self.started && self.queries.is_empty() && self.links.is_empty() {
+            return Err(self.fail(Failure { status: 529, message: "ChatGPT returned an empty response".into(), retry_after: None }, Some(0)));
+        }
+        let any_tool = self.blocks.iter().any(|b| b["type"] == "tool_use");
+        self.stop_reason = if any_tool { "tool_use" } else if self.max_tokens { "max_tokens" } else { "end_turn" };
+        self.search_results()?;
+        self.close()?;
+        self.begin()?;
+        let (usage, stop) = (self.usage_json(), self.stop_reason);
+        self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
+        self.send("message_stop", json!({ "type": "message_stop" }))
     }
 
     /// Fails the request: retryable while nothing was sent, otherwise an SSE `error` event (overloaded → Claude Code retries).
@@ -1004,14 +1728,14 @@ impl<'a> Tx<'a> {
                 Some(t) if part["thought"] == true => {
                     self.delta("thinking", t)?;
                     if let Some(s) = sig {
-                        self.sig = s.to_string();
+                        self.sig = tag(self.fam, s);
                     }
                 }
                 Some(t) => self.text(t)?,
                 // A bare signature part belongs to the thinking block it follows.
                 None if self.open == Some("thinking") => {
                     if let Some(s) = sig {
-                        self.sig = s.to_string();
+                        self.sig = tag(self.fam, s);
                     }
                 }
                 None => {}
@@ -1104,16 +1828,28 @@ impl<'a> Tx<'a> {
 mod tests {
     use super::*;
 
+    pub static FAKE_API: Mutex<Option<String>> = Mutex::new(None);
+
+    fn serve_pool(pool: Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+        serve_with(pool, chatgpt::Pool::new(Vec::new(), Vec::new()), routes, folder)
+    }
+
+    /// One Antigravity tier that Claude Code knows as `name`.
+    fn ag(name: &str, model: &str) -> Vec<Route> {
+        vec![route("opus", &[name], Upstream::Antigravity, model)]
+    }
+
     fn ctx() -> Ctx {
         Ctx {
             pool: Pool::fake("http://127.0.0.1:1", &["a"]),
+            gpt: chatgpt::Pool::new(Vec::new(), Vec::new()),
             token: "t".into(),
             agent_id: "agent".into(),
             trajectory: "traj".into(),
             step: AtomicU64::new(0),
             sigs: Mutex::new(HashMap::new()),
-            aliases: HashMap::new(),
-            fallback: None,
+            routes: Default::default(),
+            http: ureq::Agent::new_with_defaults(),
             folder: PathBuf::new(),
             ratio: Mutex::new(HashMap::new()),
         }
@@ -1299,7 +2035,7 @@ be brief" }, { "type": "text", "text": " " }],
     #[test]
     fn rotates_past_quota_and_in_band_errors() {
         let (url, seen) = fake_upstream(reply());
-        let proxy = serve_pool(Pool::fake(&url, &["quota", "inband", "good"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["quota", "inband", "good"]), Vec::new(), PathBuf::new()).unwrap();
         let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
         assert_eq!(post(&proxy, "nope", &req).0, 401);
 
@@ -1316,9 +2052,32 @@ be brief" }, { "type": "text", "text": " " }],
     }
 
     #[test]
+    fn turned_off_accounts_are_skipped_live() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["first", "second"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "first p-first");
+
+        // Switched off while running: the next request goes to the other account, the one after to none.
+        proxy.disabled.write().unwrap().insert("first".into());
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "second p-second");
+        proxy.disabled.write().unwrap().insert("second".into());
+        let n = seen.lock().unwrap().len();
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status >= 400 && body.contains("turned off"), "{status} {body}");
+        assert_eq!(seen.lock().unwrap().len(), n, "nothing reached Google");
+
+        // And back on.
+        proxy.disabled.write().unwrap().clear();
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+    }
+
+    #[test]
     fn empty_answers_are_retried_then_reported() {
         let (url, seen) = fake_upstream(reply());
-        let proxy = serve_pool(Pool::fake(&url, &["empty"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["empty"]), Vec::new(), PathBuf::new()).unwrap();
         let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
         let (status, body) = post(&proxy, &proxy.token, &req);
         assert_eq!(status, 529, "nothing was streamed, so Claude Code gets a retryable status: {body}");
@@ -1329,8 +2088,8 @@ be brief" }, { "type": "text", "text": " " }],
     #[test]
     fn translates_stream_and_non_stream() {
         let (url, seen) = fake_upstream(reply());
-        let aliases = HashMap::from([("claude-opus-5-5".to_string(), "gemini-3.1-pro-low".to_string())]);
-        let proxy = serve_pool(Pool::fake(&url, &["good", "quota"]), aliases, Some("gemini-3.1-pro-low".into()), PathBuf::new()).unwrap();
+        let aliases = ag("claude-opus-5-5", "gemini-3.1-pro-low");
+        let proxy = serve_pool(Pool::fake(&url, &["good", "quota"]), aliases, PathBuf::new()).unwrap();
         let req = json!({ "model": "claude-opus-5-5[1m]", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
         let (status, body) = post(&proxy, &proxy.token, &req);
         assert_eq!(status, 200, "{body}");
@@ -1367,10 +2126,157 @@ be brief" }, { "type": "text", "text": " " }],
         assert_eq!(*seen.lock().unwrap(), ["good p-good", "good p-good"].map(String::from), "sticky on the healthy account");
     }
 
+    fn route(tier: &'static str, names: &[&str], upstream: Upstream, model: &str) -> Route {
+        Route { tier, names: names.iter().map(|n| n.to_string()).collect(), upstream, model: model.into(), fallbacks: Vec::new() }
+    }
+
+    #[test]
+    fn tiers_resolve_by_name_then_tier_then_family_then_login() {
+        let ctx = ctx();
+        *ctx.routes.write().unwrap() = vec![
+            route("fable", &["claude-fable-5-1"], Upstream::Official, "claude-fable-5-1"),
+            route("opus", &[], Upstream::Official, ""),
+            route("sonnet", &["gemini-x@sonnet", "claude-sonnet-5-5"], Upstream::Antigravity, "gemini-x"),
+            route("haiku", &["m@haiku"], Upstream::Endpoint { name: "OR".into(), url: "u".into(), key: "k".into() }, "vendor/m"),
+        ];
+        let got = |asked: &str| {
+            let (u, m, _, _) = ctx.resolve(asked);
+            (u, m)
+        };
+        assert_eq!(got("gemini-x@sonnet"), (Upstream::Antigravity, "gemini-x".into()), "a spoofed tier's override target");
+        assert_eq!(got("claude-sonnet-5-5"), (Upstream::Antigravity, "gemini-x".into()), "its Claude name, if Claude Code sends that");
+        assert_eq!(got("claude-opus-4-6"), (Upstream::Official, "claude-opus-4-6".into()), "an official tier left at Claude Code's pick keeps the name");
+        assert_eq!(got("claude-haiku-4-5-20251001").1, "vendor/m", "a Claude Code pick goes to its family's tier");
+        assert_eq!(got("claude-opus-x@haiku").1, "vendor/m", "an explicit @tier beats the family in the name");
+        assert_eq!(got("something-else"), (Upstream::Official, "something-else".into()), "unknown names go to the login");
+        ctx.routes.write().unwrap().retain(|r| r.upstream != Upstream::Official);
+        assert_eq!(got("something-else"), (Upstream::Antigravity, "gemini-x".into()), "…or, with no official tier, to the first one");
+
+        // A switch made while the session runs: same names, new upstream.
+        ctx.routes.write().unwrap()[0].upstream = Upstream::Official;
+        ctx.routes.write().unwrap()[0].model = "claude-sonnet-5-5".into();
+        assert_eq!(got("gemini-x@sonnet"), (Upstream::Official, "claude-sonnet-5-5".into()));
+    }
+
+    /// An endpoint that answers `status` with a body naming itself, for fallback tests.
+    fn fake_endpoint(status: u16, who: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let _ = read_request(&s);
+                let text = json!({ "type": "message", "who": who, "error": { "message": format!("{who} says {status}") }, "usage": { "input_tokens": 1, "output_tokens": 1 } }).to_string();
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}", text.len());
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_failing_tier_falls_back_once() {
+        let ep = |name: &str, url: String| Upstream::Endpoint { name: name.into(), url, key: "k".into() };
+        let (busy, good) = (fake_endpoint(429, "busy"), fake_endpoint(200, "good"));
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy.clone()), "m");
+        r.fallbacks = vec![(ep("Down", fake_endpoint(503, "down")), "second".into()), (ep("Good", good), "other".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        let body = json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, text) = post(&proxy, &proxy.token, &body);
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("\"who\":\"good\""), "the second fallback answered after the first was down too: {text}");
+
+        // No fallback: the upstream's own 429 reaches Claude Code untouched.
+        proxy.routes.write().unwrap()[0].fallbacks.clear();
+        let (status, text) = post(&proxy, &proxy.token, &body);
+        assert_eq!(status, 429);
+        assert!(text.contains("busy says 429"), "{text}");
+
+        // A bad request isn't the upstream's fault: no fallback for a 400.
+        proxy.routes.write().unwrap()[0] = Route { fallbacks: vec![(ep("Good", fake_endpoint(200, "good")), "x".into())], ..route("sonnet", &["m@sonnet"], ep("Bad", fake_endpoint(400, "bad")), "m") };
+        assert_eq!(post(&proxy, &proxy.token, &body).0, 400);
+
+        // A Claude tier (no token needed) whose fallback spends a key: without the token, no fallback.
+        proxy.routes.write().unwrap()[0] = Route { fallbacks: vec![(ep("Good", fake_endpoint(200, "good")), "x".into())], ..route("sonnet", &["m@sonnet"], Upstream::Official, "m") };
+        *FAKE_API.lock().unwrap() = Some(busy);
+        let (status, text) = post(&proxy, "not-the-token", &body);
+        assert_ne!(status, 200, "{text}");
+        assert!(!text.contains("good"), "{text}");
+        assert_eq!(format!("{:?}", ep("OR", "u".into())), "OR", "logs name the provider, never the key");
+    }
+
+    #[test]
+    fn endpoint_tiers_get_their_key_model_and_clean_history() {
+        // Echoes what reached the endpoint, in a streamed answer with a rate-limit header.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let h = |k: &str| req.header(k).unwrap_or("-").to_string();
+                let seen = json!({ "path": req.path, "key": h("x-api-key"), "auth": h("authorization"), "beta": h("anthropic-beta"),
+                                   "token": h("x-ccat-token"), "body": serde_json::from_slice::<Value>(&req.body).unwrap() });
+                let text = format!("event: seen\ndata: {seen}\n\n");
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nanthropic-ratelimit-unified-5h-utilization: 0.25\r\nContent-Length: {}\r\n\r\n{text}", text.len());
+            }
+        });
+        let routes = vec![route("sonnet", &["m@sonnet"], Upstream::Endpoint { name: "OR".into(), url, key: "ek".into() }, "vendor/m")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let body = json!({ "model": "m@sonnet[1m]", "max_tokens": 10, "stream": true, "messages": [
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "from gemini", "signature": "ag:gemini:U0lH" },
+                { "type": "thinking", "thinking": "unsigned", "signature": "" },
+                { "type": "thinking", "thinking": "from anthropic", "signature": "EqQBCkg" },
+                { "type": "text", "text": "hello" } ] },
+            { "role": "user", "content": "again" } ] });
+        let call = |token: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            agent.post(format!("{}/v1/messages?beta=true", proxy.url))
+                .header("authorization", "Bearer sk-ant-oat01-login")
+                .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
+                .header("x-ccat-token", token)
+                .send(body.to_string())
+                .unwrap()
+        };
+        assert_eq!(call("nope").status().as_u16(), 401, "an endpoint tier spends ccat's key, so it needs the token");
+
+        let mut res = call(&proxy.token);
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(res.headers()["anthropic-ratelimit-unified-5h-utilization"], "0.25", "upstream headers come back");
+        let text = res.body_mut().read_to_string().unwrap();
+        let seen: Value = serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+        assert_eq!(seen["path"], "/v1/messages?beta=true", "the /v1 the URL ended with isn't doubled");
+        assert_eq!((&seen["key"], &seen["auth"]), (&json!("ek"), &json!("Bearer ek")), "the endpoint's key, never the Claude login");
+        assert_eq!(seen["beta"], "interleaved-thinking-2025-05-14", "the login's beta flag stays home");
+        assert_eq!(seen["token"], "-", "the proxy token stays home");
+        assert_eq!(seen["body"]["model"], "vendor/m");
+        let kept: Vec<&str> = seen["body"]["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
+        assert_eq!(kept, ["from anthropic", "hello"], "thinking another provider signed is dropped");
+    }
+
+    #[test]
+    fn meter_reads_usage_from_streams_and_messages() {
+        let mut m = Meter { sse: true, ..Default::default() };
+        let stream = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":3000,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n"
+        );
+        // Split mid-line, as network reads are.
+        let (a, b) = stream.as_bytes().split_at(57);
+        m.feed(a);
+        m.feed(b);
+        let u = m.finish();
+        assert_eq!((u["input_tokens"].as_u64(), u["output_tokens"].as_u64(), u["cache_read_input_tokens"].as_u64()), (Some(12), Some(42), Some(3000)));
+
+        let mut m = Meter::default();
+        m.feed(br#"{"type":"message","usage":{"input_tokens":5,"output_tokens":7}}"#);
+        assert_eq!(m.finish()["output_tokens"], 7, "a non-streamed message");
+    }
+
     #[test]
     fn all_blocked_is_a_429_with_retry_after() {
         let (url, _) = fake_upstream(reply());
-        let proxy = serve_pool(Pool::fake(&url, &["quota"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["quota"]), Vec::new(), PathBuf::new()).unwrap();
         let req = json!({ "model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
         let (status, body) = post(&proxy, &proxy.token, &req);
         assert_eq!(status, 429);
@@ -1406,8 +2312,8 @@ be brief" }, { "type": "text", "text": " " }],
     fn web_search_results_reach_claude_code() {
         let (url, _) = fake_upstream(reply());
         // The Claude route is swapped to the Gemini search model; replies keep the asked-for name.
-        let aliases = HashMap::from([("claude-opus-5-5".to_string(), "claude-opus-4-6-thinking".to_string())]);
-        let proxy = serve_pool(Pool::fake(&url, &["search"]), aliases, None, PathBuf::new()).unwrap();
+        let aliases = ag("claude-opus-5-5", "claude-opus-4-6-thinking");
+        let proxy = serve_pool(Pool::fake(&url, &["search"]), aliases, PathBuf::new()).unwrap();
         let (status, body) = post(&proxy, &proxy.token, &web_search_req("claude-opus-5-5"));
         assert_eq!(status, 200, "{body}");
         let events: Vec<Value> = body.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect();
@@ -1452,7 +2358,7 @@ be brief" }, { "type": "text", "text": " " }],
         let (url, seen) = fake_upstream(reply());
         let req = |stream: bool| json!({ "model": "gemini-3.5-flash-low", "max_tokens": 64, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] });
 
-        let proxy = serve_pool(Pool::fake(&url, &["retired"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["retired"]), Vec::new(), PathBuf::new()).unwrap();
         let (status, body) = post(&proxy, &proxy.token, &req(false));
         assert_eq!(status, 400, "{body}");
         assert!(body.contains("invalid_request_error") && body.contains("no longer available"), "Google's words reach the user: {body}");
@@ -1462,7 +2368,7 @@ be brief" }, { "type": "text", "text": " " }],
         assert!(body.contains("event: error") && body.contains("invalid_request_error"), "{body}");
 
         // Nothing said and no finish reason: still a retryable hiccup.
-        let proxy = serve_pool(Pool::fake(&url, &["silent"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["silent"]), Vec::new(), PathBuf::new()).unwrap();
         let (status, body) = post(&proxy, &proxy.token, &req(false));
         assert_eq!(status, 529, "{body}");
         assert!(body.contains("without a finish reason; last line: data:"), "{body}");
@@ -1483,7 +2389,7 @@ be brief" }, { "type": "text", "text": " " }],
     #[test]
     fn count_tokens_is_exact_on_gemini_and_calibrated_elsewhere() {
         let (url, seen) = fake_upstream(reply());
-        let proxy = serve_pool(Pool::fake(&url, &["good"]), HashMap::new(), None, PathBuf::new()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["good"]), Vec::new(), PathBuf::new()).unwrap();
         let tools = json!([{ "name": "Read", "description": "Read a file", "input_schema": { "type": "object", "additionalProperties": false,
                              "properties": { "path": { "type": "string", "minLength": 1 } } } }, { "type": "web_search_20250305", "name": "web_search" }]);
         let req = |model: &str| json!({ "model": model, "system": [{ "type": "text", "text": "x-anthropic-billing-header: cch=1;" }, { "type": "text", "text": "be brief" }],
@@ -1529,7 +2435,7 @@ be brief" }, { "type": "text", "text": " " }],
         let dir = std::env::temp_dir().join(format!("ccat-mcp-{}", antigravity::random_hex(4)));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("in.png"), b"png").unwrap();
-        let proxy = serve_pool(Pool::fake(&url, &["image"]), HashMap::new(), None, dir.clone()).unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["image"]), Vec::new(), dir.clone()).unwrap();
         let rpc = |body: Value| {
             let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
             let mut res = agent.post(format!("{}/mcp", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(body.to_string()).unwrap();
@@ -1561,15 +2467,454 @@ be brief" }, { "type": "text", "text": " " }],
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- ChatGPT: end to end against a fake Responses API
+
+    fn rsse(events: &[Value]) -> String {
+        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap_or("x"))).collect()
+    }
+
+    /// Answers every POST with `reply(bearer, body, how many came before)`; the requests it saw are the second value.
+    fn fake_responses(reply: impl Fn(&str, &Value, usize) -> (u16, String) + Send + 'static) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                assert!(req.path.ends_with("/responses"));
+                let who = req.header("authorization").unwrap_or("").trim_start_matches("Bearer ").to_string();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let n = {
+                    let mut l = log.lock().unwrap();
+                    l.push((who.clone(), body.clone()));
+                    l.len() - 1
+                };
+                let (status, text) = reply(&who, &body, n);
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        (url, seen)
+    }
+
+    fn completed(input: u64, cached: u64, output: u64) -> Value {
+        json!({ "type": "response.completed", "response": { "usage": { "input_tokens": input, "input_tokens_details": { "cached_tokens": cached }, "output_tokens": output } } })
+    }
+
+    /// A streamed text answer.
+    fn gpt_text(parts: &[&str]) -> String {
+        let mut ev = vec![json!({ "type": "response.created" }), json!({ "type": "response.output_item.added", "item": { "type": "message", "role": "assistant" } })];
+        ev.extend(parts.iter().map(|p| json!({ "type": "response.output_text.delta", "delta": p })));
+        ev.push(json!({ "type": "response.output_item.done", "item": { "type": "message" } }));
+        ev.push(completed(100, 40, 7));
+        rsse(&ev)
+    }
+
+    fn failed(code: &str) -> Value {
+        json!({ "type": "response.failed", "response": { "error": { "code": code, "message": format!("{code}!") } } })
+    }
+
+    fn gpt_proxy(base: &str, accounts: &[&str], models: Vec<chatgpt::ChatgptModel>) -> Proxy {
+        let routes = vec![route("opus", &["claude-opus-5-5"], Upstream::ChatGPT, "gpt-test")];
+        let gpt = chatgpt::Pool::fake(base, accounts);
+        *gpt.models.write().unwrap() = models;
+        serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), gpt, routes, PathBuf::new()).unwrap()
+    }
+
+    fn gpt_req(stream: bool) -> Value {
+        json!({ "model": "claude-opus-5-5", "max_tokens": 1000, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] })
+    }
+
+    fn post_h(proxy: &Proxy, headers: &[(&str, &str)], body: &Value) -> (u16, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut r = agent.post(format!("{}/v1/messages?beta=true", proxy.url)).header("authorization", format!("Bearer {}", proxy.token));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        let mut res = r.send(body.to_string()).unwrap();
+        (res.status().as_u16(), res.body_mut().read_to_string().unwrap())
+    }
+
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect()
+    }
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    fn model(slug: &str, efforts: &[&str], default: &str) -> chatgpt::ChatgptModel {
+        chatgpt::ChatgptModel { slug: slug.into(), name: slug.into(), efforts: efforts.iter().map(|e| e.to_string()).collect(), default_effort: default.into() }
+    }
+
+    #[test]
+    fn chatgpt_text_answer_becomes_anthropic_sse() {
+        let (url, seen) = fake_responses(|_, _, _| (200, gpt_text(&["Hel", "lo"])));
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        assert_eq!(post(&proxy, "nope", &gpt_req(true)).0, 401, "ChatGPT spends the plan: it needs the token");
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200, "{body}");
+        let ev = sse_events(&body);
+        assert_eq!(types(&ev), ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+        assert_eq!(ev[0]["message"]["model"], "claude-opus-5-5");
+        assert_eq!((ev[2]["delta"]["text"].as_str(), ev[3]["delta"]["text"].as_str()), (Some("Hel"), Some("lo")));
+        assert_eq!(ev[5]["delta"]["stop_reason"], "end_turn");
+        assert_eq!(ev[5]["usage"], json!({ "input_tokens": 60, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 0, "output_tokens": 7 }));
+        assert_eq!(seen.lock().unwrap()[0].0, "good", "the account's access token went upstream");
+
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((msg["content"][0]["text"].as_str(), msg["stop_reason"].as_str()), (Some("Hello"), Some("end_turn")));
+        assert_eq!(msg["usage"]["cache_read_input_tokens"], 40);
+        let before = seen.lock().unwrap().len();
+        assert!(count_tokens_of(&proxy) > 0);
+        assert_eq!(seen.lock().unwrap().len(), before, "the count is a local estimate");
+    }
+
+    /// `count_tokens` for a ChatGPT tier: the local estimate, nothing sent upstream.
+    fn count_tokens_of(proxy: &Proxy) -> u64 {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut res = agent.post(format!("{}/v1/messages/count_tokens", proxy.url)).header("x-api-key", &proxy.token).send(gpt_req(false).to_string()).unwrap();
+        serde_json::from_str::<Value>(&res.body_mut().read_to_string().unwrap()).unwrap()["input_tokens"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn chatgpt_function_calls_round_trip() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["input"].as_array().unwrap().iter().any(|i| i["type"] == "function_call_output") {
+                return (200, gpt_text(&["done"]));
+            }
+            let call = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": "" });
+            let done = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}" });
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": call }),
+                json!({ "type": "response.function_call_arguments.delta", "delta": "{\"p\":" }),
+                json!({ "type": "response.function_call_arguments.delta", "delta": "\"a\"}" }),
+                json!({ "type": "response.output_item.done", "item": done }),
+                completed(10, 0, 3),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let mut req = gpt_req(true);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object", "properties": { "p": { "type": "string" } } } }]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let ev = sse_events(&body);
+        assert_eq!(types(&ev), ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+        assert_eq!(ev[1]["content_block"], json!({ "type": "tool_use", "id": "call_1", "name": "Read", "input": {} }));
+        assert_eq!((ev[2]["delta"]["partial_json"].as_str(), ev[3]["delta"]["partial_json"].as_str()), (Some("{\"p\":"), Some("\"a\"}")));
+        assert_eq!(ev[5]["delta"]["stop_reason"], "tool_use");
+
+        // The next turn replays the call and its result under the same call id.
+        req["messages"] = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [{ "type": "text", "text": "reading" }, { "type": "tool_use", "id": "call_1", "name": "Read", "input": { "p": "a" } }] },
+            { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": [{ "type": "text", "text": "contents" }] }] }
+        ]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let input = &seen.lock().unwrap()[1].1["input"];
+        assert_eq!(input[0], json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }));
+        assert_eq!(input[1], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "reading" }] }));
+        assert_eq!(input[2], json!({ "type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}" }));
+        assert_eq!(input[3], json!({ "type": "function_call_output", "call_id": "call_1", "output": "contents" }));
+    }
+
+    #[test]
+    fn chatgpt_reasoning_is_signed_and_replayed() {
+        let (url, seen) = fake_responses(|_, _, _| {
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": { "type": "reasoning", "id": "rs_1" } }),
+                json!({ "type": "response.reasoning_summary_part.added", "summary_index": 0 }),
+                json!({ "type": "response.reasoning_summary_text.delta", "delta": "think" }),
+                json!({ "type": "response.output_item.done", "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": [] } }),
+                json!({ "type": "response.output_item.added", "item": { "type": "message" } }),
+                json!({ "type": "response.output_text.delta", "delta": "Hello" }),
+                json!({ "type": "response.output_item.done", "item": { "type": "message" } }),
+                completed(10, 0, 3),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let (_, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        let ev = sse_events(&body);
+        assert_eq!(
+            types(&ev),
+            ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(ev[1]["content_block"]["type"], "thinking");
+        assert_eq!(ev[2]["delta"], json!({ "type": "thinking_delta", "thinking": "think" }));
+        let sig = ev[3]["delta"]["signature"].as_str().unwrap().to_string();
+        let held: Value = serde_json::from_slice(&B64.decode(sig.strip_prefix("oa:").unwrap()).unwrap()).unwrap();
+        assert_eq!(held, json!({ "id": "rs_1", "encrypted_content": "ENC" }));
+
+        let mut req = gpt_req(true);
+        req["messages"] = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [{ "type": "thinking", "thinking": "think", "signature": sig }, { "type": "thinking", "thinking": "g", "signature": "ag:gemini:U0lH" }, { "type": "text", "text": "Hello" }] },
+            { "role": "user", "content": "more" }
+        ]);
+        post(&proxy, &proxy.token, &req);
+        let input = seen.lock().unwrap()[1].1["input"].clone();
+        let kinds: Vec<&str> = input.as_array().unwrap().iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["message", "reasoning", "message", "message"], "another provider's thinking is dropped");
+        assert_eq!(input[1], json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": [] }));
+    }
+
+    #[test]
+    fn chatgpt_usage_limit_rotates_to_the_next_account() {
+        let (url, seen) = fake_responses(|who, _, _| match who {
+            "limit" => (200, rsse(&[json!({ "type": "response.created" }), failed("subscription_sharing_usage_limit_exceeded")])),
+            _ => (200, gpt_text(&["fine"])),
+        });
+        let proxy = gpt_proxy(&url, &["limit", "good"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("fine") && body.contains("message_stop") && !body.contains("event: error"), "{body}");
+        let who = |s: &Arc<Mutex<Vec<(String, Value)>>>| s.lock().unwrap().iter().map(|(w, _)| w.clone()).collect::<Vec<_>>();
+        assert_eq!(who(&seen), ["limit", "good"]);
+        // The block is remembered: the next request goes straight to the second account.
+        post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(who(&seen), ["limit", "good", "good"]);
+
+        // Everything over its usage: a 429 with a Retry-After (the tier's fallback would take over).
+        let proxy = gpt_proxy(&url, &["limit"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("rate_limit_error") && body.contains("over their plan usage"), "{body}");
+    }
+
+    #[test]
+    fn chatgpt_failure_after_output_is_an_error_event() {
+        let (url, seen) = fake_responses(|_, _, _| {
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": { "type": "message" } }),
+                json!({ "type": "response.output_text.delta", "delta": "Hi" }),
+                failed("subscription_sharing_usage_limit_exceeded"),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["a", "b"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200);
+        assert!(body.contains("Hi") && body.contains("event: error") && body.contains("rate_limit_error"), "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "text had started: no second account");
+    }
+
+    #[test]
+    fn oa_thinking_never_reaches_anthropic_or_endpoints() {
+        let body = json!({ "model": "x", "messages": [{ "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "a", "signature": "oa:eyJ9" }, { "type": "thinking", "thinking": "b", "signature": "ag:claude:QUJD" },
+            { "type": "thinking", "thinking": "c", "signature": "EqQBCkg" }, { "type": "text", "text": "t" }] }] });
+        let sent: Value = serde_json::from_slice(&upstream_body(body, "claude-x")).unwrap();
+        let kept: Vec<&str> = sent["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
+        assert_eq!(kept, ["c", "t"]);
+        assert_eq!(untag(Some("oa:eyJ9"), "gpt"), None, "an Antigravity family never takes a ChatGPT signature");
+        assert_eq!(untag(Some("oa:QUJD"), "claude"), None);
+    }
+
+    #[test]
+    fn chatgpt_request_is_built_from_scratch() {
+        let (url, seen) = fake_responses(|_, _, _| (200, gpt_text(&["ok"])));
+        let proxy = gpt_proxy(&url, &["good"], vec![model("gpt-test", &["low", "medium", "high"], "medium")]);
+        let req = json!({
+            "model": "claude-opus-5-5", "max_tokens": 1000, "stream": false, "temperature": 0.2, "top_p": 0.9, "top_k": 5, "stop_sequences": ["x"],
+            "metadata": { "user_id": "u" }, "user": "u", "truncation": "auto", "service_tier": "auto", "background": true,
+            "thinking": { "type": "enabled", "budget_tokens": 2000 },
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=2;" }, { "type": "text", "text": "Be brief." }],
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } }] },
+                { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Shot", "input": {} }] },
+                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "REVG" } }] }] }],
+            "tools": [{ "name": "Shot", "description": "d", "input_schema": { "$schema": "x", "type": "object", "properties": {} } }, { "type": "web_search_20250305", "name": "web_search" }, { "type": "bash_20250124", "name": "bash" }],
+            "tool_choice": { "type": "any" }
+        });
+        let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-9")], &req);
+        assert_eq!(status, 200, "{body}");
+        let sent = seen.lock().unwrap()[0].1.clone();
+        let keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
+        for banned in ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id", "max_tokens", "top_k", "stop_sequences", "thinking", "system", "messages", "service_tier"] {
+            assert!(!keys.contains(&banned), "{banned} leaked: {keys:?}");
+        }
+        assert_eq!((&sent["store"], &sent["stream"], &sent["model"]), (&json!(false), &json!(true), &json!("gpt-test")), "never stored, always streamed, the tier's model");
+        assert_eq!(sent["instructions"], "Be brief.", "billing header filtered");
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["reasoning"], json!({ "effort": "low", "summary": "auto" }), "a 2000-token budget");
+        assert_eq!(sent["tool_choice"], "required");
+        assert_eq!(sent["tools"], json!([{ "type": "function", "name": "Shot", "description": "d", "parameters": { "type": "object", "properties": {} }, "strict": false }, { "type": "web_search" }]));
+        assert_eq!(sent["input"][0]["content"][1], json!({ "type": "input_image", "image_url": "data:image/png;base64,QUJD" }));
+        assert_eq!(sent["input"][2], json!({ "type": "function_call_output", "call_id": "t1", "output": "(see attached image)" }));
+        assert_eq!(sent["input"][3], json!({ "type": "message", "role": "user", "content": [{ "type": "input_image", "image_url": "data:image/png;base64,REVG" }] }), "tool-result images ride in a user message");
+        assert_eq!(sent["prompt_cache_key"], "sess-9");
+        assert!(sent["input"].as_array().unwrap().iter().all(|i| i["role"] != "system"));
+    }
+
+    #[test]
+    fn chatgpt_tools_are_namespaced_after_one_refusal() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["tools"][0]["type"] == "function" {
+                let e = json!({ "error": { "code": "subscription_sharing_unsupported_capability", "message": "tools not supported", "param": "tools" } });
+                return (400, e.to_string());
+            }
+            let item = json!({ "type": "function_call", "id": "fc", "call_id": "c1", "name": "claude_code.Read", "arguments": "{}" });
+            (200, rsse(&[json!({ "type": "response.output_item.added", "item": item }), json!({ "type": "response.output_item.done", "item": item }), completed(1, 0, 1)]))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let mut req = gpt_req(false);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object" } }]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["content"][0]["name"], "Read", "the namespace prefix is stripped");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "one retry");
+            assert_eq!(seen[1].1["tools"], json!([{ "type": "namespace", "name": "claude_code", "description": "Claude Code tools", "tools": seen[0].1["tools"] }]));
+        }
+        // Remembered: the next request is wrapped at once.
+        post(&proxy, &proxy.token, &req);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].1["tools"][0]["type"], "namespace");
+
+        // What the official route refused is not the Codex route's business.
+        let pool = chatgpt::Pool::new(Vec::new(), Vec::new());
+        pool.wrap.store(true, Ordering::Relaxed);
+        pool.no_cache_key.store(true, Ordering::Relaxed);
+        let hints = Hints { session: "s".into() };
+        let official = responses_body(&req, "m", None, &hints, &pool, false);
+        let codex = responses_body(&req, "m", None, &hints, &pool, true);
+        assert_eq!((official["tools"][0]["type"].as_str(), official.get("prompt_cache_key").is_none()), (Some("namespace"), true));
+        assert_eq!((codex["tools"][0]["type"].as_str(), codex["prompt_cache_key"].as_str()), (Some("function"), Some("s")));
+    }
+
+    #[test]
+    fn effort_follows_the_models_own_levels() {
+        let with = |efforts: &[&str], default: &str| Some(model("m", efforts, default));
+        let req = |e: &str| json!({ "output_config": { "effort": e } });
+        let full = with(&["low", "medium", "high", "xhigh"], "low");
+        assert_eq!(wanted_effort(&req("max"), full.as_ref()), "xhigh", "no max on this model: the nearest below");
+        assert_eq!(wanted_effort(&req("high"), full.as_ref()), "high", "1:1 when supported");
+        assert_eq!(wanted_effort(&json!({}), full.as_ref()), "low", "nothing asked: the model's default, as in Codex");
+        let top = with(&["low", "medium", "high", "xhigh", "max", "ultra"], "low");
+        assert_eq!(wanted_effort(&req("max"), top.as_ref()), "max");
+        assert_ne!(wanted_effort(&json!({ "output_config": { "effort": "ultra" } }), top.as_ref()), "ultra", "Codex's task delegation is never sent");
+        assert_eq!(wanted_effort(&json!({}), with(&["low", "ultra"], "ultra").as_ref()), "low", "an ultra default is not sent");
+        let gappy = with(&["low", "high"], "high");
+        assert_eq!(wanted_effort(&req("medium"), gappy.as_ref()), "low", "round down first");
+        assert_eq!(wanted_effort(&req("low"), with(&["medium", "high"], "medium").as_ref()), "medium", "then up");
+        // The thinking budget, clamped to the same list.
+        let budget = |b: u64| json!({ "thinking": { "type": "enabled", "budget_tokens": b } });
+        assert_eq!((wanted_effort(&budget(3000), None), wanted_effort(&budget(8000), None), wanted_effort(&budget(30000), None)), ("low".into(), "medium".into(), "high".into()));
+        assert_eq!(wanted_effort(&budget(30000), with(&["low", "medium"], "low").as_ref()), "medium");
+        assert_eq!(wanted_effort(&json!({ "thinking": { "type": "disabled" } }), None), "low");
+        assert_eq!((wanted_effort(&json!({}), None), wanted_effort(&req("max"), None)), ("medium".into(), "xhigh".into()), "nothing known about the model");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_sent_and_dropped_when_refused_and_service_tier_never() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["prompt_cache_key"] == "refused" {
+                let e = json!({ "error": { "code": "subscription_sharing_unsupported_capability", "message": "no", "param": "prompt_cache_key" } });
+                return (400, e.to_string());
+            }
+            (200, gpt_text(&["ok"]))
+        });
+        let proxy = gpt_proxy(&url, &["good"], vec![model("gpt-test", &["low"], "low")]);
+        let mut req = gpt_req(false);
+        req["speed"] = json!("fast"); // Claude Code's fast mode: ignored on purpose
+        post_h(&proxy, &[("x-claude-code-session-id", "s1"), ("anthropic-beta", "fast-mode-2026-02-01")], &req);
+        post_h(&proxy, &[], &req);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].1["prompt_cache_key"], "s1", "the session id keys the cache");
+            assert!(seen[1].1["prompt_cache_key"].as_str().unwrap().starts_with("ccat-"), "no session header: a hash of the system prompt");
+            assert!(seen.iter().all(|(_, b)| b.get("service_tier").is_none()), "fast mode is off: no service_tier, ever");
+        }
+        // Refused once: dropped for the rest of the process, and the request still succeeds.
+        let (status, _) = post_h(&proxy, &[("x-claude-code-session-id", "refused")], &req);
+        assert_eq!(status, 200);
+        let n = seen.lock().unwrap().len();
+        post_h(&proxy, &[("x-claude-code-session-id", "refused")], &req);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), n + 1, "no second refusal");
+        assert!(seen[n - 2].1.get("prompt_cache_key").is_some(), "the refused try had it");
+        assert!(seen[n - 1].1.get("prompt_cache_key").is_none() && seen[n].1.get("prompt_cache_key").is_none());
+    }
+
+    /// The Codex route against a fake backend: its own path, headers, and body shaping.
+    #[test]
+    fn codex_route_shapes_url_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<(String, Vec<(String, String)>, Value)>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push((req.path.clone(), req.headers.clone(), body));
+                let text = gpt_text(&["codex says hi"]);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        let proxy = gpt_proxy(&url, &["cx1"], Vec::new());
+        let mut req = gpt_req(false);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object" } }]);
+        let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-7")], &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("codex says hi"));
+        let seen = seen.lock().unwrap();
+        let (path, headers, sent) = &seen[0];
+        assert_eq!(path, "/codex/responses");
+        let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(h("authorization"), Some("Bearer cx1"));
+        assert_eq!(h("chatgpt-account-id"), Some("acct-cx1"), "the workspace id from the token");
+        assert_eq!((h("originator"), h("openai-beta")), (Some("ccat"), Some("responses=experimental")));
+        assert_eq!((h("session_id"), h("conversation_id"), h("x-client-request-id")), (Some("sess-7"), Some("sess-7"), Some("sess-7")));
+        assert_eq!(h("x-codex-routing-hint"), Some("model=gpt-test"));
+        assert!(h("version").is_some() && h("user-agent").is_some_and(|u| u.starts_with("ccat/")));
+        assert_eq!((&sent["store"], &sent["stream"], &sent["prompt_cache_key"], &sent["parallel_tool_calls"]), (&json!(false), &json!(true), &json!("sess-7"), &json!(true)));
+        assert!(sent.get("service_tier").is_none() && sent.get("max_output_tokens").is_none() && sent.get("temperature").is_none());
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["reasoning"]["summary"], "auto");
+        assert_eq!(sent["tools"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn codex_usage_limits_use_the_reset_time_they_carry() {
+        let reset = now_secs() + 7200;
+        let (url, _) = fake_responses(move |who, _, _| match who {
+            "cxlimit" => (429, json!({ "error": { "type": "usage_limit_reached", "message": "limit", "resets_at": reset } }).to_string()),
+            _ => (200, gpt_text(&["fine"])),
+        });
+        let proxy = gpt_proxy(&url, &["cxlimit", "cxgood"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 200, "{body}");
+        let proxy = gpt_proxy(&url, &["cxlimit"], Vec::new());
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let res = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(gpt_req(false).to_string()).unwrap();
+        assert_eq!(res.status().as_u16(), 429);
+        let wait: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((6000..=7200).contains(&wait), "blocked until the reset OpenAI named, not a guess: {wait}");
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
     /// Live check against Google with the first Antigravity account in the ccat config: the proxy's `count_tokens`
     /// vs the `promptTokenCount` Google bills for the same request, implicit caching on a repeat, and the calibrated
     /// Claude-route estimate. Spends a few requests of quota. `cargo test -- --ignored live_ --nocapture`.
     #[test]
     #[ignore = "uses your real Antigravity account from the ccat config"]
     fn live_counts_and_caching_match_google() {
-        let cfg = crate::load();
+        let (cfg, _) = crate::load();
         let p = cfg.providers.iter().find(|p| p.antigravity && !p.accounts.is_empty()).expect("an Antigravity provider with an account in the ccat config");
-        let proxy = start(p.accounts.clone(), HashMap::new(), None, std::env::temp_dir()).unwrap();
+        let proxy = start(p.accounts.clone(), Vec::new(), Vec::new(), Vec::new(), std::env::temp_dir()).unwrap();
         // Big enough (~5k tokens) for Gemini's implicit cache, which skips short prompts.
         let manual: String = (0..400).map(|i| format!("Rule {i}: keep functions short, name things for what they do, test the edge cases.\n")).collect();
         let req = |model: &str| json!({
@@ -1671,8 +3016,8 @@ be brief" }, { "type": "text", "text": " " }],
         let dir = std::env::temp_dir().join(format!("ccat-e2e-{}", antigravity::random_hex(4)));
         std::fs::create_dir_all(&dir).unwrap();
         // As ccat launches it: a Claude name for the main model, everything else falling back to it.
-        let aliases = HashMap::from([("claude-sonnet-4-6".to_string(), "gemini-3.1-pro-low".to_string())]);
-        let proxy = serve_pool(Pool::fake(&upstream, &["acct"]), aliases, Some("gemini-3.1-pro-low".into()), dir.clone()).unwrap();
+        let aliases = ag("claude-sonnet-4-6", "gemini-3.1-pro-low");
+        let proxy = serve_pool(Pool::fake(&upstream, &["acct"]), aliases, dir.clone()).unwrap();
         let cfg = dir.join("mcp.json");
         let servers = json!({ "mcpServers": { "antigravity": { "type": "http", "url": format!("{}/mcp", proxy.url), "headers": { "Authorization": format!("Bearer {}", proxy.token) } } } });
         std::fs::write(&cfg, servers.to_string()).unwrap();
