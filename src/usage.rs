@@ -1522,7 +1522,7 @@ fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, tokens: bool, cu
     (names, series)
 }
 
-/// Stacked areas, one layer per key, up to now; Recently slides left with the clock. The scale eases to new heights,
+/// One translucent area and line per key, each from zero so they overlap, up to now; Recently slides left with the clock. The scale eases to new heights,
 /// and a key with a request finished in the last minute pulses at its edge and reads "running".
 fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool, cumulative: bool) {
     let p = crate::pal(ui);
@@ -1533,7 +1533,8 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
     let cur = (now.saturating_sub(start) / w).min(n as u64 - 1) as usize;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 170.0), egui::Sense::hover());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(38.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
-    let max = (0..=cur).map(|k| series.iter().map(|s| s[k]).sum::<f64>()).fold(0.0, f64::max).max(if tokens { 1000.0 } else { 4.0 });
+    // Each key from zero, overlapping: the scale is the highest single one.
+    let max = series.iter().flat_map(|s| &s[..=cur]).cloned().fold(0.0, f64::max).max(if tokens { 1000.0 } else { 4.0 });
     // A round step: 1, 2 or 5 × 10^n, about four lines high.
     let raw = max / 4.0;
     let mag = 10f64.powf(raw.log10().floor());
@@ -1560,7 +1561,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
     };
     let clip = pt.with_clip_rect(plot);
     let running = |name: &str| calls.iter().rev().take_while(|c| c.0 + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.1 } else { &c.2 }) == name);
-    let mut base = vec![0.0; n];
+    // Biggest first, so the smaller ones are drawn over it and stay visible.
     for (i, s) in series.iter().enumerate() {
         let c = hue(i, p);
         // One mesh per layer: no anti-aliased seams between its slices. Its top edge is a line of its own.
@@ -1569,26 +1570,23 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
         for k in 0..=cur {
             let x = x_of(k);
             let at = mesh.vertices.len() as u32;
-            mesh.colored_vertex(egui::pos2(x, y_of(base[k] + s[k])), c.gamma_multiply(0.8));
-            mesh.colored_vertex(egui::pos2(x, y_of(base[k])), c.gamma_multiply(0.8));
+            mesh.colored_vertex(egui::pos2(x, y_of(s[k])), c.gamma_multiply(0.28));
+            mesh.colored_vertex(egui::pos2(x, plot.bottom()), c.gamma_multiply(0.28));
             if k > 0 {
                 mesh.add_triangle(at - 2, at - 1, at);
                 mesh.add_triangle(at - 1, at + 1, at);
             }
-            edge.push(egui::pos2(x, y_of(base[k] + s[k])));
+            edge.push(egui::pos2(x, y_of(s[k])));
         }
         if s[..=cur].iter().any(|v| *v > 0.0) {
             clip.add(mesh);
-            clip.add(egui::Shape::line(edge, egui::Stroke::new(1.5, c)));
+            clip.add(egui::Shape::line(edge, egui::Stroke::new(2.0, c)));
         }
         if running(&names[i]) {
             let pulse = (exact.fract() * std::f64::consts::TAU).sin() as f32 * 0.5 + 0.5;
-            let at = egui::pos2(x_of(cur), y_of(base[cur] + s[cur]));
+            let at = egui::pos2(x_of(cur), y_of(s[cur]));
             pt.circle_filled(at, 3.0 + 3.0 * pulse, c.gamma_multiply(0.35 * (1.0 - pulse)));
             pt.circle_filled(at, 3.0, c);
-        }
-        for k in 0..n {
-            base[k] += s[k];
         }
     }
     // Time along the bottom.
