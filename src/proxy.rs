@@ -153,8 +153,10 @@ impl Ctx {
         let route = (routes.iter().find(|r| r.names.iter().any(|n| n == asked)))
             .or_else(|| routes.iter().find(|r| !suffix.is_empty() && r.tier == suffix))
             .or_else(|| routes.iter().find(|r| low.contains(r.tier)));
+        // An empty model is Claude Code's pick: the name it sent. Fallbacks too (an empty one reached the API as "").
+        let pick = |m: &str| if m.is_empty() { asked.to_string() } else { m.to_string() };
         match route {
-            Some(r) => (r.upstream.clone(), if r.model.is_empty() { asked.to_string() } else { r.model.clone() }, r.tier, r.fallbacks.clone()),
+            Some(r) => (r.upstream.clone(), pick(&r.model), r.tier, r.fallbacks.iter().map(|(u, m)| (u.clone(), pick(m))).collect()),
             // The official API knows (or rejects) the name itself.
             None if routes.iter().any(|r| r.upstream == Upstream::Official) => (Upstream::Official, asked.to_string(), "", Vec::new()),
             None => routes.first().map_or((Upstream::Antigravity, asked.to_string(), "", Vec::new()), |r| (r.upstream.clone(), r.model.clone(), r.tier, r.fallbacks.clone())),
@@ -2151,6 +2153,10 @@ be brief" }, { "type": "text", "text": " " }],
         assert_eq!(got("something-else"), (Upstream::Official, "something-else".into()), "unknown names go to the login");
         ctx.routes.write().unwrap().retain(|r| r.upstream != Upstream::Official);
         assert_eq!(got("something-else"), (Upstream::Antigravity, "gemini-x".into()), "…or, with no official tier, to the first one");
+
+        // A Default fallback ("" = Claude Code's pick) goes out with the name Claude Code sent.
+        ctx.routes.write().unwrap()[0].fallbacks = vec![(Upstream::Official, String::new())];
+        assert_eq!(ctx.resolve("claude-sonnet-5-5").3, [(Upstream::Official, "claude-sonnet-5-5".to_string())]);
 
         // A switch made while the session runs: same names, new upstream.
         ctx.routes.write().unwrap()[0].upstream = Upstream::Official;
