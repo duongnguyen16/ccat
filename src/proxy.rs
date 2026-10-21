@@ -898,7 +898,7 @@ fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked
             continue;
         }
         if let Some(secs) = block {
-            pool.block(&acc.key, secs);
+            pool.block(&acc.key, secs, &failure);
         }
         last = Some(failure);
         if block.is_none() {

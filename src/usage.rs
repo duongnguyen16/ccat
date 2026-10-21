@@ -357,7 +357,8 @@ fn gpt_has_login(cfg: &crate::Config) -> bool {
 fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (String, u64)> {
     let mut logins: Vec<(String, String, bool)> = Vec::new();
     for a in cfg.providers.iter().filter(|p| p.chatgpt).flat_map(|p| &p.chatgpt_accounts).filter(|a| a.codex() && a.usable()) {
-        if let Ok((t, id)) = chatgpt::codex_token(&a.key) {
+        let login = if a.cli() { chatgpt::codex_cli_tokens().ok_or_else(String::new) } else { chatgpt::codex_token(&a.key) };
+        if let Ok((t, id)) = login {
             logins.push((t, id, true));
         }
     }

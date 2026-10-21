@@ -77,11 +77,11 @@ Providers are connections: add, rename, turn off and delete them in **Settings �
 
 ## ChatGPT
 
-Use your ChatGPT plan, not an API key, for the GPT models. Add an account under **Settings → Providers → ChatGPT → +**: a browser sign-in with your ChatGPT account, through the Codex backend (`chatgpt.com/backend-api/codex`) and the public Codex OAuth client, the way Codex CLI signs in. OpenAI doesn't officially support that route for other apps, so it may change. ccat keeps its own tokens (`%APPDATA%\ccat\chatgpt\`, one file per account, never in `config.json`) and never touches Codex CLI's `~/.codex`, so Codex stays signed in. Port 1455 must be free while you sign in (a running Codex login holds it). Each account shows its plan (Plus, Pro…).
+Use your ChatGPT plan, not an API key, for the GPT models. ccat shares **Codex CLI's login**: sign in with `codex login` (the **+** under **Settings → Providers → ChatGPT** opens a terminal for it) and that account shows up in ccat, with its plan. ccat reads Codex's `~/.codex/auth.json` fresh on every request and never refreshes, writes or signs it out — Codex keeps it fresh whenever it runs.
 
-ccat also implements OpenAI's official *Sign in with ChatGPT* plan-usage flow ([docs](https://developers.openai.com/siwc/token-sharing-open-source)); it's kept for later and not offered in the UI today, since it gives no plan or usage numbers.
+Why not a sign-in of ccat's own: a second sign-in with Codex's login client makes OpenAI revoke the earlier sessions, which signs you out of Codex on every device. Sharing the one session avoids that. Requests go to the Codex backend (`chatgpt.com/backend-api/codex`), the way Codex CLI sends them; OpenAI doesn't officially support that for other apps, so it may change. If the login is revoked or expires, ccat says so ("run `codex login`") instead of retrying.
 
-Usage: the ChatGPT section of the usage window shows the session (5 h) and weekly limits of your signed-in accounts, the same numbers Codex shows. **Manage usage** opens [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage).
+Usage: the ChatGPT section of the usage window shows the session (5 h) and weekly limits of that login, the same numbers Codex shows. **Manage usage** opens [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage).
 
 ## ccat vs Codex
 
@@ -98,7 +98,7 @@ What Codex (the CLI / app) offers on a ChatGPT plan, and where ccat stands on ea
 | Reasoning carried across turns     |          ✅          |          ✅          | Encrypted reasoning is replayed; it never leaks to Anthropic routes                      |
 | Prompt caching                     |          ✅          |          ✅          | Keyed on the Claude Code session                                                         |
 | Usage limits (5 h / weekly)        |          ✅          |          ✅          | Usage window and tray dial                                                               |
-| Several ChatGPT accounts           |   One login          |          ✅          | Rotation when one hits its limit, plus fallbacks to other providers per tier            |
+| Fallback when ChatGPT is limited   |          ❌          |          ✅          | Fallbacks to Claude, Antigravity or any endpoint per tier                               |
 | Agent harness                      |     Codex agent      |    ✅ Claude Code    | Skills, hooks, plugins, subagents, MCP, plan mode                                        |
 | `AGENTS.md`, sandbox, approvals    |          ✅          |          ➖          | Claude Code's `CLAUDE.md`, permission modes and *Bypass permissions*                     |
 | `/review`                          |          ✅          |          ➖          | Claude Code's code-review commands and plugins                                           |

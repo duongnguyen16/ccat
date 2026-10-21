@@ -269,6 +269,10 @@ fn load() -> (Config, serde_json::Value) {
     }
     builtin_antigravity(&mut cfg);
     builtin_chatgpt(&mut cfg);
+    // Codex CLI's login is the ChatGPT account ccat shares (see `chatgpt::CODEX_CLI`).
+    if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
+        chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
+    }
     (cfg, raw)
 }
 

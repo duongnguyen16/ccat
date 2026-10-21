@@ -8,7 +8,7 @@
 //! across processes by a lock file. The UI process signs in and out; the proxy only reads.
 
 use crate::{
-    antigravity::{self, agent, enc, log, random_hex, uuid, Failure},
+    antigravity::{agent, log, Failure},
     now,
 };
 use base64::{
@@ -20,7 +20,6 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader},
-    net::TcpListener,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,34 +28,30 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-const ISSUER: &str = "https://auth.openai.com";
-const AUTH_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
 const DISCOVERY_URL: &str = "https://auth.openai.com/.well-known/openid-configuration";
-/// The client id of a first registration; OpenAI answers with the `oaiapp_…` id this install uses from then on.
-const FIRST_CLIENT: &str = "dynamic_agent_client";
+
 const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
-const SCOPES: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+
 const RESOURCE: &str = "https://api.openai.com/v1";
 /// Where plan usage is spent (models, inference).
 pub const API: &str = RESOURCE;
 pub const USAGE_PAGE: &str = "https://chatgpt.com/settings/usage";
 /// An access token is replaced this long before it expires.
 const EARLY: u64 = 300;
-// The Codex route (what OpenAI's Codex CLI and oh-my-pi use; OpenAI does not support it for third-party apps): the public
-// Codex OAuth client, its fixed loopback port, and the ChatGPT backend the Codex CLI talks to.
-const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CODEX_SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
-const CODEX_PORT: u16 = 1455;
-const CODEX_REDIRECT: &str = "http://localhost:1455/auth/callback";
+
 pub const CODEX_BASE: &str = "https://chatgpt.com/backend-api";
 /// The Codex CLI version the backend is told (it gates newer models on it, see oh-my-pi's `CODEX_CLIENT_VERSION`).
 const CODEX_VERSION: &str = "0.159.0";
 const ORIGINATOR: &str = "ccat";
 pub const WHAM_USAGE: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const CODEX: &str = "codex";
+/// Codex CLI's own login (`~/.codex/auth.json`), shared rather than duplicated: a second sign-in with Codex's client
+/// makes OpenAI revoke the earlier sessions (Codex CLI and the user's other devices), so ccat reads that login fresh on
+/// every request and never refreshes, writes or revokes it. Codex refreshes it whenever it runs.
+pub const CODEX_CLI: &str = "codex-cli";
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const TERMINAL: [&str; 6] = ["invalid_grant", "invalid_refresh_token", "token_expired", "refresh_token_expired", "refresh_token_invalidated", "refresh_token_reused"];
 
@@ -82,9 +77,44 @@ impl ChatgptAccount {
         !self.disabled && self.granted
     }
 
+    /// Goes through the Codex backend: ccat's own Codex-route sign-in, or Codex CLI's shared login.
     pub fn codex(&self) -> bool {
-        self.route == CODEX
+        self.route == CODEX || self.route == CODEX_CLI
     }
+
+    pub fn cli(&self) -> bool {
+        self.route == CODEX_CLI
+    }
+}
+
+/// (access token, ChatGPT account id) of Codex CLI's login, read fresh from its file; `None` when Codex isn't signed in
+/// with ChatGPT.
+pub fn codex_cli_tokens() -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(codex_home().join("auth.json")).ok()?).ok()?;
+    (v["auth_mode"] == "chatgpt").then_some(())?;
+    let t = &v["tokens"];
+    let access = t["access_token"].as_str().filter(|s| !s.is_empty())?.to_string();
+    let id = t["account_id"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| codex_profile(&access, "").0);
+    Some((access, id))
+}
+
+/// Codex CLI's login as an account (email and plan from its tokens), when it is signed in with ChatGPT.
+pub fn codex_cli_account() -> Option<ChatgptAccount> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(codex_home().join("auth.json")).ok()?).ok()?;
+    (v["auth_mode"] == "chatgpt").then_some(())?;
+    let t = &v["tokens"];
+    let (_, plan, email, _) = codex_profile(t["access_token"].as_str().unwrap_or(""), t["id_token"].as_str().unwrap_or(""));
+    Some(ChatgptAccount { key: CODEX_CLI.into(), email: if email.is_empty() { "Codex CLI".into() } else { email }, granted: true, route: CODEX_CLI.into(), plan, ..Default::default() })
+}
+
+/// Keeps Codex CLI's login first in `accounts`: added when Codex is signed in, its email and plan refreshed, the
+/// on/off choice kept. Left in place (unusable) while Codex is signed out, so the choice survives a `codex login`.
+pub fn sync_codex_cli(accounts: &mut Vec<ChatgptAccount>) {
+    let Some(mut cli) = codex_cli_account() else { return };
+    if let Some(i) = accounts.iter().position(|a| a.cli()) {
+        cli.disabled = accounts.remove(i).disabled;
+    }
+    accounts.insert(0, cli);
 }
 
 /// What ccat knows of one ChatGPT model (kept in the config, so the pickers and the proxy need no network).
@@ -137,66 +167,6 @@ impl TokenErr {
 }
 
 // ---------------------------------------------------------------- small helpers: SHA-256, PKCE, time
-
-const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74,
-    0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d,
-    0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e,
-    0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/// SHA-256 (FIPS 180-4). Here only for PKCE and account keys, so a crate would be a lot of dependency for ~30 lines.
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 64];
-        for (i, c) in block.chunks(4).enumerate() {
-            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let t1 = v[7].wrapping_add(s1).wrapping_add((v[4] & v[5]) ^ (!v[4] & v[6])).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let t2 = s0.wrapping_add((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]));
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for (x, y) in h.iter_mut().zip(v) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 32];
-    for (o, x) in out.chunks_mut(4).zip(h) {
-        o.copy_from_slice(&x.to_be_bytes());
-    }
-    out
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// PKCE S256: base64url (no padding) of the SHA-256 of the verifier.
-fn challenge(verifier: &str) -> String {
-    B64U.encode(sha256(verifier.as_bytes()))
-}
-
-/// Names the account's credential file, so the email (which can change) never does.
-pub fn key_of(sub: &str) -> String {
-    hex(&sha256(sub.as_bytes()))[..16].to_string()
-}
 
 /// A time as unix seconds: a number (seconds, or milliseconds when huge), a numeric string, or an RFC 3339 string.
 /// Anything else is 0, i.e. "no restriction": an unreadable `earliest_refresh_at` must never block a refresh for ever.
@@ -285,18 +255,6 @@ fn write(dir: &Path, key: &str, c: &Creds) -> Result<(), String> {
     write_private(&creds_path(dir, key), serde_json::to_string_pretty(c).map_err(|e| e.to_string())?.as_bytes())
 }
 
-/// One id per install, `urn:uuid:<v4>`: OpenAI ties the registrations of this install together with it.
-fn host_id(dir: &Path) -> Result<String, String> {
-    let path = dir.join("host-id");
-    if let Some(id) = std::fs::read_to_string(&path).ok().map(|t| t.trim().to_string()).filter(|t| t.starts_with("urn:uuid:")) {
-        return Ok(id);
-    }
-    make_dir(dir).map_err(|e| e.to_string())?;
-    let id = format!("urn:uuid:{}", uuid());
-    write_private(&path, id.as_bytes())?;
-    Ok(id)
-}
-
 /// The refresh lock. Dropping it releases it, so every error path lets go.
 struct Lock(PathBuf);
 
@@ -382,6 +340,9 @@ pub fn needs_signin(key: &str) -> bool {
 }
 
 fn signed_out(dir: &Path, key: &str) -> bool {
+    if key == CODEX_CLI {
+        return codex_cli_tokens().is_none();
+    }
     // The official route needs the plan-usage scope; a Codex token has no such scope.
     read(dir, key).is_none_or(|c| c.reauth || (c.route != CODEX && !c.scope.split_whitespace().any(|s| s == PLAN_SCOPE)))
 }
@@ -564,7 +525,10 @@ pub fn codex_token(key: &str) -> Result<(String, String), String> {
 /// Revokes the account's refresh token at OpenAI, then deletes its local files, revoked or not. Blocking: run it on a thread.
 pub fn sign_out(key: &str) {
     let d = dir();
-    if let Some(c) = read(&d, key) {
+    if key == CODEX_CLI {
+        return; // Codex CLI's login is Codex's to manage
+    }
+    if let Some(c) = read(&d, key).filter(|c| c.route != CODEX) {
         if let Err(e) = revoke(&c) {
             log(&format!("ChatGPT sign-out: could not revoke the token at OpenAI ({e}); deleting the local copy anyway"));
         }
@@ -587,171 +551,6 @@ fn revoke(c: &Creds) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------- browser sign-in
-
-/// The `/authorize` URL. `again` is the saved (client id, ID token, email) of an account being signed in again: it keeps
-/// its issued client id and gets hints, and is not a new registration (no `agent_name_hint`).
-fn authorize_url(port: u16, host: &str, state: &str, nonce: &str, verifier: &str, again: Option<(&str, &str, &str)>) -> String {
-    let redirect = format!("http://127.0.0.1:{port}/auth/callback");
-    let mut q = vec![
-        ("response_type", "code"),
-        ("client_id", again.map_or(FIRST_CLIENT, |a| a.0)),
-        ("ext_agent_host_id", host),
-        ("redirect_uri", &redirect),
-        ("scope", SCOPES),
-        ("resource", RESOURCE),
-        ("state", state),
-        ("nonce", nonce),
-        ("code_challenge_method", "S256"),
-    ];
-    let code_challenge = challenge(verifier);
-    q.push(("code_challenge", &code_challenge));
-    match again {
-        None => q.push(("agent_name_hint", "ccat")),
-        Some((_, id_token, email)) => {
-            q.extend([("id_token_hint", id_token), ("login_hint", email)].into_iter().filter(|(_, v)| !v.is_empty()));
-        }
-    }
-    format!("{AUTH_URL}?{}", q.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&"))
-}
-
-/// The Codex `/oauth/authorize` URL, with the parameters the Codex CLI sends.
-fn codex_authorize_url(state: &str, verifier: &str) -> String {
-    let q = [
-        ("response_type", "code"),
-        ("client_id", CODEX_CLIENT),
-        ("redirect_uri", CODEX_REDIRECT),
-        ("scope", CODEX_SCOPE),
-        ("code_challenge", &challenge(verifier)),
-        ("code_challenge_method", "S256"),
-        ("state", state),
-        ("id_token_add_organizations", "true"),
-        ("codex_cli_simplified_flow", "true"),
-        ("originator", ORIGINATOR),
-    ];
-    format!("{CODEX_AUTH_URL}?{}", q.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&"))
-}
-
-/// Browser sign-in. `start` binds the loopback port first (so the redirect always has a listener, and a failure shows
-/// before the browser opens); `finish` blocks until OpenAI redirects back, then trades the code for tokens.
-pub struct Login {
-    listener: TcpListener,
-    state: String,
-    nonce: String,
-    verifier: String,
-    redirect: String,
-    /// The issued client id of the account being signed in again; none for a first registration.
-    saved_client: Option<String>,
-    /// The Codex route (see `CODEX`) instead of the official one.
-    codex: bool,
-    dir: PathBuf,
-    pub url: String,
-}
-
-impl Login {
-    /// `again`: an official account to sign in again (it keeps its client id and gets hints); else a new registration.
-    /// `codex`: the Codex route, whose redirect port is fixed (1455, like the Codex CLI's).
-    pub fn start(again: Option<&ChatgptAccount>, codex: bool) -> Result<Login, String> {
-        Self::start_in(&dir(), again, codex)
-    }
-
-    fn start_in(dir: &Path, again: Option<&ChatgptAccount>, codex: bool) -> Result<Login, String> {
-        let port = if codex { CODEX_PORT } else { 0 };
-        let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
-            if codex {
-                format!("Port {CODEX_PORT} is busy (a Codex login may still be open); finish or close it and try again: {e}")
-            } else {
-                format!("Could not listen for the ChatGPT sign-in: {e}")
-            }
-        })?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        let verifier = B64U.encode(random_hex(32));
-        let (state, nonce) = (random_hex(16), random_hex(16));
-        let login = |url: String, redirect: String, saved_client: Option<String>| Login { listener, state: state.clone(), nonce: nonce.clone(), verifier: verifier.clone(), redirect, saved_client, codex, dir: dir.to_path_buf(), url };
-        if codex {
-            return Ok(login(codex_authorize_url(&state, &verifier), CODEX_REDIRECT.into(), None));
-        }
-        let saved = again.filter(|a| !a.codex()).and_then(|a| read(dir, &a.key)).filter(|c| !c.client_id.is_empty());
-        let hint = saved.as_ref().map(|c| (c.client_id.as_str(), c.id_token.as_str(), c.email.as_str()));
-        let url = authorize_url(port, &host_id(dir)?, &state, &nonce, &verifier, hint);
-        Ok(login(url, format!("http://127.0.0.1:{port}/auth/callback"), saved.map(|c| c.client_id)))
-    }
-
-    pub fn finish(self, cancel: &AtomicBool) -> Result<ChatgptAccount, String> {
-        let q = antigravity::accept(&self.listener, cancel, "/auth/callback", &self.state, "ChatGPT").map_err(|e| {
-            if e.contains("access_denied") { "Sign-in was declined in ChatGPT.".to_string() } else { e }
-        })?;
-        let code = &q["code"];
-        if self.codex {
-            return self.finish_codex(code);
-        }
-        let issued = q.get("client_id").filter(|c| !c.is_empty());
-        let client = match (&self.saved_client, issued) {
-            (None, Some(id)) => id.clone(),
-            (None, None) => return Err("OpenAI did not issue a client id for ccat; try again.".into()),
-            (Some(old), Some(id)) if id != old => return Err("OpenAI answered with a different client id than this account's; refusing it.".into()),
-            (Some(old), _) => old.clone(),
-        };
-        let tok = token_post(
-            TOKEN_URL,
-            &[("grant_type", "authorization_code"), ("client_id", &client), ("code", code), ("code_verifier", &self.verifier), ("redirect_uri", &self.redirect), ("resource", RESOURCE)],
-        )
-        .map_err(|e| e.message().to_string())?;
-        let (sub, email) = check_id_token(tok["id_token"].as_str().unwrap_or(""), &client, &self.nonce, now())?;
-        let mut c = Creds { client_id: client, email: email.clone(), sub: sub.clone(), ..Default::default() };
-        apply(&mut c, &tok).map_err(|e| e.message().to_string())?;
-        if c.refresh_token.is_empty() {
-            return Err("OpenAI returned no refresh token; try again.".into());
-        }
-        let granted = c.scope.split_whitespace().any(|s| s == PLAN_SCOPE);
-        let key = key_of(&sub);
-        write(&self.dir, &key, &c)?;
-        log(&format!("ChatGPT signed in {email} (plan usage {})", if granted { "granted" } else { "NOT granted" }));
-        Ok(ChatgptAccount { key, email, granted, ..Default::default() })
-    }
-
-    /// The Codex route: ccat's own tokens from the public Codex client. Codex CLI's `~/.codex/auth.json` is never
-    /// touched: its refresh tokens rotate, so refreshing its token from here would sign the Codex CLI out.
-    fn finish_codex(&self, code: &str) -> Result<ChatgptAccount, String> {
-        let tok = token_post(
-            CODEX_TOKEN_URL,
-            &[("grant_type", "authorization_code"), ("client_id", CODEX_CLIENT), ("code", code), ("code_verifier", &self.verifier), ("redirect_uri", CODEX_REDIRECT)],
-        )
-        .map_err(|e| e.message().to_string())?;
-        let mut c = Creds { client_id: CODEX_CLIENT.into(), route: CODEX.into(), ..Default::default() };
-        apply(&mut c, &tok).map_err(|e| e.message().to_string())?;
-        let (account_id, plan, email, sub) = codex_profile(&c.access_token, &c.id_token);
-        if account_id.is_empty() || c.refresh_token.is_empty() {
-            return Err("OpenAI's Codex sign-in returned no ChatGPT account id or refresh token; try again.".into());
-        }
-        let who = if sub.is_empty() { email.clone() } else { sub.clone() };
-        (c.account_id, c.plan, c.email, c.sub) = (account_id, plan.clone(), email.clone(), sub);
-        let key = key_of(&format!("codex:{who}"));
-        write(&self.dir, &key, &c)?;
-        log(&format!("ChatGPT (Codex route) signed in {email} (plan {plan})"));
-        Ok(ChatgptAccount { key, email, granted: true, route: CODEX.into(), plan, ..Default::default() })
-    }
-}
-
-/// Checks an ID token and returns (`sub`, email). It arrives straight from the token endpoint over TLS, so (OpenID Connect
-/// Core 3.1.3.7) its signature is not verified; the claims that bind it to this sign-in are: issuer, audience (our issued
-/// client id), expiry and the nonce we sent. `sub` is the account's identity, `email` only for display.
-fn check_id_token(jwt: &str, client_id: &str, nonce: &str, now: u64) -> Result<(String, String), String> {
-    let bad = |what: &str| format!("OpenAI's ID token is not valid ({what}); try again.");
-    let payload = jwt.split('.').nth(1).ok_or_else(|| bad("missing"))?;
-    let claims: Value = B64U.decode(payload.trim_end_matches('=')).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| bad("unreadable"))?;
-    let aud = &claims["aud"];
-    match () {
-        _ if claims["iss"] != ISSUER => Err(bad("issuer")),
-        _ if !(aud == client_id || aud.as_array().is_some_and(|a| a.iter().any(|x| x == client_id))) => Err(bad("audience")),
-        _ if claims["exp"].as_u64().is_none_or(|e| e <= now) => Err(bad("expired")),
-        _ if claims["nonce"] != nonce => Err(bad("nonce")),
-        _ => match claims["sub"].as_str().filter(|s| !s.is_empty()) {
-            Some(sub) => Ok((sub.to_string(), claims["email"].as_str().unwrap_or("").to_string())),
-            None => Err(bad("no subject")),
-        },
-    }
-}
 
 // ---------------------------------------------------------------- errors
 
@@ -778,6 +577,8 @@ pub fn classify(status: u16, code: &str, message: &str, param: &str) -> Denied {
     // ponytail: OpenAI gives no reset time for plan usage, so an hour is a guess; the account is simply tried again after it.
     let (st, block) = match code {
         "subscription_sharing_usage_limit_exceeded" | "usage_limit_reached" => (429, Some(3600)),
+        // The sign-in itself was revoked (typically by a newer sign-in with the same client): no retrying until it changes.
+        "token_revoked" | "token_invalidated" | "invalid_token" | "token_expired" => (401, Some(86_400)),
         "usage_not_included" => (403, Some(86_400)),
         "subscription_sharing_user_not_eligible" => (403, Some(86_400)),
         "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable" => (503, Some(30)),
@@ -833,7 +634,8 @@ pub struct Pool {
     codex_base: String,
     /// Access tokens by account key, kept in memory until 5 minutes before they expire.
     cache: Mutex<HashMap<String, (String, Instant)>>,
-    blocked: Mutex<HashMap<String, Instant>>,
+    /// Until when, and why (status, message), each account is skipped.
+    blocked: Mutex<HashMap<String, (Instant, u16, String)>>,
     /// The API refused plain function tools once: send them in a namespace from now on.
     pub wrap: AtomicBool,
     /// Likewise for `prompt_cache_key`: dropped for the rest of the process.
@@ -854,13 +656,14 @@ impl Pool {
     }
 
     fn blocked_for(&self, key: &str) -> Option<Duration> {
-        self.blocked.lock().unwrap().get(key).and_then(|t| t.checked_duration_since(Instant::now()))
+        self.blocked.lock().unwrap().get(key).and_then(|(t, ..)| t.checked_duration_since(Instant::now()))
     }
 
-    pub fn block(&self, key: &str, secs: u64) {
+    /// Skips the account for `secs`, remembering why, so "nothing left" names the real reason.
+    pub fn block(&self, key: &str, secs: u64, why: &Failure) {
         let who = self.accounts.read().unwrap().iter().find(|a| a.key == key).map_or(key.to_string(), |a| a.email.clone());
-        log(&format!("ChatGPT {who} blocked for {secs}s"));
-        self.blocked.lock().unwrap().insert(key.to_string(), Instant::now() + Duration::from_secs(secs));
+        log(&format!("ChatGPT {who} skipped for {secs}s: {} {}", why.status, why.message));
+        self.blocked.lock().unwrap().insert(key.to_string(), (Instant::now() + Duration::from_secs(secs), why.status, why.message.clone()));
     }
 
     /// The first account, in the order they were added, that is on, granted, signed in and not blocked.
@@ -879,16 +682,28 @@ impl Pool {
         if usable.is_empty() {
             return fail("No ChatGPT account can be used: turn one on, or sign in again in ccat → Providers (plan usage must be granted).");
         }
-        let secs = usable.iter().filter_map(|a| self.blocked_for(&a.key)).min().unwrap_or(Duration::from_secs(60)).as_secs().max(1);
-        Failure {
-            status: 429,
-            message: format!("All {} ChatGPT account(s) are over their plan usage; trying again in {}m{}s (OpenAI gives no reset time, so this is a guess).", usable.len(), secs / 60, secs % 60),
-            retry_after: Some(secs),
+        // The account back soonest, and why it is out.
+        let blocked = self.blocked.lock().unwrap();
+        let soonest = usable.iter().filter_map(|a| blocked.get(&a.key)).filter(|(t, ..)| *t > Instant::now()).min_by_key(|(t, ..)| *t);
+        let (secs, status, why) = soonest.map_or((60, 429, String::new()), |(t, st, m)| (t.saturating_duration_since(Instant::now()).as_secs().max(1), *st, m.clone()));
+        let wait = format!("{}m{}s", secs / 60, secs % 60);
+        match status {
+            429 => Failure { status: 429, message: format!("All {} ChatGPT account(s) are over their plan usage; trying again in {wait}.", usable.len()), retry_after: Some(secs) },
+            401 => Failure { status: 401, message: format!("{why}. Sign in again: run `codex login` (ccat shares Codex's login)."), retry_after: None },
+            st => Failure { status: st, message: format!("{why} (ChatGPT is skipped for {wait})."), retry_after: None },
         }
     }
 
     /// A valid access token for the account, from memory or through the locked refresh (see `access`).
     fn token(&self, a: &ChatgptAccount, rejected: Option<&str>) -> Result<String, TokenErr> {
+        if a.cli() {
+            // Read fresh each time, never refreshed: Codex refreshes it when it runs.
+            return match codex_cli_tokens() {
+                Some((t, _)) if Some(t.as_str()) != rejected => Ok(t),
+                Some(_) => Err(TokenErr::SignIn("Codex CLI's login was refused; run `codex` (or `codex login`) to renew it".into())),
+                None => Err(TokenErr::SignIn("Codex CLI isn't signed in with ChatGPT; run `codex login`".into())),
+            };
+        }
         if rejected.is_none() {
             if let Some((t, _)) = self.cache.lock().unwrap().get(&a.key).filter(|(_, until)| *until > Instant::now()) {
                 return Ok(t.clone());
@@ -911,7 +726,7 @@ impl Pool {
                 TokenErr::Later(m) => Denied { failure: Failure { status: 502, message: format!("{}: {m}", a.email), retry_after: None }, block: Some(30), param: String::new() },
             })?;
             let (url, mut headers) = if a.codex() {
-                let id = read(&self.dir, &a.key).map(|c| c.account_id).unwrap_or_default();
+                let id = if a.cli() { codex_cli_tokens().map(|t| t.1).unwrap_or_default() } else { read(&self.dir, &a.key).map(|c| c.account_id).unwrap_or_default() };
                 if id.is_empty() {
                     return Err(Denied { failure: Failure { status: 403, message: format!("{}: no ChatGPT account id; sign in again.", a.email), retry_after: None }, block: Some(86_400), param: String::new() });
                 }
@@ -961,7 +776,7 @@ impl Pool {
 impl Pool {
     /// Accounts whose access token is their name, in a scratch folder, pointed at a fake API.
     pub fn fake(base: &str, names: &[&str]) -> Pool {
-        let dir = std::env::temp_dir().join(format!("ccat-gpt-{}", random_hex(6)));
+        let dir = std::env::temp_dir().join(format!("ccat-gpt-{}", crate::antigravity::random_hex(6)));
         let accounts = names
             .iter()
             .map(|n| {
@@ -972,7 +787,7 @@ impl Pool {
                     refresh_token: "r".into(),
                     access_token: n.to_string(),
                     expires_at: now() + 86_400,
-                    scope: if codex { String::new() } else { SCOPES.into() },
+                    scope: if codex { String::new() } else { PLAN_SCOPE.into() },
                     email: format!("{n}@x"),
                     sub: n.to_string(),
                     route: if codex { CODEX.into() } else { String::new() },
@@ -1001,17 +816,16 @@ impl Drop for Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::antigravity::dec;
     use serde_json::json;
 
     fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ccat-gpt-{tag}-{}", random_hex(4)));
+        let d = std::env::temp_dir().join(format!("ccat-gpt-{tag}-{}", crate::antigravity::random_hex(4)));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     fn creds(access: &str, expires_in: i64) -> Creds {
-        Creds { client_id: "oaiapp_t".into(), refresh_token: "r1".into(), access_token: access.into(), expires_at: (now() as i64 + expires_in) as u64, scope: SCOPES.into(), ..Default::default() }
+        Creds { client_id: "oaiapp_t".into(), refresh_token: "r1".into(), access_token: access.into(), expires_at: (now() as i64 + expires_in) as u64, scope: PLAN_SCOPE.into(), ..Default::default() }
     }
 
     /// The `Later` side of a result, for asserts (`TokenErr` has no Debug).
@@ -1023,18 +837,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sha256_and_pkce_known_answers() {
-        assert_eq!(hex(&sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let two_blocks = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-        assert_eq!(hex(&sha256(two_blocks)), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-        // RFC 7636 appendix B.
-        assert_eq!(challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
-        let c = challenge(&B64U.encode(random_hex(32)));
-        assert!(c.len() == 43 && !c.contains(['=', '+', '/']), "S256 challenge is 43 base64url chars: {c}");
-        assert_eq!(key_of("user-1").len(), 16);
-    }
 
     #[test]
     fn times_in_any_shape() {
@@ -1047,73 +849,10 @@ mod tests {
         assert_eq!((unix_time(&json!("soon")), unix_time(&json!(null))), (0, 0), "unreadable means no restriction");
     }
 
-    fn query(url: &str) -> Vec<(String, String)> {
-        url.split_once('?').unwrap().1.split('&').map(|kv| kv.split_once('=').unwrap()).map(|(k, v)| (k.to_string(), dec(v))).collect()
-    }
-
-    #[test]
-    fn authorize_url_params() {
-        let verifier = "v".repeat(43);
-        fn keys(q: &[(String, String)]) -> Vec<&str> {
-            let mut k: Vec<&str> = q.iter().map(|(k, _)| k.as_str()).collect();
-            k.sort();
-            k
-        }
-        let get = |q: &[(String, String)], k: &str| q.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
-
-        let first = query(&authorize_url(4242, "urn:uuid:h", "st", "no", &verifier, None));
-        assert_eq!(
-            keys(&first),
-            ["agent_name_hint", "client_id", "code_challenge", "code_challenge_method", "ext_agent_host_id", "nonce", "redirect_uri", "resource", "response_type", "scope", "state"],
-            "a first registration: no hints"
-        );
-        assert_eq!(get(&first, "client_id").unwrap(), "dynamic_agent_client");
-        assert_eq!(get(&first, "agent_name_hint").unwrap(), "ccat");
-        assert_eq!(get(&first, "redirect_uri").unwrap(), "http://127.0.0.1:4242/auth/callback");
-        assert_eq!(get(&first, "scope").unwrap(), "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct");
-        assert_eq!(get(&first, "resource").unwrap(), "https://api.openai.com/v1");
-        assert_eq!(get(&first, "code_challenge").unwrap(), challenge(&verifier));
-        assert_eq!((get(&first, "response_type").unwrap(), get(&first, "ext_agent_host_id").unwrap()), ("code".into(), "urn:uuid:h".into()));
-
-        let again = query(&authorize_url(4242, "urn:uuid:h", "st", "no", &verifier, Some(("oaiapp_x", "idtok", "a@b.c"))));
-        assert_eq!(
-            keys(&again),
-            ["client_id", "code_challenge", "code_challenge_method", "ext_agent_host_id", "id_token_hint", "login_hint", "nonce", "redirect_uri", "resource", "response_type", "scope", "state"],
-            "a re-auth: the saved client id and hints, not a registration"
-        );
-        assert_eq!((get(&again, "client_id").unwrap(), get(&again, "id_token_hint").unwrap(), get(&again, "login_hint").unwrap()), ("oaiapp_x".into(), "idtok".into(), "a@b.c".into()));
-    }
-
-    #[test]
-    fn login_starts_with_its_own_host_id_and_port() {
-        let d = scratch("login");
-        let a = Login::start_in(&d, None, false).unwrap();
-        let q = query(&a.url);
-        let id = std::fs::read_to_string(d.join("host-id")).unwrap();
-        assert!(id.starts_with("urn:uuid:") && id.len() == 9 + 36, "{id}");
-        assert!(q.iter().any(|(k, v)| k == "ext_agent_host_id" && *v == id));
-        let port = a.listener.local_addr().unwrap().port();
-        assert!(q.iter().any(|(k, v)| k == "redirect_uri" && *v == format!("http://127.0.0.1:{port}/auth/callback")), "the listener is bound before the URL exists");
-        assert_eq!(host_id(&d).unwrap(), id, "one id per install");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     fn jwt(claims: Value) -> String {
         format!("{}.{}.sig", B64U.encode("{}"), B64U.encode(claims.to_string()))
     }
 
-    #[test]
-    fn id_token_claims_are_checked() {
-        let good = json!({ "iss": ISSUER, "aud": ["x", "oaiapp_t"], "exp": 2_000_000_000u64, "nonce": "n1", "sub": "user-1", "email": "me@x.io" });
-        assert_eq!(check_id_token(&jwt(good.clone()), "oaiapp_t", "n1", 1_900_000_000), Ok(("user-1".into(), "me@x.io".into())));
-        let with = |k: &str, v: Value| {
-            let mut c = good.clone();
-            c[k] = v;
-            check_id_token(&jwt(c), "oaiapp_t", "n1", 1_900_000_000).is_err()
-        };
-        assert!(with("iss", json!("https://evil.example")) && with("aud", json!("someone-else")) && with("exp", json!(1_800_000_000u64)) && with("nonce", json!("n2")) && with("sub", json!("")));
-        assert!(check_id_token("not-a-jwt", "oaiapp_t", "n1", 0).is_err());
-    }
 
     #[test]
     fn refresh_waits_for_the_lock_and_reuses_what_another_process_wrote() {
@@ -1186,19 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_urls_profiles_and_limits() {
-        let q = query(&codex_authorize_url("st", &"v".repeat(43)));
-        let get = |k: &str| q.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
-        let mut keys: Vec<&str> = q.iter().map(|(k, _)| k.as_str()).collect();
-        keys.sort();
-        assert_eq!(keys, ["client_id", "code_challenge", "code_challenge_method", "codex_cli_simplified_flow", "id_token_add_organizations", "originator", "redirect_uri", "response_type", "scope", "state"]);
-        assert_eq!(get("client_id"), Some("app_EMoamEEZ73f0CkXaXp7hrann"));
-        assert_eq!(get("redirect_uri"), Some("http://localhost:1455/auth/callback"));
-        assert_eq!(get("scope"), Some("openid profile email offline_access api.connectors.read api.connectors.invoke"));
-        assert_eq!((get("code_challenge_method"), get("response_type"), get("codex_cli_simplified_flow"), get("id_token_add_organizations")), (Some("S256"), Some("code"), Some("true"), Some("true")));
-        assert_eq!(get("code_challenge"), Some(challenge(&"v".repeat(43)).as_str()));
-        assert!(codex_authorize_url("s", "v").starts_with("https://auth.openai.com/oauth/authorize?"));
-
+    fn codex_profiles_and_limits() {
         // Account id and plan from the claims of either token; the plan may only be in the ID token.
         let access = jwt(json!({ AUTH_CLAIM: { "chatgpt_account_id": "acct-1" }, "https://api.openai.com/profile": { "email": "Me@X.io " } }));
         let id = jwt(json!({ AUTH_CLAIM: { "chatgpt_plan_type": "Plus" }, "sub": "user-9" }));
@@ -1234,6 +961,17 @@ mod tests {
         assert_eq!((m[1].name.as_str(), m[1].efforts.clone()), ("GPT-6 Sol", vec!["low".to_string()]), "what the API said wins");
         assert_eq!(parse_models(api.as_array().unwrap(), &Value::Null)[0].name, "", "no cache: no name, the slug shows");
         assert_eq!(clamp_effort("max", &m[0].efforts), "max");
+    }
+
+    #[test]
+    fn a_revoked_sign_in_says_so_instead_of_plan_usage() {
+        let d = classify(401, "token_revoked", "Encountered invalidated oauth token for user, failing request", "");
+        assert_eq!((d.failure.status, d.block), (401, Some(86_400)));
+        let p = Pool::fake("http://127.0.0.1:1", &["cxa"]);
+        p.block("cxa", 60, &d.failure);
+        let f = p.exhausted();
+        assert_eq!(f.status, 401);
+        assert!(f.message.contains("invalidated oauth token") && f.message.contains("codex login") && !f.message.contains("plan usage"), "{}", f.message);
     }
 
     #[test]

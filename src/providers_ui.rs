@@ -98,20 +98,6 @@ fn start_login(ctx: &egui::Context) -> Result<LoginJob<antigravity::Account>, St
     Ok(LoginJob { url, cancel, rx })
 }
 
-/// `again`: an account to sign in again (hints and its client id), else a new one. `codex`: the Codex route.
-fn start_gpt_login(ctx: &egui::Context, again: Option<&chatgpt::ChatgptAccount>, codex: bool) -> Result<LoginJob<chatgpt::ChatgptAccount>, String> {
-    let login = chatgpt::Login::start(again, codex)?;
-    open_browser(&login.url);
-    let (tx, rx) = mpsc::channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (url, stop, ctx) = (login.url.clone(), cancel.clone(), ctx.clone());
-    std::thread::spawn(move || {
-        let _ = tx.send(login.finish(&stop));
-        ctx.request_repaint();
-    });
-    Ok(LoginJob { url, cancel, rx })
-}
-
 /// One row of `ROW` height. `add` lays out the right-hand controls first (right to left), then a left-to-right
 /// layout takes what's left; `hot` says the pointer is over the row, which is when a trash icon shows.
 fn row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui, bool)) {
@@ -374,13 +360,17 @@ impl ProvidersEditor {
                 ui.allocate_space(vec2(28.0, 28.0));
                 self.fetch_btn(ui, pr);
                 let free = self.gpt_login.is_none();
-                // One way in: the Codex sign-in, the one that also gives the plan and the usage numbers.
-                let plus = ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text("Sign in with ChatGPT")).inner;
-                if plus.clicked() {
-                    match start_gpt_login(ui.ctx(), None, true) {
-                        Ok(job) => (self.gpt_login, self.gpt_err) = (Some(job), String::new()),
-                        Err(e) => self.gpt_err = e,
+                // One way in, and it is Codex's: a sign-in of ccat's own with Codex's client would make OpenAI revoke the
+                // earlier ones (Codex CLI and the other devices). `codex login` keeps a single session that ccat shares.
+                let tip = "Sign in with `codex login` (opens a terminal). ccat shares Codex CLI's login instead of creating its own, which would sign your other devices out.";
+                if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text(tip)).inner.clicked() {
+                    if let Err(e) = std::process::Command::new("cmd").args(["/c", "start", "Codex login", "cmd", "/k", "codex login"]).spawn() {
+                        self.gpt_err = format!("Couldn't start `codex login`: {e}");
                     }
+                }
+                // Pick up a `codex login` that just finished (or a sign-out), without reopening ccat.
+                if ui.ctx().cumulative_frame_nr() % 60 == 0 {
+                    chatgpt::sync_codex_cli(&mut pr.chatgpt_accounts);
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add(egui::Label::new(name_text(&title, on)).truncate());
@@ -405,7 +395,7 @@ impl ProvidersEditor {
             if let Some(e) = self.fetch_errs.get(&pr.name) {
                 note(ui, e, p.danger);
             }
-            let (mut remove, mut again) = (None, None);
+            let mut remove = None;
             for n in 0..pr.chatgpt_accounts.len() {
                 let needs = self.gpt_needs(&pr.chatgpt_accounts[n].key);
                 let acc = &mut pr.chatgpt_accounts[n];
@@ -414,37 +404,32 @@ impl ProvidersEditor {
                     if switch(ui, &mut on, "").on_hover_text("Off: the proxy doesn't use this account.").changed() {
                         acc.disabled = !on;
                     }
-                    if trash(ui, hot, "Sign out (revokes the sign-in at OpenAI)") {
+                    if !acc.cli() && trash(ui, hot, "Remove this account from ccat") {
                         remove = Some(n);
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.add_space(INDENT);
                         let alias = acc.email.split('@').next().unwrap_or(&acc.email);
                         ui.label(RichText::new(alias).size(12.5).color(if on { p.fg } else { p.muted })).on_hover_text(&acc.email);
+                        if acc.cli() {
+                            ui.label(RichText::new("Codex CLI").size(10.5).color(p.subtle)).on_hover_text("Codex CLI's login, shared: ccat never refreshes or signs it out. Manage it with `codex login` / `codex logout`.");
+                        }
                         if acc.codex() {
                             let plan = acc.plan.chars().next().map(|c| c.to_uppercase().chain(acc.plan.chars().skip(1)).collect::<String>()).unwrap_or_default();
                             badge(ui, &plan, on);
                         }
-                        let why = if !acc.granted { "plan not granted" } else if needs { "sign in again" } else { "" };
-                        if badge(ui, why, on).is_some_and(|b| b.on_hover_text("Click to sign in again").on_hover_cursor(egui::CursorIcon::PointingHand).clicked()) {
-                            again = Some(n);
-                        }
+                        let why = if !acc.granted { "plan not granted" } else if needs && acc.cli() { "run codex login" } else if needs { "signed out" } else { "" };
+                        let _ = badge(ui, why, on).map(|b| b.on_hover_text(if acc.cli() { "Codex CLI isn't signed in: + runs `codex login`" } else { "Revoked at OpenAI; remove it and use Codex CLI's login" }));
                     });
                 });
             }
             if let Some(n) = remove {
                 let gone = pr.chatgpt_accounts.remove(n);
-                // The revoke is a network call: off the UI thread. The local files go after it, revoked or not.
+                // Off the UI thread: an official-route sign-in is revoked first (a network call); a Codex-route one is only forgotten.
                 std::thread::spawn(move || chatgpt::sign_out(&gone.key));
             }
-            if let (Some(n), true) = (again, self.gpt_login.is_none()) {
-                match start_gpt_login(ui.ctx(), pr.chatgpt_accounts.get(n), pr.chatgpt_accounts.get(n).is_some_and(|a| a.codex())) {
-                    Ok(job) => (self.gpt_login, self.gpt_err) = (Some(job), String::new()),
-                    Err(e) => self.gpt_err = e,
-                }
-            }
             if pr.chatgpt_accounts.is_empty() && self.gpt_login.is_none() {
-                note(ui, "No ChatGPT account yet. Use + to sign in.", p.subtle);
+                note(ui, "No ChatGPT account yet. + runs `codex login`; ccat then shares Codex's login.", p.subtle);
             } else if !pr.chatgpt_accounts.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(INDENT);
