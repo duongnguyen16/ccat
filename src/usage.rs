@@ -683,7 +683,7 @@ impl Arc {
 /// its weekly use. One: a full pie in a full ring, filling clockwise from the top. Two: a dial cut across the
 /// middle, the first above, the second below, both filling from the left. Three: 120° sectors, the first centred
 /// at 12 o'clock, then 4 and 8, each filling clockwise from its start edge. Blank bands separate the parts.
-/// Light taskbar → black ink; orange when ahead of pace or past 90%, red when used up.
+/// Light taskbar → black ink; orange from 75%, red when used up.
 pub fn icon_pixels(size: u32, dials: &[Dial], light_taskbar: bool, now: u64) -> Vec<u8> {
     use std::f32::consts::{PI, TAU};
     let s = size as f32;
@@ -2101,7 +2101,7 @@ impl eframe::App for Popup {
         }
 
         let mut reload = None;
-        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, [c.popup_tab, c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
+        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, [c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
         let before = snapshot(&self.cfg);
         self.providers.poll(&mut self.cfg);
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
@@ -2130,8 +2130,6 @@ impl eframe::App for Popup {
             self.measured = measured;
             ctx.request_repaint();
         }
-        // The tab open now is the one the window opens on next time.
-        self.cfg.popup_tab = self.tab as u8;
         if snapshot(&self.cfg) != before {
             self.save(); // running sessions follow the config file
         }
@@ -2175,7 +2173,6 @@ pub fn run_popup(click: (f64, f64)) {
         Box::new(move |cc| {
             crate::setup(&cc.egui_ctx);
             let by_model = cfg.analytics_view == 0;
-            let tab = [Tab::Usage, Tab::Analytics, Tab::Settings].get(cfg.popup_tab as usize).copied().unwrap_or(Tab::Usage);
             let app = Popup {
                 cfg,
                 loaded,
@@ -2186,7 +2183,7 @@ pub fn run_popup(click: (f64, f64)) {
                 anchor,
                 focused_once: false,
                 styled: false,
-                tab,
+                tab: Tab::Usage,
                 sub: Sub::Models,
                 editor: Default::default(),
                 providers: Default::default(),

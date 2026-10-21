@@ -114,8 +114,6 @@ struct Config {
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
     show_fable: bool,
-    /// The usage window's tab last open (0 Usage, 1 Analytics, 2 Settings): where it opens next time.
-    popup_tab: u8,
     /// Analytics: the view last open (0 Models, 1 Overview, 2 Live); Live's range (an index into `usage::RANGES`),
     /// calls instead of tokens, grouping (0 total, 1 per model, 2 per provider) and running totals.
     analytics_view: u8,
