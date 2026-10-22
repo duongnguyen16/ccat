@@ -79,6 +79,7 @@ impl Proxy {
         if g.error.is_empty() && !g.bars.is_empty() && g.bars.iter().all(|b| !b.out()) {
             lifted |= ctx.gpt.unblock(g.fetched);
         }
+        *ctx.plan_backs.lock().unwrap() = [plan_back(&u.claude), plan_back(&u.chatgpt)];
         if lifted {
             ctx.wake.fetch_add(1, Ordering::Relaxed);
         }
@@ -88,6 +89,15 @@ impl Proxy {
     pub fn heartbeat(&self) {
         self.ctx.note(|_| {});
     }
+}
+
+/// When a plan is back by its usage bars: the latest reset among those used up (a used-up week outlasts the 5
+/// hours); 0 when none is, or the fetch failed.
+fn plan_back(src: &crate::usage::Source) -> u64 {
+    if !src.error.is_empty() {
+        return 0;
+    }
+    src.bars.iter().filter(|b| b.out()).map(|b| b.resets).max().unwrap_or(0)
 }
 
 /// The config's name for a route: provider ("" = Claude) and model.
@@ -189,6 +199,8 @@ struct Ctx {
     live: Mutex<crate::live::Session>,
     /// Bumped when a block is lifted early: held requests try again at once.
     wake: AtomicU64,
+    /// When Claude Code's plan and the ChatGPT plan are back, by the last usage seen (see `plan_back`).
+    plan_backs: Mutex<[u64; 2]>,
 }
 
 /// Tokens one image costs. ponytail: a flat middle-of-the-road figure (Gemini 3 default resolution ≈1120, a
@@ -214,6 +226,17 @@ fn weigh(v: &Value) -> (u64, u64) {
 }
 
 impl Ctx {
+    /// When route `u`'s plan should be back by its usage bars, if that is still ahead; else 0.
+    fn plan_back(&self, u: &Upstream, now: u64) -> u64 {
+        let [claude, gpt] = *self.plan_backs.lock().unwrap();
+        let at = match u {
+            Upstream::Official => claude,
+            Upstream::ChatGPT => gpt,
+            _ => 0,
+        };
+        if at > now { at } else { 0 }
+    }
+
     fn note(&self, f: impl FnOnce(&mut crate::live::Session)) {
         let mut g = self.live.lock().unwrap();
         f(&mut g);
@@ -295,6 +318,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         fail_on_limit: fail_on_limit.clone(),
         live: Default::default(),
         wake: AtomicU64::new(0),
+        plan_backs: Default::default(),
     });
     let handle = ctx.clone();
     std::thread::spawn(move || {
@@ -427,6 +451,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             // agent pauses at a usage limit instead of stopping.
             let hold = !ctx.fail_on_limit.load(Ordering::Relaxed);
             let mut held: Option<Held> = None;
+            let mut passes = 0u32;
             loop {
                 // Resolved on every pass: a route changed in Settings reaches a request already waiting.
                 let (up, model, tier, fallbacks) = ctx.resolve(&asked);
@@ -462,13 +487,19 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                 if fails.iter().any(|f| f.status != 429) {
                     return respond_error(&mut s, last);
                 }
-                // The soonest any try says it's back, checked again at least every 5 minutes (a pool's guess can be early or late).
-                let wait = fails.iter().filter_map(|f| f.retry_after).min().unwrap_or(60).clamp(15, 300);
+                // When each route should be back: what it said, else what the tray's usage shows for its plan (the
+                // 5-hour reset, or the weekly one once the week is used up), else unknown. The request waits for the
+                // soonest; a route with no idea (Claude's bare "429 Error" can pass in seconds) is tried again soon,
+                // backing off 15 s, 30 s, 60 s … and every route at least every 5 minutes.
+                let now = crate::now();
+                let backs: Vec<u64> = tries.iter().zip(&fails).map(|((u, _), f)| f.retry_after.map(|r| now + r).unwrap_or_else(|| ctx.plan_back(u, now))).collect();
+                let soon = 15u64 << passes.min(4);
+                passes += 1;
+                let wait = backs.iter().map(|b| if *b > now { b - now } else { soon }).min().unwrap_or(soon).clamp(15, 300);
                 antigravity::log(&format!("{asked} [{tier}]: every route is at its usage limit; holding the request, next try in {wait}s"));
                 // Tell the usage window what this tier waits for, and when each route should be back.
                 if !tier.is_empty() {
-                    let now = crate::now();
-                    let waiting = tries.iter().zip(&fails).map(|((u, m), f)| (hop(u, m), f.retry_after.map_or(0, |r| now + r))).collect();
+                    let waiting = tries.iter().zip(&backs).map(|((u, m), b)| (hop(u, m), *b)).collect();
                     let first = held.is_none();
                     ctx.note(|s| {
                         let t = s.tiers.entry(tier.to_string()).or_default();
@@ -694,6 +725,11 @@ fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: O
     let status = res.status();
     if may_fail.takes(status.as_u16()) {
         let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
+        if status.as_u16() == 429 {
+            // Which limit it was: Anthropic says so in headers only.
+            let said: Vec<String> = res.headers().iter().filter(|(k, _)| k.as_str() == "retry-after" || k.as_str().contains("ratelimit")).map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or(""))).collect();
+            antigravity::log(&format!("{base} answered 429: {}", said.join(" ")));
+        }
         let text = res.body_mut().with_config().limit(64 << 10).read_to_string().unwrap_or_default();
         let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or(text);
         return Err(Failure { status: status.as_u16(), message, retry_after });
@@ -2034,6 +2070,7 @@ mod tests {
             fail_on_limit: Default::default(),
             live: Default::default(),
             wake: AtomicU64::new(0),
+            plan_backs: Default::default(),
         }
     }
 
