@@ -37,6 +37,9 @@ pub fn dir() -> PathBuf {
 
 /// This process's file; its contents are only ever replaced whole.
 pub fn write(s: &Session) {
+    if cfg!(test) {
+        return;
+    }
     let d = dir();
     let _ = fs::create_dir_all(&d);
     let path = d.join(format!("{}.json", std::process::id()));

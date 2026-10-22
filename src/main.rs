@@ -1309,8 +1309,9 @@ impl TierEditor {
         let rect = |row: usize| self.at.iter().find(|(tt, r, _)| *tt == t && *r == row).map(|x| x.2);
         let rows: Vec<egui::Rect> = (0..chain.len()).filter_map(rect).collect();
         let row_of = |h: &live::Hop| chain.iter().position(|(pv, m)| live::matches(h, pv, m));
-        let active = lt.and_then(|l| l.used.as_ref()).and_then(row_of);
         let held = lt.filter(|l| l.held > 0);
+        // A tier that is waiting isn't running anything: no branch lit.
+        let active = lt.filter(|_| held.is_none()).and_then(|l| l.used.as_ref()).and_then(row_of);
         let waiting: Vec<usize> = held.map(|l| l.waiting.iter().filter_map(|(h, _)| row_of(h)).collect()).unwrap_or_default();
         let orange = hex(0xe08a2e);
         if let (Some(root), Some(last)) = (rect(SPOOF_ROW).or(rows.first().copied()), rows.last()) {

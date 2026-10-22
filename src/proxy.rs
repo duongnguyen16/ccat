@@ -281,7 +281,15 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         step: AtomicU64::new(0),
         sigs: Mutex::new(HashMap::new()),
         routes: routes.clone(),
-        http: ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into(),
+        // A held request may wait for hours (ccat lifts Claude Code's timeout), so an upstream that never answers
+        // must fail on its own: as long as Claude Code's default wait for an answer.
+        http: ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(600)))
+            .build()
+            .into(),
         folder,
         ratio: Mutex::new(HashMap::new()),
         fail_on_limit: fail_on_limit.clone(),
@@ -413,25 +421,28 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             // Claude Code may tag a name with a context hint such as `[1m]`.
             let asked = body["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
             let counted = path == "/v1/messages";
-            let (up, model, tier, fallbacks) = ctx.resolve(&asked);
-            // Each try spends ccat's keys or accounts unless it's Claude: those need the token.
-            let tries: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).filter(|(u, _)| *u == Upstream::Official || authed).collect();
-            if tries.is_empty() {
-                return denied(&mut s);
-            }
+
             // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
             // Every try out of quota: the request waits, open, until one can run (or Claude Code stops waiting), so an
             // agent pauses at a usage limit instead of stopping.
             let hold = !ctx.fail_on_limit.load(Ordering::Relaxed);
             let mut held: Option<Held> = None;
             loop {
+                // Resolved on every pass: a route changed in Settings reaches a request already waiting.
+                let (up, model, tier, fallbacks) = ctx.resolve(&asked);
+                // Each try spends ccat's keys or accounts unless it's Claude: those need the token.
+                let tries: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).filter(|(u, _)| *u == Upstream::Official || authed).collect();
+                if tries.is_empty() {
+                    return denied(&mut s);
+                }
                 let mut fails = Vec::new();
                 for (n, (u, m)) in tries.iter().enumerate() {
                     let last = n + 1 == tries.len();
                     if n > 0 {
                         antigravity::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
                     }
-                    match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, !last || hold) {
+                    let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
+                    match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, may_fail) {
                         Ok(()) => {
                             if !tier.is_empty() {
                                 ctx.note(|s| {
@@ -441,7 +452,6 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                             }
                             return;
                         }
-                        Err(f) if last && !hold => return respond_error(&mut s, &f),
                         Err(f) => {
                             antigravity::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message));
                             fails.push(f);
@@ -488,7 +498,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
         // No server-initiated stream and no sessions: the MCP spec's answer for both is 405.
         ("GET" | "DELETE", "/mcp") => respond_error(&mut s, &Failure { status: 405, message: "no SSE stream".into(), retry_after: None }),
         // Anything else Claude Code asks its API for, with its own login, goes to the real one.
-        _ if bearer.is_some_and(|b| b != ctx.token) => drop(forward(&mut s, &ctx.http, &req, &anthropic_api(), None, req.body.clone(), None, false)),
+        _ if bearer.is_some_and(|b| b != ctx.token) => drop(forward(&mut s, &ctx.http, &req, &anthropic_api(), None, req.body.clone(), None, Fail::Never)),
         _ if !authed => denied(&mut s),
         _ => {
             antigravity::log(&format!("404 {} {} (Claude Code asked for something the proxy doesn't serve)", req.method, req.path));
@@ -519,7 +529,7 @@ fn still_waiting(s: &TcpStream, secs: u64, wake: &AtomicU64) -> bool {
 /// Runs a request on one upstream. With `may_fail` a failure that left nothing written comes back as `Err`
 /// (so a fallback can take over); without, it answers Claude Code with the upstream's own error.
 #[allow(clippy::too_many_arguments)]
-fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &Upstream, model: &str, tier: &'static str, counted: bool, may_fail: bool) -> Result<(), Failure> {
+fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &Upstream, model: &str, tier: &'static str, counted: bool, may_fail: Fail) -> Result<(), Failure> {
     match up {
         Upstream::Official => {
             let meter = counted.then_some((tier, "Claude", model));
@@ -548,6 +558,28 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
 /// A malformed request (400) would fail there too.
 fn worth_falling_back(status: u16) -> bool {
     matches!(status, 401 | 403 | 404 | 408 | 429) || status >= 500
+}
+
+/// Which failures `run` hands back instead of answering Claude Code with them (only while nothing was written).
+#[derive(Clone, Copy)]
+enum Fail {
+    /// None: the upstream's own answer goes through as it is (the last try).
+    Never,
+    /// Those a fallback can help with (see `worth_falling_back`).
+    Fallback,
+    /// Usage limits only: the last try of a request that waits them out. Anything else still goes through as it is
+    /// (Claude Code acts on its own errors: compacting on a too-long prompt, refreshing its login on a 401).
+    Limit,
+}
+
+impl Fail {
+    fn takes(self, status: u16) -> bool {
+        match self {
+            Fail::Never => false,
+            Fail::Fallback => worth_falling_back(status),
+            Fail::Limit => status == 429,
+        }
+    }
 }
 
 /// The request body for an official or endpoint route: the tier's real model, and no thinking blocks another
@@ -633,7 +665,7 @@ fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
 /// and the answer, SSE included, streams back as it arrives, rate-limit headers and all. With `meter` (tier,
 /// provider, model) the answer's token usage goes to the token log.
 #[allow(clippy::too_many_arguments)]
-fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: bool) -> Result<(), Failure> {
+fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: Fail) -> Result<(), Failure> {
     let mut b = ureq::http::Request::builder().method(req.method.as_str()).uri(format!("{base}{}", req.path));
     for (k, v) in &req.headers {
         let hop = matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding" | "accept-encoding" | "x-ccat-token");
@@ -653,14 +685,14 @@ fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: O
         b = b.header("x-api-key", key).header("authorization", format!("Bearer {key}"));
     }
     let sent = if body.is_empty() { b.body(()).map(|r| agent.run(r)) } else { b.body(body).map(|r| agent.run(r)) };
-    let fail = |s: &mut TcpStream, f: Failure| if may_fail { Err(f) } else { Ok(respond_error(s, &f)) };
+    let fail = |s: &mut TcpStream, f: Failure| if may_fail.takes(f.status) { Err(f) } else { Ok(respond_error(s, &f)) };
     let mut res = match sent {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return fail(s, Failure { status: 502, message: format!("ccat proxy → {base}: {e}"), retry_after: None }),
         Err(e) => return fail(s, Failure { status: 400, message: format!("ccat proxy: {e}"), retry_after: None }),
     };
     let status = res.status();
-    if may_fail && worth_falling_back(status.as_u16()) {
+    if may_fail.takes(status.as_u16()) {
         let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
         let text = res.body_mut().with_config().limit(64 << 10).read_to_string().unwrap_or_default();
         let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or(text);
@@ -737,7 +769,7 @@ fn google_count(ctx: &Ctx, req: &Value, model: &str) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, model: String, tier: &str, may_fail: bool) -> Result<(), Failure> {
+fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, model: String, tier: &str, may_fail: Fail) -> Result<(), Failure> {
     if model.is_empty() {
         respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
         return Ok(());
@@ -788,7 +820,7 @@ fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, model: Strin
         }
     }
     match last {
-        Some(f) if may_fail && worth_falling_back(f.status) => Err(f),
+        Some(f) if may_fail.takes(f.status) => Err(f),
         Some(f) => Ok(respond_error(s, &f)),
         None => Ok(()),
     }
@@ -984,7 +1016,7 @@ fn responses_body(req: &Value, model: &str, meta: Option<&chatgpt::ChatgptModel>
 
 /// A ChatGPT route: the request goes to the first usable account, and on a refusal to the next (see `chatgpt::classify`).
 #[allow(clippy::too_many_arguments)]
-fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, model: &str, tier: &str, may_fail: bool) -> Result<(), Failure> {
+fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, model: &str, tier: &str, may_fail: Fail) -> Result<(), Failure> {
     if model.is_empty() {
         respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
         return Ok(());
@@ -1053,7 +1085,7 @@ fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked
         }
     }
     match last {
-        Some(f) if may_fail && worth_falling_back(f.status) => Err(f),
+        Some(f) if may_fail.takes(f.status) => Err(f),
         Some(f) => Ok(respond_error(s, &f)),
         None => Ok(()),
     }
@@ -2278,6 +2310,33 @@ be brief" }, { "type": "text", "text": " " }],
 
     fn route(tier: &'static str, names: &[&str], upstream: Upstream, model: &str) -> Route {
         Route { tier, names: names.iter().map(|n| n.to_string()).collect(), upstream, model: model.into(), fallbacks: Vec::new() }
+    }
+
+    #[test]
+    fn a_held_request_runs_as_soon_as_its_route_is_back() {
+        let ep = |name: &str, url: String| Upstream::Endpoint { name: name.into(), url, key: "k".into() };
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![route("sonnet", &["m@sonnet"], ep("Busy", fake_endpoint(429, "busy")), "m")], PathBuf::new()).unwrap();
+        proxy.fail_on_limit.store(false, Ordering::Relaxed);
+        let body = json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
+        let (p2, b2) = (proxy.clone(), body.clone());
+        let t = std::time::Instant::now();
+        let waiting = std::thread::spawn(move || post(&p2, &p2.token, &b2));
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!waiting.is_finished(), "held, not answered with the 429");
+        // The route comes back (here: switched in Settings) and the pools say so: it runs at once, not at the next try.
+        proxy.routes.write().unwrap()[0].upstream = ep("Good", fake_endpoint(200, "good"));
+        proxy.ctx.wake.fetch_add(1, Ordering::Relaxed);
+        let (status, text) = waiting.join().unwrap();
+        assert_eq!(status, 200, "{text}");
+        assert!(t.elapsed() < Duration::from_secs(10), "well before the 15 s floor");
+
+        // Holding doesn't touch any other error: Claude Code still gets the upstream's own answer.
+        for (code, who) in [(400, "bad"), (503, "down")] {
+            proxy.routes.write().unwrap()[0].upstream = ep(who, fake_endpoint(code, who));
+            let (status, text) = post(&proxy, &proxy.token, &body);
+            assert_eq!(status, code);
+            assert!(text.contains(&format!("{who} says {code}")), "{text}");
+        }
     }
 
     #[test]
