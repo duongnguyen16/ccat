@@ -11,6 +11,30 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
 
 pub const TRAY_FLAG: &str = "--ccat-tray";
 pub const POPUP_FLAG: &str = "--ccat-usage";
+/// Set on a tray started by Restart: it waits for the old one to let go of the single-tray mutex.
+const RESTART_ENV: &str = "CCAT_TRAY_RESTART";
+
+/// The tray's Reload: each Antigravity account's plan asked again (in parallel), Codex's ChatGPT login re-read, then
+/// every usage source fetched. Running sessions follow the saved config.
+fn reload_all() {
+    let (mut cfg, loaded) = crate::load();
+    if let Some(p) = cfg.providers.iter_mut().find(|p| p.antigravity) {
+        std::thread::scope(|s| {
+            for a in p.accounts.iter_mut() {
+                s.spawn(move || {
+                    if let Ok(plan) = antigravity::plan_of(a) {
+                        a.plan = plan;
+                    }
+                });
+            }
+        });
+    }
+    if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
+        crate::chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
+    }
+    let _ = crate::save(&cfg, &loaded);
+    refresh(true, true, true);
+}
 /// How often the tray refreshes: the reference monitor's cadence, gentle on `/api/oauth/usage`'s rate limit.
 const POLL_SECS: u64 = 180;
 /// The reload buttons can't go faster than this.
@@ -805,8 +829,19 @@ mod win {
 
     /// Takes the tray's single-instance mutex; `false` when another tray holds it. The handle lives until exit.
     pub fn claim() -> bool {
-        // SAFETY: a named mutex; the handle is deliberately kept for the process lifetime.
-        unsafe { !CreateMutexW(std::ptr::null(), 0, wide(MUTEX).as_ptr()).is_null() && GetLastError() != ERROR_ALREADY_EXISTS }
+        // SAFETY: a named mutex; the handle is kept for the process lifetime when it's ours, closed when it isn't
+        // (an open handle would keep the mutex alive after its owner quits).
+        unsafe {
+            let h = CreateMutexW(std::ptr::null(), 0, wide(MUTEX).as_ptr());
+            if h.is_null() {
+                return false;
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(h);
+                return false;
+            }
+            true
+        }
     }
 
     pub fn tray_running() -> bool {
@@ -823,13 +858,18 @@ mod win {
 
     /// Other running processes with this exe's file name, not counting `skip`.
     pub fn others(skip: &[u32]) -> usize {
+        pids(skip).map_or(1, |p| p.len()) // can't tell: assume someone still needs the tray
+    }
+
+    /// Their ids; `None` when the processes can't be listed.
+    pub fn pids(skip: &[u32]) -> Option<Vec<u32>> {
         let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).unwrap_or_default();
-        let mut n = 0;
+        let mut n = Vec::new();
         // SAFETY: a process snapshot walked with a correctly sized entry, then closed.
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap.is_null() || snap as isize == -1 {
-                return 1; // can't tell: assume someone still needs the tray
+                return None;
             }
             let mut e: PROCESSENTRY32W = std::mem::zeroed();
             e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -838,13 +878,20 @@ mod win {
                 let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
                 let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
                 if name == me && e.th32ProcessID != std::process::id() && !skip.contains(&e.th32ProcessID) {
-                    n += 1;
+                    n.push(e.th32ProcessID);
                 }
                 ok = Process32NextW(snap, &mut e) != 0;
             }
             CloseHandle(snap);
         }
-        n
+        Some(n)
+    }
+
+    /// A Yes/No question in a plain Windows dialog, on top.
+    pub fn confirm(text: &str) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO};
+        // SAFETY: a modal message box with no owner; both strings outlive the call.
+        unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("ccat").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST) == IDYES }
     }
 
     /// Per-monitor DPI aware before anything measures the screen: tray clicks, the work area and the DPI then all
@@ -920,15 +967,24 @@ pub fn run_tray() {
         sync::{Arc, Mutex as M},
         time::Instant,
     };
-    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::{
+        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+        Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
+    };
     use windows_sys::Win32::{
         System::Threading::GetCurrentThreadId,
         UI::WindowsAndMessaging::{AllowSetForegroundWindow, DispatchMessageW, GetMessageW, PostThreadMessageW, SetTimer, TranslateMessage, MSG, WM_APP, WM_TIMER},
     };
 
     win::dpi_aware();
-    if !win::claim() {
-        return;
+    // A tray that restarts itself starts this one and quits: wait for it to let go.
+    let restarted = std::env::var_os(RESTART_ENV).is_some();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !win::claim() {
+        if !restarted || Instant::now() > until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     // SAFETY: plain Win32 calls on this thread; it owns the message queue the tray posts to.
     let tid = unsafe { GetCurrentThreadId() };
@@ -956,7 +1012,19 @@ pub fn run_tray() {
         (icon, tooltip(u, &src, &ag))
     };
     let (icon, tip) = draw(&load_usage());
-    let Ok(tray) = TrayIconBuilder::new().with_icon(icon.unwrap_or_else(|| Icon::from_rgba(vec![0; 16 * 16 * 4], 16, 16).unwrap())).with_tooltip(tip).build() else { return };
+    // Right click: Reload, Restart, Quit. Picks reach the loop as WM_APP + 1 with 1, 2, 3.
+    let (reload, restart, quit) = (MenuItem::new("Reload", true, None), MenuItem::new("Restart", true, None), MenuItem::new("Quit ccat", true, None));
+    let menu = Menu::new();
+    let _ = menu.append_items(&[&reload, &restart, &PredefinedMenuItem::separator(), &quit]);
+    let ids = [reload.id().clone(), restart.id().clone(), quit.id().clone()];
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        if let Some(i) = ids.iter().position(|id| *id == e.id) {
+            // SAFETY: posting to our own thread's queue.
+            unsafe { PostThreadMessageW(tid, WM_APP + 1, i + 1, 0) };
+        }
+    }));
+    let builder = TrayIconBuilder::new().with_icon(icon.unwrap_or_else(|| Icon::from_rgba(vec![0; 16 * 16 * 4], 16, 16).unwrap())).with_tooltip(tip);
+    let Ok(tray) = builder.with_menu(Box::new(menu)).with_menu_on_left_click(false).build() else { return };
 
     // SAFETY: a thread timer (no window): WM_TIMER lands in this thread's queue every 2 s.
     unsafe { SetTimer(std::ptr::null_mut(), 0, 2000, None) };
@@ -1002,6 +1070,42 @@ pub fn run_tray() {
                         }
                         break;
                     });
+                }
+            }
+            continue;
+        }
+        if msg.hwnd.is_null() && msg.message == WM_APP + 1 {
+            use std::os::windows::process::CommandExt;
+            let kill_popup = || {
+                if let Some(c) = popup.lock().unwrap().as_mut() {
+                    let _ = c.kill();
+                }
+            };
+            match msg.wParam {
+                // Reload: every account's plan asked again, the ChatGPT login re-read, every source fetched now.
+                1 => {
+                    std::thread::spawn(reload_all);
+                }
+                // Restart: a fresh tray (the installed exe, as it is now), sessions untouched.
+                2 => {
+                    kill_popup();
+                    let fresh = std::env::current_exe().and_then(|exe| Command::new(exe).arg(TRAY_FLAG).env(RESTART_ENV, "1").creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn());
+                    if fresh.is_ok() {
+                        break;
+                    }
+                }
+                // Quit: every ccat with what it runs (Claude Code), so each terminal is back at its shell; then the tray.
+                _ => {
+                    let popup_pid: Vec<u32> = popup.lock().unwrap().as_ref().map(|c| c.id()).into_iter().collect();
+                    let sessions = win::pids(&popup_pid).unwrap_or_default();
+                    let ask = format!("Quit ccat?\n\nThis ends {} running ccat session(s) and the Claude Code in each.", sessions.len());
+                    if sessions.is_empty() || win::confirm(&ask) {
+                        for pid in sessions {
+                            let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).creation_flags(0x0800_0000).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                        }
+                        kill_popup();
+                        break;
+                    }
                 }
             }
             continue;
