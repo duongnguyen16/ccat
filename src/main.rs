@@ -1303,7 +1303,7 @@ impl TierEditor {
 
     /// Tier `t`'s route tree in the gutter: from its Claude name (or its first route) to each route, the branch that
     /// served its last request (in a running session, the last 15 minutes) in the accent colour, an orange dot on each
-    /// route a held request waits for; then, while requests are held, what they wait for.
+    /// route a held request waits for (the usage window says what for, at its bottom).
     fn tree(&self, ui: &mut egui::Ui, t: usize, chain: &[(String, String)], lt: Option<&live::Tier>) {
         let p = pal(ui);
         let rect = |row: usize| self.at.iter().find(|(tt, r, _)| *tt == t && *r == row).map(|x| x.2);
@@ -1333,13 +1333,6 @@ impl TierEditor {
                     pt.circle_filled(egui::pos2(end, rows[*n].center().y), 3.0, orange);
                 }
             }
-        }
-        if let Some(l) = held {
-            let text = format!("{} waiting at the usage limits: {}", if l.held == 1 { "1 request".to_string() } else { format!("{} requests", l.held) }, live::waits(l, now()));
-            ui.horizontal(|ui| {
-                ui.add_space(GUTTER + 16.0 + 2.0 * ui.spacing().item_spacing.x);
-                ui.add(egui::Label::new(RichText::new(text).size(11.5).color(orange)).wrap());
-            });
         }
     }
 

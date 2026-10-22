@@ -1097,7 +1097,6 @@ const ERROR_H: f32 = 17.0;
 const PART_H: f32 = 18.0;
 /// Between sections, with a 1px rule across its middle; the footer has one above it too.
 const SECTION_GAP: f32 = 21.0;
-const FOOTER_H: f32 = 12.0 + 18.0;
 
 use eframe::egui;
 
@@ -1161,7 +1160,7 @@ fn height(sections: &[Section]) -> f32 {
     let body: f32 = sections.iter().map(|s| SECTION_H + s.errors.len() as f32 * ERROR_H + rows(&s.bars).iter().map(|r| if r[0].part.is_empty() { BAR_BLOCK } else { BAR_BLOCK + PART_H }).sum::<f32>()).sum();
     let gaps = sections.len().saturating_sub(1) as f32 * SECTION_GAP;
     let empty = if sections.is_empty() { ERROR_H * 2.0 } else { 0.0 };
-    (PAD + HEADER_H + body + gaps + empty + FOOTER_H + PAD).ceil()
+    (PAD + HEADER_H + body + gaps + empty + PAD).ceil()
 }
 
 fn ag_accounts(cfg: &crate::Config) -> Vec<antigravity::Account> {
@@ -1808,8 +1807,9 @@ struct Popup {
     providers: crate::providers_ui::ProvidersEditor,
     /// Analytics: by model (else by provider), the shown data and the file stamp it was read at, "show more".
     by_model: bool,
-    /// What running sessions report (see `live`), read at most once a second.
+    /// What running sessions report (see `live`), read at most once a second; the height of the notes it gives.
     live: Option<(std::time::Instant, HashMap<String, crate::live::Tier>)>,
+    notes_h: f32,
     /// Analytics → Live: the requests read and the file stamp they were read at.
     calls: Option<(Vec<Call>, Option<std::time::SystemTime>)>,
     stats: Option<(Stats, bool, Option<std::time::SystemTime>)>,
@@ -1859,15 +1859,17 @@ impl Popup {
     fn usage_tab(&mut self, ui: &mut egui::Ui, blocks: &[Section], reload: &mut Option<usize>) {
         let p = crate::pal(ui);
         let now = now();
-        // Requests held at their limits, one line per tier, above everything else.
-        for (tier, l) in self.held() {
-            row(ui, ERROR_H, |ui| {
-                let text = format!("{tier} is waiting: {}", crate::live::waits(&l, now));
-                ui.add(egui::Label::new(egui::RichText::new(&text).size(12.0).color(ORANGE)).truncate()).on_hover_text(&text);
-            });
-        }
         let accounts = ag_accounts(&self.cfg);
         let alias = |e: &str| e.split('@').next().unwrap_or(e).to_string();
+        // When each source last answered: said on its reload button.
+        let fetched: Vec<u64> = blocks
+            .iter()
+            .map(|s| match s.which {
+                0 => self.usage.claude.fetched,
+                2 => self.usage.chatgpt.fetched,
+                _ => accounts.iter().filter_map(|a| self.usage.antigravity.get(&a.email)).map(|x| x.fetched).max().unwrap_or(0),
+            })
+            .collect();
         for (n, s) in blocks.iter().enumerate() {
             if n > 0 {
                 rule(ui, SECTION_GAP);
@@ -1894,7 +1896,7 @@ impl Popup {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.busy[s.which].load(std::sync::atomic::Ordering::SeqCst) {
                         ui.add_sized([28.0, 28.0], egui::Spinner::new().size(14.0));
-                    } else if crate::icon_btn(ui, crate::Icon::Reload).on_hover_text("Reload now").clicked() {
+                    } else if crate::icon_btn(ui, crate::Icon::Reload).on_hover_text(format!("Reload now (updated {})", ago(fetched[n], now))).clicked() {
                         *reload = Some(s.which);
                     }
                     if s.which != 1 {
@@ -1941,15 +1943,23 @@ impl Popup {
         if blocks.is_empty() {
             ui.add(egui::Label::new(egui::RichText::new("Nothing to show: sign in to Claude Code, or add a Google account in ccat → Config.").size(11.5).color(p.subtle)).wrap());
         }
-        // When each source last answered.
-        rule(ui, 12.0);
-        let fetched = |s: &Section| match s.which {
-            0 => self.usage.claude.fetched,
-            2 => self.usage.chatgpt.fetched,
-            _ => accounts.iter().filter_map(|a| self.usage.antigravity.get(&a.email)).map(|x| x.fetched).max().unwrap_or(0),
-        };
-        let text = blocks.iter().map(|s| format!("{}: updated {}", s.title, ago(fetched(s), now))).collect::<Vec<_>>().join("   ·   ");
-        row(ui, 18.0, |ui| ui.label(egui::RichText::new(text).size(11.0).color(p.subtle)));
+    }
+
+    /// At the bottom of every tab: what held requests wait for, one wrapped line per tier. Returns its height.
+    fn notes(&mut self, ui: &mut egui::Ui) -> f32 {
+        let held = self.held();
+        if held.is_empty() {
+            return 0.0;
+        }
+        let top = ui.cursor().top();
+        rule(ui, 16.0);
+        let now = now();
+        for (tier, l) in held {
+            let n = if l.held == 1 { String::new() } else { format!(" ({} requests)", l.held) };
+            ui.add(egui::Label::new(egui::RichText::new(format!("{tier} is waiting at its usage limits{n}: {}", crate::live::waits(&l, now))).size(11.5).color(ORANGE)).wrap());
+            ui.add_space(3.0);
+        }
+        ui.cursor().top() - top
     }
 
     fn analytics_tab(&mut self, ui: &mut egui::Ui) {
@@ -2106,7 +2116,8 @@ impl eframe::App for Popup {
         let blocks = sections(&self.cfg, &self.usage, self.claude);
         // Usage knows its height up front; the other tabs take last frame's. The bottom edge stays put.
         let h = match self.tab {
-            Tab::Usage => height(&blocks) + self.held().len() as f32 * ERROR_H,
+            // Usage knows its own height; the notes under it, last frame's.
+            Tab::Usage => height(&blocks) + self.notes_h,
             Tab::Settings if self.editor.active() => self.measured.max(470.0),
             _ => self.measured,
         };
@@ -2138,10 +2149,13 @@ impl eframe::App for Popup {
                         segmented(ui, &mut self.tab, &[(Tab::Settings, "Settings"), (Tab::Analytics, "Analytics"), (Tab::Usage, "Usage")]);
                     });
                 });
-                let body = ui.vertical(|ui| match self.tab {
-                    Tab::Usage => self.usage_tab(ui, &blocks, &mut reload),
-                    Tab::Analytics => self.analytics_tab(ui),
-                    Tab::Settings => self.settings_tab(ui, win),
+                let body = ui.vertical(|ui| {
+                    match self.tab {
+                        Tab::Usage => self.usage_tab(ui, &blocks, &mut reload),
+                        Tab::Analytics => self.analytics_tab(ui),
+                        Tab::Settings => self.settings_tab(ui, win),
+                    }
+                    self.notes_h = self.notes(ui);
                 });
                 HEADER_H + body.response.rect.height()
             })
@@ -2210,6 +2224,7 @@ pub fn run_popup(click: (f64, f64)) {
                 providers: Default::default(),
                 by_model,
                 live: None,
+                notes_h: 0.0,
                 calls: None,
                 stats: None,
                 more: false,
