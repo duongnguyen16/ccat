@@ -95,7 +95,12 @@ pub fn waits(t: &Tier, now: u64) -> String {
         0..60 => "back any moment".to_string(),
         s if s < 3600 => format!("back in {}m", s / 60),
         s if s < 86_400 => format!("back in {}h {}m", s / 3600, s % 3600 / 60),
-        s => format!("back in {}d {}h", s / 86_400, s % 86_400 / 3600),
+        s if s < 6 * 86_400 => format!("back in {}d {}h", s / 86_400, s % 86_400 / 3600),
+        _ => {
+            let (_, mo, d) = crate::usage::local_date(back);
+            let (_, h, m) = crate::usage::local(back);
+            format!("back on {d:02}/{mo:02}, {h:02}:{m:02}")
+        }
     };
     t.waiting
         .iter()
@@ -105,6 +110,25 @@ pub fn waits(t: &Tier, now: u64) -> String {
         })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// "in 3h 58m", "on 30/10, 17:51", "any moment" or "time unknown": the soonest reset time among waiting routes.
+pub fn nearest_wait(t: &Tier, now: u64) -> String {
+    let nearest = t.waiting.iter().map(|(_, b)| *b).filter(|b| *b > now).min();
+    match nearest {
+        Some(back) => match back - now {
+            0..60 => "any moment".to_string(),
+            s if s < 3600 => format!("in {}m", s / 60),
+            s if s < 86_400 => format!("in {}h {}m", s / 3600, s % 3600 / 60),
+            s if s < 6 * 86_400 => format!("in {}d {}h", s / 86_400, s % 86_400 / 3600),
+            _ => {
+                let (_, mo, d) = crate::usage::local_date(back);
+                let (_, h, m) = crate::usage::local(back);
+                format!("on {d:02}/{mo:02}, {h:02}:{m:02}")
+            }
+        },
+        None => "time unknown".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +143,6 @@ mod tests {
         assert!(!matches(&hop("ChatGPT", "gemini-x"), "Antigravity", "gemini-x"), "same id, other provider");
         let t = Tier { held: 1, waiting: vec![(hop("ChatGPT", "gpt-6.1-sol"), 1000 + 3 * 3600 + 58 * 60), (hop("Antigravity", "gemini-x"), 0)], ..Default::default() };
         assert_eq!(waits(&t, 1000), "GPT 6.1 Sol back in 3h 58m · Gemini X back time unknown");
+        assert_eq!(nearest_wait(&t, 1000), "in 3h 58m");
     }
 }

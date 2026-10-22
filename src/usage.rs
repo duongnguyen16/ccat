@@ -201,7 +201,7 @@ fn local_day(t: u64) -> i64 {
 }
 
 #[cfg(windows)]
-fn local_date(t: u64) -> (i64, i64, i64) {
+pub fn local_date(t: u64) -> (i64, i64, i64) {
     use windows_sys::Win32::{
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
@@ -219,13 +219,13 @@ fn local_date(t: u64) -> (i64, i64, i64) {
 }
 
 #[cfg(not(windows))]
-fn local_date(t: u64) -> (i64, i64, i64) {
+pub fn local_date(t: u64) -> (i64, i64, i64) {
     civil_from_days((t / 86_400) as i64)
 }
 
 /// Local (weekday 0 = Sunday, hour, minute) of a unix time.
 #[cfg(windows)]
-fn local(t: u64) -> (u16, u16, u16) {
+pub fn local(t: u64) -> (u16, u16, u16) {
     use windows_sys::Win32::{
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
@@ -243,7 +243,7 @@ fn local(t: u64) -> (u16, u16, u16) {
 }
 
 #[cfg(not(windows))]
-fn local(t: u64) -> (u16, u16, u16) {
+pub fn local(t: u64) -> (u16, u16, u16) {
     utc_parts(t)
 }
 
@@ -251,7 +251,7 @@ fn utc_parts(t: u64) -> (u16, u16, u16) {
     (((t / 86_400 + 4) % 7) as u16, (t % 86_400 / 3600) as u16, (t % 3600 / 60) as u16)
 }
 
-/// "Resets in 3h 30m (22:00)" within a day, "Resets on Fri, 10:00" beyond.
+/// "Resets in 3h 30m (22:00)" within a day, "Resets on Fri, 10:00" within 6 days, "Resets on 30/10, 10:00" beyond.
 pub fn reset_text(resets: u64, now: u64) -> String {
     if resets == 0 {
         return "Starts when used".into();
@@ -263,6 +263,9 @@ pub fn reset_text(resets: u64, now: u64) -> String {
     let (wd, h, m) = local(resets);
     if left < 86_400 {
         format!("Resets in {}h {}m ({h:02}:{m:02})", left / 3600, left % 3600 / 60)
+    } else if left >= 6 * 86_400 {
+        let (_, mo, d) = local_date(resets);
+        format!("Resets on {d:02}/{mo:02}, {h:02}:{m:02}")
     } else {
         let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][wd as usize % 7];
         format!("Resets on {day}, {h:02}:{m:02}")
@@ -1750,10 +1753,11 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
         pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    // Recently: each bucket's centre sits at its real time, so the chart drifts left as the clock runs. The others
-    // keep their day or week across the width and fill in towards the right.
+    // Recently: each bucket's centre sits at its real time, so the chart drifts left as the clock runs. This week
+    // scales from Monday to the latest bucket so the line meets the right edge. Today keeps its 24 hours.
     let x_of = |k: usize| match range {
         0 => plot.right() - (((exact - (start + k as u64 * w) as f64 - w as f64 / 2.0) / (n as u64 * w) as f64) as f32 * plot.width()),
+        2 if cur > 0 => plot.left() + (k as f32 / cur as f32) * plot.width(),
         _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
     };
     let clip = pt.with_clip_rect(plot);
@@ -1791,14 +1795,23 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
         let (_, h, m) = local(t);
         format!("{h:02}:{m:02}")
     };
+    let (wd, _, _) = local(now);
+    let cur_day = ((wd + 6) % 7) as usize;
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let marks: Vec<(f32, String)> = match range {
         0 => vec![(0.0, "-60m".into()), (0.5, "-30m".into()), (1.0, "now".into())],
         1 => (0..=4).map(|q| (q as f32 / 4.0, format!("{:02}:00", q * 6))).collect(),
-        _ => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate().map(|(d, n)| ((d as f32 + 0.5) / 7.0, n.to_string())).collect(),
+        _ if cur == 0 => vec![(0.0, "Mon".into())],
+        _ => (0..=cur_day)
+            .map(|d| {
+                let center = if d < cur_day { d as f32 * 24.0 + 12.0 } else { ((d * 24 + cur) as f32 / 2.0).min(cur as f32) };
+                (center / cur as f32, days[d].to_string())
+            })
+            .collect(),
     };
     for (frac, text) in marks {
-        let align = if frac <= 0.0 { egui::Align2::LEFT_TOP } else if frac >= 1.0 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
-        pt.text(egui::pos2(plot.left() + plot.width() * frac, plot.bottom() + 4.0), align, text, egui::FontId::proportional(10.5), p.subtle);
+        let align = if frac <= 0.05 { egui::Align2::LEFT_TOP } else if frac >= 0.95 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
+        pt.text(egui::pos2(plot.left() + plot.width() * frac.clamp(0.0, 1.0), plot.bottom() + 4.0), align, text, egui::FontId::proportional(10.5), p.subtle);
     }
     // Hover: the bucket under the pointer, per key.
     if let Some(h) = resp.hover_pos().filter(|h| plot.contains(*h)) {
@@ -2177,10 +2190,11 @@ impl Popup {
         let p = crate::pal(ui);
         for (tier, l) in held {
             let tip = format!("{} waiting at usage limits: {}", if l.held == 1 { "1 request".to_string() } else { format!("{} requests", l.held) }, crate::live::waits(&l, now));
+            let badge_text = format!("Waiting for reset limit · {}", crate::live::nearest_wait(&l, now));
             row(ui, 22.0, |ui| {
                 ui.label(egui::RichText::new(tier).size(12.5).color(p.fg).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    orange_badge(ui, "Waiting for reset limit").on_hover_text(&tip);
+                    orange_badge(ui, &badge_text).on_hover_text(&tip);
                 });
             });
             ui.add_space(2.0);
@@ -2502,6 +2516,7 @@ mod tests {
         let now = 1_792_400_000;
         assert!(reset_text(now + 3 * 3600 + 30 * 60, now).starts_with("Resets in 3h 30m ("));
         assert!(reset_text(now + 3 * 86_400, now).starts_with("Resets on "));
+        assert!(reset_text(now + 7 * 86_400, now).contains("/"));
         assert_eq!(reset_text(0, now), "Starts when used");
         assert_eq!(utc_parts(0), (4, 0, 0), "1970-01-01 was a Thursday");
     }
@@ -2659,6 +2674,29 @@ mod tests {
         let (names, c) = live_series(&calls, span, 2, false, true);
         assert_eq!(names, ["Antigravity", "ChatGPT", "Claude"]);
         assert_eq!((c[2][0], c[2][1], c[2][59], c[0][48], c[0][49]), (0.0, 1.0, 1.0, 0.0, 1.0), "cumulative: only ever rises");
+    }
+
+    #[test]
+    fn this_week_marks_scale_to_elapsed_days() {
+        // Thursday 15:00 UTC
+        let now = 1_792_681_200;
+        let (wd, _, _) = local(now);
+        let cur_day = ((wd + 6) % 7) as usize;
+        let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        let (start, w, n) = range_span(2, now);
+        assert_eq!((w, n), (3600, 168));
+        let cur = (now.saturating_sub(start) / w).min(n as u64 - 1) as usize;
+        assert!(cur > 0);
+        let marks: Vec<(f32, String)> = (0..=cur_day)
+            .map(|d| {
+                let center = if d < cur_day { d as f32 * 24.0 + 12.0 } else { ((d * 24 + cur) as f32 / 2.0).min(cur as f32) };
+                (center / cur as f32, days[d].to_string())
+            })
+            .collect();
+        assert_eq!(marks.len(), cur_day + 1);
+        assert_eq!(marks[0].1, "Mon");
+        assert_eq!(marks[cur_day].1, days[cur_day]);
+        assert!(marks[cur_day].0 <= 1.0);
     }
 
     #[test]
