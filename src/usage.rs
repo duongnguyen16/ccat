@@ -2165,7 +2165,7 @@ impl Popup {
         }
     }
 
-    /// At the bottom of every tab: what held requests wait for, one badge per tier with hover details. Returns its height.
+    /// At the bottom of the Usage tab: what held requests wait for, one row per tier with badge on the right. Returns its height.
     fn notes(&mut self, ui: &mut egui::Ui) -> f32 {
         let held = self.held();
         if held.is_empty() {
@@ -2177,11 +2177,13 @@ impl Popup {
         let p = crate::pal(ui);
         for (tier, l) in held {
             let tip = format!("{} waiting at usage limits: {}", if l.held == 1 { "1 request".to_string() } else { format!("{} requests", l.held) }, crate::live::waits(&l, now));
-            ui.horizontal(|ui| {
+            row(ui, 22.0, |ui| {
                 ui.label(egui::RichText::new(tier).size(12.5).color(p.fg).strong());
-                orange_badge(ui, "Waiting for reset limit").on_hover_text(&tip);
-            }).response.on_hover_text(&tip);
-            ui.add_space(3.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    orange_badge(ui, "Waiting for reset limit").on_hover_text(&tip);
+                });
+            });
+            ui.add_space(2.0);
         }
         ui.cursor().top() - top
     }
@@ -2375,11 +2377,19 @@ impl eframe::App for Popup {
                 });
                 let body = ui.vertical(|ui| {
                     match self.tab {
-                        Tab::Usage => self.usage_tab(ui, &blocks, &mut reload),
-                        Tab::Analytics => self.analytics_tab(ui),
-                        Tab::Settings => self.settings_tab(ui, win),
+                        Tab::Usage => {
+                            self.usage_tab(ui, &blocks, &mut reload);
+                            self.notes_h = self.notes(ui);
+                        }
+                        Tab::Analytics => {
+                            self.notes_h = 0.0;
+                            self.analytics_tab(ui);
+                        }
+                        Tab::Settings => {
+                            self.notes_h = 0.0;
+                            self.settings_tab(ui, win);
+                        }
                     }
-                    self.notes_h = self.notes(ui);
                 });
                 HEADER_H + body.response.rect.height()
             })
