@@ -2044,6 +2044,11 @@ impl Popup {
             self.editor.rows(ui, &mut self.cfg);
             ui.add_space(6.0);
             ui.add(egui::Label::new(egui::RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
+            ui.add_space(8.0);
+            let mut wait = !self.cfg.fail_on_limit;
+            row(ui, 24.0, |ui| crate::switch(ui, &mut wait, "Wait out usage limits"))
+                .on_hover_text("When every route and fallback of a request is at its usage limit, the request waits until one can run, so an agent pauses instead of stopping. Esc in Claude Code still cancels it. Routed sessions only.");
+            self.cfg.fail_on_limit = !wait;
         });
         display_block(ui, &mut self.cfg);
     }
@@ -2099,7 +2104,7 @@ impl eframe::App for Popup {
         }
 
         let mut reload = None;
-        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, [c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
+        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, c.fail_on_limit, [c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
         let before = snapshot(&self.cfg);
         self.providers.poll(&mut self.cfg);
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();

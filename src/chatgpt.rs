@@ -636,6 +636,8 @@ pub struct Pool {
     cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Until when, and why (status, message), each account is skipped.
     blocked: Mutex<HashMap<String, (Instant, u16, String)>>,
+    /// Unix time each block was set: only usage fetched after it can lift it (see `unblock`).
+    since: Mutex<HashMap<String, u64>>,
     /// The API refused plain function tools once: send them in a namespace from now on.
     pub wrap: AtomicBool,
     /// Likewise for `prompt_cache_key`: dropped for the rest of the process.
@@ -664,6 +666,20 @@ impl Pool {
         let who = self.accounts.read().unwrap().iter().find(|a| a.key == key).map_or(key.to_string(), |a| a.email.clone());
         log(&format!("ChatGPT {who} skipped for {secs}s: {} {}", why.status, why.message));
         self.blocked.lock().unwrap().insert(key.to_string(), (Instant::now() + Duration::from_secs(secs), why.status, why.message.clone()));
+        self.since.lock().unwrap().insert(key.to_string(), crate::now());
+    }
+
+    /// Lifts plan-usage blocks (429s) set before usage fetched at `fetched` showed room again. True if one was lifted.
+    pub fn unblock(&self, fetched: u64) -> bool {
+        let since = self.since.lock().unwrap();
+        let mut blocked = self.blocked.lock().unwrap();
+        let before = blocked.len();
+        blocked.retain(|k, (t, status, _)| !(*status == 429 && *t > Instant::now() && since.get(k).is_some_and(|s| *s < fetched)));
+        let lifted = blocked.len() < before;
+        if lifted {
+            log(&format!("ChatGPT has plan usage again (usage at {fetched}): back in the rotation"));
+        }
+        lifted
     }
 
     /// The first account, in the order they were added, that is on, granted, signed in and not blocked.

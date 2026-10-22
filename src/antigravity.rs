@@ -441,6 +441,10 @@ fn callback(mut s: TcpStream, path_wanted: &str, state: &str, who: &str) -> Opti
 // ---------------------------------------------------------------- account pool
 
 /// Antigravity meters each backend family separately, so a block is per (account, family).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 pub fn family(model: &str) -> &'static str {
     if model.starts_with("claude") {
         "claude"
@@ -455,6 +459,8 @@ pub fn family(model: &str) -> &'static str {
 struct Slot {
     token: Option<(String, Instant)>,
     blocked: HashMap<&'static str, Instant>,
+    /// Unix time each block was set: only usage fetched after it can lift it (see `Pool::unblock`).
+    since: HashMap<&'static str, u64>,
 }
 
 pub struct Pool {
@@ -494,7 +500,23 @@ impl Pool {
 
     pub fn block(&self, i: usize, fam: &'static str, secs: u64) {
         log(&format!("{} blocked for {fam} for {secs}s", self.accounts[i].email));
-        self.state.lock().unwrap().1[i].blocked.insert(fam, Instant::now() + Duration::from_secs(secs));
+        let mut g = self.state.lock().unwrap();
+        g.1[i].blocked.insert(fam, Instant::now() + Duration::from_secs(secs));
+        g.1[i].since.insert(fam, unix_now());
+    }
+
+    /// Lifts `email`'s block for `fam` when usage fetched at `fetched` (after the block was set) shows quota again:
+    /// a reset the block's own guess didn't know of. True if one was lifted.
+    pub fn unblock(&self, email: &str, fam: &str, fetched: u64) -> bool {
+        let Some(i) = self.accounts.iter().position(|a| a.email == email) else { return false };
+        let mut g = self.state.lock().unwrap();
+        let s = &mut g.1[i];
+        let live = s.blocked.get(fam).is_some_and(|t| *t > Instant::now()) && s.since.get(fam).is_some_and(|t| *t < fetched);
+        if live {
+            s.blocked.remove(fam);
+            log(&format!("{email} has {fam} quota again (usage at {fetched}): back in the rotation"));
+        }
+        live
     }
 
     fn blocked_for(&self, i: usize, fam: &str) -> Option<Duration> {

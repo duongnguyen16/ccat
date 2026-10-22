@@ -16,7 +16,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Duration,
@@ -40,6 +40,7 @@ const MODEL_ENUM: [(&str, &str); 5] = [
 /// (Gemini 3.5 Flash was retired in Oct 2026: it now answers with a "switch models" notice and no finish reason.)
 const SEARCH_MODEL: &str = "gemini-3.8-flash-low";
 
+#[derive(Clone)]
 pub struct Proxy {
     pub url: String,
     pub token: String,
@@ -51,6 +52,71 @@ pub struct Proxy {
     pub chatgpt: Arc<RwLock<Vec<ChatgptAccount>>>,
     /// What the config knows of each ChatGPT model (efforts, fast tier); swappable too.
     pub chatgpt_models: Arc<RwLock<Vec<ChatgptModel>>>,
+    /// Answer usage limits at once instead of holding the request until a route can run; switchable too.
+    pub fail_on_limit: Arc<AtomicBool>,
+    ctx: Arc<Ctx>,
+}
+
+impl Proxy {
+    /// Fresh usage (the tray's `usage.json`): an account it shows with quota again, fetched after its block was set,
+    /// goes back into rotation now rather than when the block's guess runs out. So a tier returns to its first
+    /// route as soon as that resets, and held requests try again at once.
+    pub fn recheck(&self, u: &crate::usage::Usage) {
+        let ctx = &self.ctx;
+        let mut lifted = false;
+        for (email, src) in u.antigravity.iter().filter(|(_, s)| s.error.is_empty()) {
+            // The second group's buckets cover Claude and GPT-OSS alike.
+            for (group, fams) in [("Gemini", &["gemini"][..]), ("Claude", &["claude", "gpt"][..])] {
+                let bars: Vec<_> = src.bars.iter().filter(|b| b.label.starts_with(group)).collect();
+                if !bars.is_empty() && bars.iter().all(|b| !b.out()) {
+                    for f in fams {
+                        lifted |= ctx.pool.unblock(email, f, src.fetched);
+                    }
+                }
+            }
+        }
+        let g = &u.chatgpt;
+        if g.error.is_empty() && !g.bars.is_empty() && g.bars.iter().all(|b| !b.out()) {
+            lifted |= ctx.gpt.unblock(g.fetched);
+        }
+        if lifted {
+            ctx.wake.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Rewrites this session's live file, so the usage window knows it still runs.
+    pub fn heartbeat(&self) {
+        self.ctx.note(|_| {});
+    }
+}
+
+/// The config's name for a route: provider ("" = Claude) and model.
+fn hop(u: &Upstream, model: &str) -> crate::live::Hop {
+    let provider = match u {
+        Upstream::Official => String::new(),
+        Upstream::Endpoint { name, .. } => name.clone(),
+        Upstream::Antigravity => crate::AG_NAME.into(),
+        Upstream::ChatGPT => crate::GPT_NAME.into(),
+    };
+    crate::live::Hop { provider, model: model.to_string() }
+}
+
+/// A request held at a usage limit, counted in the live file while it waits.
+struct Held<'a> {
+    ctx: &'a Ctx,
+    tier: &'static str,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.ctx.note(|s| {
+            let t = s.tiers.entry(self.tier.to_string()).or_default();
+            t.held = t.held.saturating_sub(1);
+            if t.held == 0 {
+                t.waiting.clear();
+            }
+        });
+    }
 }
 
 /// The official API: requests go there with the login Claude Code itself sends.
@@ -118,6 +184,11 @@ struct Ctx {
     folder: PathBuf,
     /// Tokens per text byte of an Anthropic request, learned per model family from Google's real prompt counts.
     ratio: Mutex<HashMap<&'static str, f64>>,
+    fail_on_limit: Arc<AtomicBool>,
+    /// What this session's tiers are doing, written to its live file (see `live`).
+    live: Mutex<crate::live::Session>,
+    /// Bumped when a block is lifted early: held requests try again at once.
+    wake: AtomicU64,
 }
 
 /// Tokens one image costs. ponytail: a flat middle-of-the-road figure (Gemini 3 default resolution ≈1120, a
@@ -143,6 +214,13 @@ fn weigh(v: &Value) -> (u64, u64) {
 }
 
 impl Ctx {
+    fn note(&self, f: impl FnOnce(&mut crate::live::Session)) {
+        let mut g = self.live.lock().unwrap();
+        f(&mut g);
+        g.updated = crate::now();
+        crate::live::write(&g);
+    }
+
     /// Where a model name goes. An exact name wins, then an explicit `@tier` suffix, then the tier named in it
     /// (`claude-haiku-…` → Haiku), then — for names Claude Code picks on its own — the official API when a tier
     /// uses it (the login is there), else the first tier. No routes at all: the name runs on Antigravity as-is.
@@ -189,6 +267,7 @@ pub fn start(accounts: Vec<Account>, chatgpt: Vec<ChatgptAccount>, models: Vec<C
 
 fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
     let routes = Arc::new(RwLock::new(routes));
+    let fail_on_limit = Arc::new(AtomicBool::new(false));
     let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -205,14 +284,18 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         http: ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into(),
         folder,
         ratio: Mutex::new(HashMap::new()),
+        fail_on_limit: fail_on_limit.clone(),
+        live: Default::default(),
+        wake: AtomicU64::new(0),
     });
+    let handle = ctx.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             let ctx = ctx.clone();
             std::thread::spawn(move || serve(conn, &ctx));
         }
     });
-    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models })
+    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, ctx: handle })
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -337,15 +420,58 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                 return denied(&mut s);
             }
             // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
-            for (n, (u, m)) in tries.iter().enumerate() {
-                let last = n + 1 == tries.len();
-                if n > 0 {
-                    antigravity::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+            // Every try out of quota: the request waits, open, until one can run (or Claude Code stops waiting), so an
+            // agent pauses at a usage limit instead of stopping.
+            let hold = !ctx.fail_on_limit.load(Ordering::Relaxed);
+            let mut held: Option<Held> = None;
+            loop {
+                let mut fails = Vec::new();
+                for (n, (u, m)) in tries.iter().enumerate() {
+                    let last = n + 1 == tries.len();
+                    if n > 0 {
+                        antigravity::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+                    }
+                    match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, !last || hold) {
+                        Ok(()) => {
+                            if !tier.is_empty() {
+                                ctx.note(|s| {
+                                    let t = s.tiers.entry(tier.to_string()).or_default();
+                                    (t.used, t.at) = (Some(hop(u, m)), crate::now());
+                                });
+                            }
+                            return;
+                        }
+                        Err(f) if last && !hold => return respond_error(&mut s, &f),
+                        Err(f) => {
+                            antigravity::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message));
+                            fails.push(f);
+                        }
+                    }
                 }
-                match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, !last) {
-                    Ok(()) => return,
-                    Err(f) if last => return respond_error(&mut s, &f),
-                    Err(f) => antigravity::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message)),
+                let Some(last) = fails.last() else { return };
+                if fails.iter().any(|f| f.status != 429) {
+                    return respond_error(&mut s, last);
+                }
+                // The soonest any try says it's back, checked again at least every 5 minutes (a pool's guess can be early or late).
+                let wait = fails.iter().filter_map(|f| f.retry_after).min().unwrap_or(60).clamp(15, 300);
+                antigravity::log(&format!("{asked} [{tier}]: every route is at its usage limit; holding the request, next try in {wait}s"));
+                // Tell the usage window what this tier waits for, and when each route should be back.
+                if !tier.is_empty() {
+                    let now = crate::now();
+                    let waiting = tries.iter().zip(&fails).map(|((u, m), f)| (hop(u, m), f.retry_after.map_or(0, |r| now + r))).collect();
+                    let first = held.is_none();
+                    ctx.note(|s| {
+                        let t = s.tiers.entry(tier.to_string()).or_default();
+                        t.held += first as u32;
+                        t.waiting = waiting;
+                    });
+                    if first {
+                        held = Some(Held { ctx, tier });
+                    }
+                }
+                if !still_waiting(&s, wait, &ctx.wake) {
+                    antigravity::log(&format!("{asked} [{tier}]: Claude Code stopped waiting; request dropped"));
+                    return;
                 }
             }
         }
@@ -369,6 +495,25 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             respond_error(&mut s, &Failure { status: 404, message: format!("ccat proxy has no {} {}", req.method, req.path), retry_after: None })
         }
     }
+}
+
+/// Sleeps `secs` while Claude Code keeps the connection open; false as soon as it closes it (Esc, or a timeout). Ends
+/// early when `wake` moves: a route came back.
+fn still_waiting(s: &TcpStream, secs: u64, wake: &AtomicU64) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    let at = wake.load(Ordering::Relaxed);
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let open = loop {
+        match s.peek(&mut [0u8; 1]) {
+            Ok(0) => break false,
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => break false,
+            _ if std::time::Instant::now() >= until || wake.load(Ordering::Relaxed) != at => break true,
+            _ => std::thread::sleep(Duration::from_secs(2)),
+        }
+    };
+    open && s.set_nonblocking(false).is_ok()
 }
 
 /// Runs a request on one upstream. With `may_fail` a failure that left nothing written comes back as `Err`
@@ -1833,7 +1978,7 @@ mod tests {
     pub static FAKE_API: Mutex<Option<String>> = Mutex::new(None);
 
     fn serve_pool(pool: Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
-        serve_with(pool, chatgpt::Pool::new(Vec::new(), Vec::new()), routes, folder)
+        serve_with(pool, chatgpt::Pool::new(Vec::new(), Vec::new()), routes, folder).inspect(|p| p.fail_on_limit.store(true, Ordering::Relaxed))
     }
 
     /// One Antigravity tier that Claude Code knows as `name`.
@@ -1854,6 +1999,9 @@ mod tests {
             http: ureq::Agent::new_with_defaults(),
             folder: PathBuf::new(),
             ratio: Mutex::new(HashMap::new()),
+            fail_on_limit: Default::default(),
+            live: Default::default(),
+            wake: AtomicU64::new(0),
         }
     }
 
@@ -2130,6 +2278,19 @@ be brief" }, { "type": "text", "text": " " }],
 
     fn route(tier: &'static str, names: &[&str], upstream: Upstream, model: &str) -> Route {
         Route { tier, names: names.iter().map(|n| n.to_string()).collect(), upstream, model: model.into(), fallbacks: Vec::new() }
+    }
+
+    #[test]
+    fn a_held_request_stops_waiting_when_claude_code_hangs_up() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (server, _) = l.accept().unwrap();
+        let wake = AtomicU64::new(0);
+        assert!(still_waiting(&server, 0, &wake), "open: keep holding");
+        drop(client);
+        let t = std::time::Instant::now();
+        assert!(!still_waiting(&server, 60, &wake), "closed: give up");
+        assert!(t.elapsed() < Duration::from_secs(5), "at once, not after the wait");
     }
 
     #[test]
@@ -2524,7 +2685,9 @@ be brief" }, { "type": "text", "text": " " }],
         let routes = vec![route("opus", &["claude-opus-5-5"], Upstream::ChatGPT, "gpt-test")];
         let gpt = chatgpt::Pool::fake(base, accounts);
         *gpt.models.write().unwrap() = models;
-        serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), gpt, routes, PathBuf::new()).unwrap()
+        let p = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), gpt, routes, PathBuf::new()).unwrap();
+        p.fail_on_limit.store(true, Ordering::Relaxed);
+        p
     }
 
     fn gpt_req(stream: bool) -> Value {

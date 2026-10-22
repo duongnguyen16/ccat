@@ -4,6 +4,7 @@
 
 mod antigravity;
 mod chatgpt;
+mod live;
 mod mcp;
 mod profiles;
 mod providers_ui;
@@ -34,9 +35,9 @@ const TIERS: [(&str, &str, &str); 4] = [
 /// How the official provider (Claude Code's own login, `Route::provider` "") shows in the UI.
 const OFFICIAL: &str = "Claude";
 /// The built-in profile's fixed name; every other profile is an Anthropic-compatible endpoint.
-const AG_NAME: &str = "Antigravity";
+pub const AG_NAME: &str = "Antigravity";
 /// The built-in ChatGPT provider's fixed name.
-const GPT_NAME: &str = "ChatGPT";
+pub const GPT_NAME: &str = "ChatGPT";
 
 /// A connection: an Anthropic-compatible endpoint (`url` + `key`) or the built-in Antigravity account pool.
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -111,6 +112,9 @@ struct Config {
     tray_mode: ViewMode,
     /// Usage sources top to bottom in the popup and first to last on the dial (names; see `usage::ordered`).
     source_order: Vec<String>,
+    /// A routed request whose every route is at its usage limit fails at once, instead of waiting (open) until one
+    /// can run. Off by default: an agent pauses at a limit rather than stopping.
+    fail_on_limit: bool,
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
     show_fable: bool,
@@ -138,7 +142,7 @@ const CLAUDE_MODELS: [&str; 6] = ["claude-sonnet-5-5", "claude-opus-5-5", "claud
 /// so a row of ccat windows opened together costs one check, not one each.
 const REFRESH_SECS: u64 = 6 * 3600;
 
-fn now() -> u64 {
+pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
@@ -200,6 +204,7 @@ struct Launch {
     claude_off: bool,
     folder: String,
     bypass: bool,
+    fail_on_limit: bool,
 }
 
 /// Whether a launch goes through ccat's local proxy: anything but every tier on Claude with no fallback. Plain
@@ -237,7 +242,7 @@ fn tier_names(tiers: &[Route; 4], routed: bool) -> ([String; 4], serde_json::Map
 
 // ---------------------------------------------------------------- storage / network
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
@@ -246,7 +251,7 @@ fn config_path() -> PathBuf {
 }
 
 /// The model list prefixes ids with the vendor ("anthropic/…"); endpoints want the bare id.
-fn bare_id(m: &str) -> String {
+pub fn bare_id(m: &str) -> String {
     let m = m.trim();
     m.strip_prefix("anthropic/").unwrap_or(m).to_string()
 }
@@ -980,7 +985,7 @@ impl App {
         self.cfg.recents.insert(0, self.folder.clone());
         self.cfg.recents.truncate(12);
         let (tiers, providers, claude_models) = (self.cfg.tiers.clone(), self.cfg.providers.clone(), self.cfg.claude_models.clone());
-        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass });
+        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit });
         ui.send_viewport_cmd(ViewportCommand::Close);
     }
 
@@ -1509,12 +1514,24 @@ fn retarget(routes: &mut [proxy::Route], tiers: &[Route; 4], providers: &[Provid
 /// Watches the config while a routed session runs: a model switched in ccat (launcher or Settings) reaches this
 /// session's next request.
 fn follow_config(px: &proxy::Proxy) {
-    let (routes, disabled, chatgpt, chatgpt_models) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone());
+    let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone());
     let stamp = || fs::metadata(config_path()).and_then(|m| m.modified()).ok();
+    let usage_stamp = || fs::metadata(config_path().with_file_name("usage.json")).and_then(|m| m.modified()).ok();
+    let px = px.clone();
     std::thread::spawn(move || {
-        let mut seen = stamp();
+        let (mut seen, mut usage_seen, mut beat) = (stamp(), None, 0u32);
         loop {
             std::thread::sleep(Duration::from_secs(2));
+            // A minute's heartbeat, so the usage window knows this session still runs.
+            beat += 1;
+            if beat % 30 == 1 {
+                px.heartbeat();
+            }
+            // The tray refreshes usage every few minutes: a reset it sees puts the route back at once.
+            if usage_stamp() != usage_seen {
+                usage_seen = usage_stamp();
+                px.recheck(&usage::load_usage());
+            }
             if stamp() == seen {
                 continue;
             }
@@ -1527,6 +1544,7 @@ fn follow_config(px: &proxy::Proxy) {
             let gpt = cfg.providers.iter().find(|p| p.chatgpt);
             *chatgpt.write().unwrap() = gpt.map(|p| p.chatgpt_accounts.clone()).unwrap_or_default();
             *chatgpt_models.write().unwrap() = gpt.map(|p| p.chatgpt_models.clone()).unwrap_or_default();
+            fail_on_limit.store(cfg.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
             for (old, new) in routes.read().unwrap().iter().zip(&next) {
                 if (&old.upstream, &old.model, &old.fallbacks) != (&new.upstream, &new.model, &new.fallbacks) {
                     antigravity::log(&format!("{} now runs {} on {:?}", old.tier, new.model, new.upstream)); // Debug names the provider, never its key
@@ -1577,6 +1595,12 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
             match proxy::start(accounts, gpt_accounts, gpt_models, routes, PathBuf::from(folder)) {
                 Ok(px) => {
                     *px.disabled.write().unwrap() = off_accounts(&l.providers);
+                    px.fail_on_limit.store(l.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
+                    // A request held at a usage limit can wait for hours: Claude Code mustn't give up on it after its
+                    // usual 10 minutes. A timeout the user set stays.
+                    if std::env::var_os("API_TIMEOUT_MS").is_none() {
+                        env.push(("API_TIMEOUT_MS", (7 * 24 * 3600 * 1000u64).to_string()));
+                    }
                     if uses_ag {
                         let servers = serde_json::json!({ "mcpServers": { "antigravity": {
                             "type": "http", "url": format!("{}/mcp", px.url), "headers": { "Authorization": format!("Bearer {}", px.token) },
@@ -2042,7 +2066,7 @@ mod tests {
     fn live_mixed_tiers() {
         let (cfg, _) = load();
         let tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
-        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false };
+        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false };
         let dir = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &dir).unwrap();
         assert!(p.routed && !p.env.iter().any(|(k, _)| *k == "ANTHROPIC_AUTH_TOKEN"), "official tiers keep the Claude login");
@@ -2093,7 +2117,7 @@ mod tests {
         unsafe { std::env::set_var("APPDATA", &dir) };
         cfg.tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         save(&cfg, &serde_json::Value::Null).unwrap();
-        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false };
+        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false };
         let work = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &work).unwrap();
         let ask = || {
