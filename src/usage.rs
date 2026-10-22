@@ -1808,6 +1808,8 @@ struct Popup {
     providers: crate::providers_ui::ProvidersEditor,
     /// Analytics: by model (else by provider), the shown data and the file stamp it was read at, "show more".
     by_model: bool,
+    /// What running sessions report (see `live`), read at most once a second.
+    live: Option<(std::time::Instant, HashMap<String, crate::live::Tier>)>,
     /// Analytics → Live: the requests read and the file stamp they were read at.
     calls: Option<(Vec<Call>, Option<std::time::SystemTime>)>,
     stats: Option<(Stats, bool, Option<std::time::SystemTime>)>,
@@ -1835,6 +1837,15 @@ impl Popup {
         });
     }
 
+    /// Tiers with requests held at their usage limits, in tier order: (UI name, what they wait for).
+    fn held(&mut self) -> Vec<(&'static str, crate::live::Tier)> {
+        if self.live.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(1)) {
+            self.live = Some((std::time::Instant::now(), crate::live::read(now())));
+        }
+        let live = &self.live.as_ref().unwrap().1;
+        crate::TIERS.iter().filter_map(|(name, key, _)| live.get(*key).filter(|l| l.held > 0).map(|l| (*name, l.clone()))).collect()
+    }
+
     /// Re-read `tokens.jsonl` when it changed or the grouping did.
     fn stats(&mut self) -> &Stats {
         let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
@@ -1848,6 +1859,13 @@ impl Popup {
     fn usage_tab(&mut self, ui: &mut egui::Ui, blocks: &[Section], reload: &mut Option<usize>) {
         let p = crate::pal(ui);
         let now = now();
+        // Requests held at their limits, one line per tier, above everything else.
+        for (tier, l) in self.held() {
+            row(ui, ERROR_H, |ui| {
+                let text = format!("{tier} is waiting: {}", crate::live::waits(&l, now));
+                ui.add(egui::Label::new(egui::RichText::new(&text).size(12.0).color(ORANGE)).truncate()).on_hover_text(&text);
+            });
+        }
         let accounts = ag_accounts(&self.cfg);
         let alias = |e: &str| e.split('@').next().unwrap_or(e).to_string();
         for (n, s) in blocks.iter().enumerate() {
@@ -2088,7 +2106,7 @@ impl eframe::App for Popup {
         let blocks = sections(&self.cfg, &self.usage, self.claude);
         // Usage knows its height up front; the other tabs take last frame's. The bottom edge stays put.
         let h = match self.tab {
-            Tab::Usage => height(&blocks),
+            Tab::Usage => height(&blocks) + self.held().len() as f32 * ERROR_H,
             Tab::Settings if self.editor.active() => self.measured.max(470.0),
             _ => self.measured,
         };
@@ -2191,6 +2209,7 @@ pub fn run_popup(click: (f64, f64)) {
                 editor: Default::default(),
                 providers: Default::default(),
                 by_model,
+                live: None,
                 calls: None,
                 stats: None,
                 more: false,

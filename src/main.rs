@@ -26,7 +26,7 @@ use std::{
 };
 
 /// (UI label, routing key, env var) for each model tier Claude Code knows.
-const TIERS: [(&str, &str, &str); 4] = [
+pub const TIERS: [(&str, &str, &str); 4] = [
     ("Fable", "fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
     ("Opus", "opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
     ("Sonnet", "sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
@@ -1165,7 +1165,14 @@ struct TierEditor {
     focus: bool,
     /// The configuration button above the tiers, its menu and dialogs.
     bar: profiles::Bar,
+    /// This frame's row labels, (tier, row, rect): where the route tree is drawn.
+    at: Vec<(usize, usize, egui::Rect)>,
+    /// What running sessions report (see `live`), read at most once a second.
+    live: Option<(std::time::Instant, std::collections::HashMap<String, live::Tier>)>,
 }
+
+/// Left of each row's number: room for the route tree.
+const GUTTER: f32 = 12.0;
 
 /// One dropdown entry: the (provider, model) it picks, its text, and a tag on the right.
 struct Choice {
@@ -1183,6 +1190,12 @@ impl TierEditor {
 
     fn rows(&mut self, ui: &mut egui::Ui, cfg: &mut Config) {
         let p = pal(ui);
+        self.at.clear();
+        if self.live.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(1)) {
+            self.live = Some((std::time::Instant::now(), live::read(now())));
+        }
+        let live = self.live.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
         let before = cfg.tiers.clone();
         let (names, _) = tier_names(&cfg.tiers, routed(&cfg.tiers));
         let claude = claude_choices(&cfg.claude_models, None);
@@ -1248,9 +1261,10 @@ impl TierEditor {
                     }
                 });
             }
-            // Lined up with the selectors: past the number column `selector` draws: its 16pt label and the spacing after it.
+            self.tree(ui, t, &chain, live.get(TIERS[t].1));
+            // Lined up with the selectors: past the tree's gutter and the number column `selector` draws.
             ui.horizontal(|ui| {
-                ui.add_space(16.0 + ui.spacing().item_spacing.x);
+                ui.add_space(GUTTER + 16.0 + 2.0 * ui.spacing().item_spacing.x);
                 if ui.add(egui::Label::new(RichText::new(format!("+ New {tier} fallback")).size(12.0).color(p.subtle)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     chain.push((String::new(), String::new()));
                     self.open(t, chain.len() - 1);
@@ -1287,6 +1301,47 @@ impl TierEditor {
         }
     }
 
+    /// Tier `t`'s route tree in the gutter: from its Claude name (or its first route) to each route, the branch that
+    /// served its last request (in a running session, the last 15 minutes) in the accent colour, an orange dot on each
+    /// route a held request waits for; then, while requests are held, what they wait for.
+    fn tree(&self, ui: &mut egui::Ui, t: usize, chain: &[(String, String)], lt: Option<&live::Tier>) {
+        let p = pal(ui);
+        let rect = |row: usize| self.at.iter().find(|(tt, r, _)| *tt == t && *r == row).map(|x| x.2);
+        let rows: Vec<egui::Rect> = (0..chain.len()).filter_map(rect).collect();
+        let row_of = |h: &live::Hop| chain.iter().position(|(pv, m)| live::matches(h, pv, m));
+        let active = lt.and_then(|l| l.used.as_ref()).and_then(row_of);
+        let held = lt.filter(|l| l.held > 0);
+        let waiting: Vec<usize> = held.map(|l| l.waiting.iter().filter_map(|(h, _)| row_of(h)).collect()).unwrap_or_default();
+        let orange = hex(0xe08a2e);
+        if let (Some(root), Some(last)) = (rect(SPOOF_ROW).or(rows.first().copied()), rows.last()) {
+            if rows.len() > 1 || root != rows[0] {
+                let (x, end) = (root.left() - GUTTER + 3.0, root.left() - 3.0);
+                let (grey, lit) = (Stroke::new(1.5, p.border_strong), Stroke::new(2.0, p.accent));
+                let pt = ui.painter();
+                pt.line_segment([egui::pos2(x, root.center().y), egui::pos2(x, last.center().y)], grey);
+                for r in rows.iter().chain((root != rows[0]).then_some(&root)) {
+                    pt.line_segment([egui::pos2(x, r.center().y), egui::pos2(end, r.center().y)], grey);
+                }
+                if let Some(n) = active {
+                    let y = rows[n].center().y;
+                    for seg in [[egui::pos2(x, root.center().y), egui::pos2(x, y)], [egui::pos2(x, y), egui::pos2(end, y)], [egui::pos2(x, root.center().y), egui::pos2(end, root.center().y)]] {
+                        pt.line_segment(seg, lit);
+                    }
+                }
+                for n in &waiting {
+                    pt.circle_filled(egui::pos2(end, rows[*n].center().y), 3.0, orange);
+                }
+            }
+        }
+        if let Some(l) = held {
+            let text = format!("{} waiting at the usage limits: {}", if l.held == 1 { "1 request".to_string() } else { format!("{} requests", l.held) }, live::waits(l, now()));
+            ui.horizontal(|ui| {
+                ui.add_space(GUTTER + 16.0 + 2.0 * ui.spacing().item_spacing.x);
+                ui.add(egui::Label::new(RichText::new(text).size(11.5).color(orange)).wrap());
+            });
+        }
+    }
+
     fn open(&mut self, t: usize, row: usize) {
         (self.pick, self.focus) = (Some((t, row)), true);
         self.query.clear();
@@ -1298,8 +1353,10 @@ impl TierEditor {
         let p = pal(ui);
         let mut open = None;
         ui.horizontal(|ui| {
-            ui.add_sized([16.0, 26.0], egui::Label::new(RichText::new(label).size(12.5).color(p.subtle)));
-            let resp = picker_btn(ui, w, text, placeholder);
+            ui.add_space(GUTTER);
+            let at = ui.add_sized([16.0, 26.0], egui::Label::new(RichText::new(label).size(12.5).color(p.subtle))).rect;
+            self.at.push((t, row, at));
+            let resp = picker_btn(ui, w - GUTTER - ui.spacing().item_spacing.x, text, placeholder);
             if resp.clicked() {
                 if self.pick == Some((t, row)) {
                     self.pick = None;
