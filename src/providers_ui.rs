@@ -43,6 +43,8 @@ pub struct ProvidersEditor {
     /// Whether each ChatGPT account (by key) must sign in again, and when that was last looked up: the answer is in a
     /// file, so it is read every few seconds, not every frame.
     gpt_state: HashMap<String, (Instant, bool)>,
+    /// Accounts being looked up again (Antigravity by email: its plan; ChatGPT by key), and the answer to come.
+    checking: HashMap<String, mpsc::Receiver<Result<String, String>>>,
 }
 
 enum Act {
@@ -119,6 +121,19 @@ fn trash(ui: &mut egui::Ui, hot: bool, tip: &str) -> bool {
     }
 }
 
+/// The row's reload slot, left of the trash: while hovered (or busy), else the same space left empty.
+fn reload(ui: &mut egui::Ui, hot: bool, busy: bool, tip: &str) -> bool {
+    if busy {
+        ui.add_sized([28.0, 28.0], egui::Spinner::new().size(13.0));
+        false
+    } else if hot {
+        icon_btn(ui, Icon::Reload).on_hover_text(tip).clicked()
+    } else {
+        ui.allocate_space(vec2(28.0, 28.0));
+        false
+    }
+}
+
 /// The plan, small and rounded with a faint green tint.
 fn badge(ui: &mut egui::Ui, text: &str, on: bool) -> Option<egui::Response> {
     if text.is_empty() {
@@ -178,6 +193,28 @@ impl ProvidersEditor {
 
     /// Takes in finished model lists and sign-ins; call it every frame, whether or not the view is showing.
     pub fn poll(&mut self, cfg: &mut Config) {
+        // Accounts looked up again: an Antigravity plan as it is now.
+        let mut plans = Vec::new();
+        self.checking.retain(|who, rx| match rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => true,
+            Ok(r) => {
+                plans.push((who.clone(), r));
+                false
+            }
+            Err(_) => false,
+        });
+        for (who, r) in plans {
+            match r {
+                Ok(plan) => {
+                    if let Some(a) = cfg.providers.iter_mut().filter(|p| p.antigravity).flat_map(|p| p.accounts.iter_mut()).find(|a| a.email == who) {
+                        a.plan = plan;
+                    }
+                }
+                Err(e) => {
+                    self.fetch_errs.insert(crate::AG_NAME.to_string(), format!("{}: {e}", who.split('@').next().unwrap_or(&who)));
+                }
+            }
+        }
         let mut done = Vec::new();
         self.fetches.retain(|(name, rx)| match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => true,
@@ -332,6 +369,16 @@ impl ProvidersEditor {
                     if trash(ui, hot, "Remove this account") {
                         remove = Some(n);
                     }
+                    if reload(ui, hot, self.checking.contains_key(&acc.email), "Look this account up again: its plan and its quota") {
+                        let (tx, rx) = mpsc::channel();
+                        let (a, ctx) = (acc.clone(), ui.ctx().clone());
+                        std::thread::spawn(move || {
+                            let _ = tx.send(antigravity::plan_of(&a));
+                            crate::usage::refresh(false, true, false);
+                            ctx.request_repaint();
+                        });
+                        self.checking.insert(acc.email.clone(), rx);
+                    }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.add_space(INDENT);
                         let alias = acc.email.split('@').next().unwrap_or(&acc.email);
@@ -396,6 +443,7 @@ impl ProvidersEditor {
                 note(ui, e, p.danger);
             }
             let mut remove = None;
+            let mut resync = false;
             for n in 0..pr.chatgpt_accounts.len() {
                 let needs = self.gpt_needs(&pr.chatgpt_accounts[n].key);
                 let acc = &mut pr.chatgpt_accounts[n];
@@ -406,6 +454,18 @@ impl ProvidersEditor {
                     }
                     if !acc.cli() && trash(ui, hot, "Remove this account from ccat") {
                         remove = Some(n);
+                    }
+                    let busy = self.checking.contains_key(&acc.key);
+                    if reload(ui, hot, busy, "Look this account up again: its plan and its usage") {
+                        let (tx, rx) = mpsc::channel();
+                        let ctx = ui.ctx().clone();
+                        std::thread::spawn(move || {
+                            crate::usage::refresh(false, false, true);
+                            let _ = tx.send(Ok(String::new()));
+                            ctx.request_repaint();
+                        });
+                        self.checking.insert(acc.key.clone(), rx);
+                        resync = true;
                     }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.add_space(INDENT);
@@ -422,6 +482,9 @@ impl ProvidersEditor {
                         let _ = badge(ui, why, on).map(|b| b.on_hover_text(if acc.cli() { "Codex CLI isn't signed in: + runs `codex login`" } else { "Revoked at OpenAI; remove it and use Codex CLI's login" }));
                     });
                 });
+            }
+            if resync {
+                chatgpt::sync_codex_cli(&mut pr.chatgpt_accounts);
             }
             if let Some(n) = remove {
                 let gone = pr.chatgpt_accounts.remove(n);
