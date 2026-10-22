@@ -1330,7 +1330,13 @@ impl TierEditor {
                     }
                 }
                 for n in &waiting {
-                    pt.circle_filled(egui::pos2(end, rows[*n].center().y), 3.0, orange);
+                    let center = egui::pos2(end, rows[*n].center().y);
+                    pt.circle_filled(center, 3.0, orange);
+                    if let Some(l) = held {
+                        let dot_rect = egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0));
+                        ui.interact(dot_rect, ui.id().with(("waiting_dot", t, *n)), egui::Sense::hover())
+                            .on_hover_text(format!("Waiting at usage limits: {}", live::waits(l, now())));
+                    }
                 }
             }
         }

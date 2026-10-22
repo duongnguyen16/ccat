@@ -494,9 +494,9 @@ pub fn ag_bars(sources: &[(&antigravity::Account, &Source)], group: &str) -> Vec
         let mut ranks: Vec<u8> = each.iter().filter(|e| e.1.is_some()).map(|e| e.2).collect();
         ranks.sort();
         ranks.dedup();
-        for r in ranks {
-            if let Some((used, resets)) = avg(each.iter().filter(|e| e.2 == r).filter_map(|e| e.1).collect()) {
-                let part = if sources.len() > 1 { ["Free", "Other", "Plus", "Pro", "Ultra"][r as usize].to_string() } else { String::new() };
+        for r in &ranks {
+            if let Some((used, resets)) = avg(each.iter().filter(|e| e.2 == *r).filter_map(|e| e.1).collect()) {
+                let part = if ranks.len() > 1 { ["Free", "Other", "Plus", "Pro", "Ultra"][*r as usize].to_string() } else { String::new() };
                 out.push(Bar { label: label("Weekly (7 day)"), used, resets, window: WEEK, part });
             }
         }
@@ -1981,6 +1981,16 @@ fn chevron(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().add(egui::Shape::line(vec![c + egui::vec2(-3.5, -2.0), c + egui::vec2(0.0, 1.5), c + egui::vec2(3.5, -2.0)], egui::Stroke::new(1.5, color)));
 }
 
+/// An orange status badge (e.g. "Waiting for reset limit").
+fn orange_badge(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let orange = ORANGE;
+    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), orange);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + egui::vec2(10.0, 4.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, orange.gamma_multiply(0.18));
+    ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, orange);
+    resp
+}
+
 /// Settings has two views: the tier pickers, and the providers behind them.
 #[derive(Clone, Copy, PartialEq)]
 enum Sub {
@@ -2103,14 +2113,26 @@ impl Popup {
                     } else {
                         let before = self.cfg.usage_view.clone();
                         let view = &mut self.cfg.usage_view;
-                        let shown = if view.is_empty() { "General".to_string() } else { alias(view) };
+                        let all_plan = {
+                            let mut plans: Vec<u8> = accounts.iter().map(|a| antigravity::rank(&a.plan)).collect();
+                            plans.sort();
+                            plans.dedup();
+                            if plans.len() == 1 {
+                                let label = antigravity::plan_label(&accounts[0].plan);
+                                if !label.is_empty() { Some(label) } else { None }
+                            } else {
+                                None
+                            }
+                        };
+                        let general_label = all_plan.unwrap_or("General");
+                        let shown = if view.is_empty() { general_label.to_string() } else { alias(view) };
                         // Plain mono text like the Claude plan beside it; a click lists the accounts with their plans.
                         let at = ui.add(egui::Label::new(egui::RichText::new(shown).monospace().size(11.5).color(p.muted)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
                         egui::Popup::menu(&at).show(|ui| {
                             ui.set_min_width(210.0);
                             ui.spacing_mut().item_spacing.y = 1.0;
                             let mut picked = None;
-                            if crate::pick_row(ui, view.is_empty(), "General", false, "").clicked() {
+                            if crate::pick_row(ui, view.is_empty(), general_label, false, "").clicked() {
                                 picked = Some(String::new());
                             }
                             for a in &accounts {
@@ -2143,7 +2165,7 @@ impl Popup {
         }
     }
 
-    /// At the bottom of every tab: what held requests wait for, one wrapped line per tier. Returns its height.
+    /// At the bottom of every tab: what held requests wait for, one badge per tier with hover details. Returns its height.
     fn notes(&mut self, ui: &mut egui::Ui) -> f32 {
         let held = self.held();
         if held.is_empty() {
@@ -2152,9 +2174,13 @@ impl Popup {
         let top = ui.cursor().top();
         rule(ui, 16.0);
         let now = now();
+        let p = crate::pal(ui);
         for (tier, l) in held {
-            let n = if l.held == 1 { String::new() } else { format!(" ({} requests)", l.held) };
-            ui.add(egui::Label::new(egui::RichText::new(format!("{tier} is waiting at its usage limits{n}: {}", crate::live::waits(&l, now))).size(11.5).color(ORANGE)).wrap());
+            let tip = format!("{} waiting at usage limits: {}", if l.held == 1 { "1 request".to_string() } else { format!("{} requests", l.held) }, crate::live::waits(&l, now));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tier).size(12.5).color(p.fg).strong());
+                orange_badge(ui, "Waiting for reset limit").on_hover_text(&tip);
+            }).response.on_hover_text(&tip);
             ui.add_space(3.0);
         }
         ui.cursor().top() - top
@@ -2530,8 +2556,8 @@ mod tests {
 
     #[test]
     fn failed_fetches_keep_their_last_bars_greyed_out() {
-        let acct = |e: &str| antigravity::Account { email: e.into(), ..Default::default() };
-        let ag = crate::Provider { name: "Antigravity".into(), antigravity: true, accounts: vec![acct("a@x"), acct("b@x")], ..Default::default() };
+        let acct = |e: &str, plan: &str| antigravity::Account { email: e.into(), plan: plan.into(), ..Default::default() };
+        let ag = crate::Provider { name: "Antigravity".into(), antigravity: true, accounts: vec![acct("a@x", "free-tier"), acct("b@x", "g1-pro-tier")], ..Default::default() };
         let cfg = crate::Config { providers: vec![ag], ..Default::default() };
         let bars = parse_ag(&ag_summary(0.5, 0.5));
         let src = |err: &str| Source { bars: bars.clone(), error: err.into(), ..Default::default() };
@@ -2543,7 +2569,12 @@ mod tests {
 
         u.antigravity.insert("a@x".into(), src(""));
         u.antigravity.insert("b@x".into(), src(""));
-        assert!(sections(&cfg, &u, false)[0].bars.iter().any(|b| !b.part.is_empty()), "two accounts: weekly split by plan");
+        assert!(sections(&cfg, &u, false)[0].bars.iter().any(|b| !b.part.is_empty()), "two accounts with different plans: weekly split by plan");
+
+        // When all accounts have the same plan, they are not split.
+        let ag_same = crate::Provider { name: "Antigravity".into(), antigravity: true, accounts: vec![acct("a@x", "g1-pro-tier"), acct("b@x", "g1-pro-tier")], ..Default::default() };
+        let cfg_same = crate::Config { providers: vec![ag_same], ..Default::default() };
+        assert!(sections(&cfg_same, &u, false)[0].bars.iter().all(|b| b.part.is_empty()), "same plan: no split");
 
         u.antigravity.insert("a@x".into(), src("down"));
         u.antigravity.insert("b@x".into(), src("down"));

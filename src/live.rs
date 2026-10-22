@@ -88,7 +88,7 @@ pub fn matches(hop: &Hop, provider: &str, model: &str) -> bool {
     hop.provider == provider && (id.is_empty() || hop.model == id.split('[').next().unwrap_or("").trim())
 }
 
-/// "gpt-6.1-sol back in 3h 58m · gemini-x back time unknown": what a held tier waits for.
+/// "GPT 6.1 Sol back in 3h 58m · Gemini X back time unknown": what a held tier waits for.
 pub fn waits(t: &Tier, now: u64) -> String {
     let when = |back: u64| match back.saturating_sub(now) {
         _ if back == 0 => "back time unknown".to_string(),
@@ -97,7 +97,14 @@ pub fn waits(t: &Tier, now: u64) -> String {
         s if s < 86_400 => format!("back in {}h {}m", s / 3600, s % 3600 / 60),
         s => format!("back in {}d {}h", s / 86_400, s % 86_400 / 3600),
     };
-    t.waiting.iter().map(|(h, back)| format!("{} {}", if h.model.is_empty() { "Claude" } else { &h.model }, when(*back))).collect::<Vec<_>>().join(" · ")
+    t.waiting
+        .iter()
+        .map(|(h, back)| {
+            let name = if h.model.is_empty() { "Claude".to_string() } else { crate::usage::pretty_model(&h.model) };
+            format!("{name} {}", when(*back))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 #[cfg(test)]
@@ -111,6 +118,6 @@ mod tests {
         assert!(matches(&hop("Antigravity", "gemini-x"), "Antigravity", "gemini-x[1m]"), "a context hint doesn't count");
         assert!(!matches(&hop("ChatGPT", "gemini-x"), "Antigravity", "gemini-x"), "same id, other provider");
         let t = Tier { held: 1, waiting: vec![(hop("ChatGPT", "gpt-6.1-sol"), 1000 + 3 * 3600 + 58 * 60), (hop("Antigravity", "gemini-x"), 0)], ..Default::default() };
-        assert_eq!(waits(&t, 1000), "gpt-6.1-sol back in 3h 58m · gemini-x back time unknown");
+        assert_eq!(waits(&t, 1000), "GPT 6.1 Sol back in 3h 58m · Gemini X back time unknown");
     }
 }
