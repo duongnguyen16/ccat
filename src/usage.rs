@@ -1400,14 +1400,108 @@ fn tokens_path() -> PathBuf {
     crate::config_path().with_file_name("tokens.jsonl")
 }
 
-/// "claude-opus-5-5" → "Opus 5.5", "claude-haiku-4-5-20251001" → "Haiku 4.5"; anything else as it is.
+/// "claude-opus-5-5" → "Claude Opus 5.5", "gpt-6-astra" → "GPT 6 Astra", "gemini-3.8-flash-tiered" → "Gemini 3.8 Flash Tiered".
 pub fn pretty_model(m: &str) -> String {
-    let Some(rest) = m.strip_prefix("claude-") else { return m.to_string() };
-    let mut parts = rest.split('-');
-    let family = parts.next().unwrap_or("");
-    let name: String = family.chars().take(1).flat_map(char::to_uppercase).chain(family.chars().skip(1)).collect();
-    let version: Vec<&str> = parts.take_while(|p| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit())).collect();
-    if version.is_empty() { name } else { format!("{name} {}", version.join(".")) }
+    let m = m.trim().strip_prefix("anthropic/").unwrap_or(m.trim());
+    if let Some(rest) = m.strip_prefix("claude-") {
+        let parts: Vec<&str> = rest.split('-').collect();
+        let mut res = vec!["Claude".to_string()];
+        if parts.first().is_some_and(|p| p.chars().all(|c| c.is_ascii_digit())) {
+            let mut ver = Vec::new();
+            let mut rest_parts = &parts[..];
+            for (i, p) in parts.iter().enumerate() {
+                if p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()) {
+                    ver.push(*p);
+                } else {
+                    rest_parts = &parts[i..];
+                    break;
+                }
+            }
+            if !ver.is_empty() {
+                res.push(ver.join("."));
+            }
+            for p in rest_parts {
+                if p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                res.push(capitalize_word(p));
+            }
+        } else if let Some((fam, tails)) = parts.split_first() {
+            res.push(capitalize_word(fam));
+            let mut ver = Vec::new();
+            let mut extra = Vec::new();
+            for p in tails {
+                if p.chars().all(|c| c.is_ascii_digit()) {
+                    if p.len() == 8 {
+                        continue; // Date snapshot e.g. 20251001
+                    }
+                    if p.len() <= 2 {
+                        ver.push(*p);
+                    } else {
+                        extra.push(p.to_string());
+                    }
+                } else {
+                    extra.push(capitalize_word(p));
+                }
+            }
+            if !ver.is_empty() {
+                res.push(ver.join("."));
+            }
+            res.extend(extra);
+        }
+        return res.join(" ");
+    }
+    if let Some(rest) = m.strip_prefix("gpt-") {
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let mut res = vec!["GPT".to_string()];
+        for p in parts {
+            if p.starts_with(|c: char| c.is_ascii_digit()) && p.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                res.push(p.to_string());
+            } else if p.eq_ignore_ascii_case("4o") {
+                res.push("4o".to_string());
+            } else {
+                res.push(capitalize_word(p));
+            }
+        }
+        return res.join(" ");
+    }
+    if let Some(rest) = m.strip_prefix("gemini-") {
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let mut res = vec!["Gemini".to_string()];
+        for p in parts {
+            if p.starts_with(|c: char| c.is_ascii_digit()) && p.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                res.push(p.to_string());
+            } else {
+                res.push(capitalize_word(p));
+            }
+        }
+        return res.join(" ");
+    }
+    if let Some(rest) = m.strip_prefix("deepseek-") {
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let mut res = vec!["DeepSeek".to_string()];
+        for p in parts {
+            res.push(capitalize_word(p));
+        }
+        return res.join(" ");
+    }
+    if m.starts_with('o') && m.len() >= 2 && m.as_bytes()[1].is_ascii_digit() {
+        let parts: Vec<&str> = m.split('-').filter(|p| !p.is_empty()).collect();
+        let mut res = vec![parts[0].to_uppercase()];
+        for p in &parts[1..] {
+            res.push(capitalize_word(p));
+        }
+        return res.join(" ");
+    }
+    m.to_string()
+}
+
+fn capitalize_word(w: &str) -> String {
+    let mut chars = w.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+    }
 }
 
 /// 950, 405.6k, 21.9M, 1.6B.
@@ -2517,7 +2611,7 @@ mod tests {
         assert_eq!(calls.len(), 3, "older than `since` is left out");
         let span = (60, 60, 60); // minutes 1 to 60
         let (names, s) = live_series(&calls, span, 1, false, false);
-        assert_eq!(names, ["Opus 5.5", "gpt-6.1-sol"], "most first");
+        assert_eq!(names, ["Claude Opus 5.5", "GPT 6.1 Sol"], "most first");
         assert_eq!((s[0][1], s[1][1], s[0][49]), (1.0, 1.0, 1.0));
         let (names, s) = live_series(&calls, span, 0, true, false);
         assert_eq!((names.len(), s[0][1], s[0][49]), (1, 110.0, 10.0), "total tokens, in and out");
@@ -2619,7 +2713,7 @@ mod tests {
     #[test]
     fn analytics_counts_per_day_and_formats_like_the_console() {
         assert_eq!((fmt_tokens(950.0), fmt_tokens(405_600.0), fmt_tokens(21_900_000.0), fmt_tokens(1.6e9), fmt_tokens(4e9)), ("950".into(), "405.6k".into(), "21.9M".into(), "1.6B".into(), "4B".into()));
-        assert_eq!((pretty_model("claude-opus-5-5"), pretty_model("claude-haiku-4-5-20251001"), pretty_model("gemini-3.8-flash-tiered")), ("Opus 5.5".into(), "Haiku 4.5".into(), "gemini-3.8-flash-tiered".into()));
+        assert_eq!((pretty_model("claude-opus-5-5"), pretty_model("claude-haiku-4-5-20251001"), pretty_model("gpt-6-astra"), pretty_model("gemini-3.8-flash-tiered")), ("Claude Opus 5.5".into(), "Claude Haiku 4.5".into(), "GPT 6 Astra".into(), "Gemini 3.8 Flash Tiered".into()));
         assert_eq!(civil_from_days(civil_days(2026, 10, 4)), (2026, 10, 4));
         assert_eq!(day_label(civil_days(2026, 10, 4)), "Oct 4");
         let t = 1_792_400_000u64;
@@ -2627,7 +2721,7 @@ mod tests {
         let line = |dt: u64, model: &str, provider: &str, i: u64, o: u64| json!({ "t": t - dt, "tier": "opus", "provider": provider, "model": model, "input": i, "output": o, "cache_read": 1000, "cache_write": 0 }).to_string();
         let text = [line(0, "claude-opus-5-5", "Claude", 10, 5), line(0, "gemini-x", "Antigravity", 1, 1), line(86_400, "claude-opus-5-5", "Claude", 0, 100), line(40 * 86_400, "old", "Claude", 9, 9), "garbage".into()].join("\n");
         let st = load_stats(&text, true, today);
-        assert_eq!(st.keys.iter().map(|k| (k.0.as_str(), k.1, k.2)).collect::<Vec<_>>(), [("Opus 5.5", 2010, 105), ("gemini-x", 1001, 1)], "cache reads count as input; a 40-day-old line is out");
+        assert_eq!(st.keys.iter().map(|k| (k.0.as_str(), k.1, k.2)).collect::<Vec<_>>(), [("Claude Opus 5.5", 2010, 105), ("Gemini X", 1001, 1)], "cache reads count as input; a 40-day-old line is out");
         assert_eq!(st.cells[&(DAYS - 1, 0)], 1015, "today's Opus: in + out");
         let by_provider = load_stats(&text, false, today);
         assert_eq!(by_provider.keys[0].0, "Claude");
