@@ -40,6 +40,9 @@ pub struct ProvidersEditor {
     login_err: String,
     gpt_login: Option<LoginJob<chatgpt::ChatgptAccount>>,
     gpt_err: String,
+    muse_login: Option<LoginJob<crate::museai::Account>>,
+    muse_err: String,
+    ctx: Option<egui::Context>,
     /// Whether each ChatGPT account (by key) must sign in again, and when that was last looked up: the answer is in a
     /// file, so it is read every few seconds, not every frame.
     gpt_state: HashMap<String, (Instant, bool)>,
@@ -55,6 +58,28 @@ enum Act {
 
 /// A model-list request on its own thread. Antigravity asks with its first account that's on.
 fn start_fetch(ctx: &egui::Context, p: &Provider) -> Result<mpsc::Receiver<Fetched>, String> {
+    if p.ollama {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let url = p.url.clone();
+        let key = (!p.key.trim().is_empty()).then(|| p.key.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::ollama::list_models(&url, key.as_deref()).map(|ids| (ids, Vec::new())));
+            ctx.request_repaint();
+        });
+        return Ok(rx);
+    }
+    if p.muse {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let url = p.url.clone();
+        let key = (!p.key.trim().is_empty()).then(|| p.key.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::museai::list_models(&url, key.as_deref()).map(|ids| (ids, Vec::new())));
+            ctx.request_repaint();
+        });
+        return Ok(rx);
+    }
     if p.chatgpt {
         let key = p.chatgpt_accounts.iter().find(|a| a.usable()).map(|a| a.key.clone()).ok_or("Sign in with ChatGPT first (and turn the account on).")?;
         let (tx, rx) = mpsc::channel();
@@ -98,6 +123,38 @@ fn start_login(ctx: &egui::Context) -> Result<LoginJob<antigravity::Account>, St
         ctx.request_repaint();
     });
     Ok(LoginJob { url, cancel, rx })
+}
+
+fn start_muse_login(ctx: &egui::Context) -> Result<LoginJob<crate::museai::Account>, String> {
+    let login = crate::museai::Login::start()?;
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (url, stop, ctx) = (login.url.clone(), cancel.clone(), ctx.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(login.finish(&stop));
+        ctx.request_repaint();
+    });
+    Ok(LoginJob { url, cancel, rx })
+}
+
+impl<T> Drop for LoginJob<T> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ProvidersEditor {
+    fn drop(&mut self) {
+        if let Some(job) = &self.muse_login {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(job) = &self.login {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(job) = &self.gpt_login {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One row of `ROW` height. `add` lays out the right-hand controls first (right to left), then a left-to-right
@@ -173,9 +230,9 @@ impl ProvidersEditor {
         self.rename.is_some()
     }
 
-    /// A Google sign-in is waiting on the browser, which takes focus away from the window.
+    /// A sign-in is waiting on the browser, which takes focus away from the window.
     pub fn signing_in(&self) -> bool {
-        self.login.is_some() || self.gpt_login.is_some()
+        self.login.is_some() || self.gpt_login.is_some() || self.muse_login.is_some()
     }
 
     /// Whether the ChatGPT account must sign in again (looked up at most every 3 seconds).
@@ -273,10 +330,33 @@ impl ProvidersEditor {
             }
             self.gpt_login = None;
         }
+        if let Some(r) = self.muse_login.as_ref().and_then(|j| j.rx.try_recv().ok()) {
+            match r {
+                Ok(acc) => {
+                    if let Some(p) = cfg.providers.iter_mut().find(|p| p.muse) {
+                        p.muse_account = Some(acc);
+                        p.disabled = false;
+                        if let Some(ctx) = &self.ctx {
+                            if let Ok(rx) = start_fetch(ctx, p) {
+                                self.fetches.push((p.name.clone(), rx));
+                                self.fetch_errs.remove(&p.name);
+                            }
+                        }
+                    }
+                    self.muse_err.clear();
+                    std::thread::spawn(|| {
+                        crate::usage::refresh(false, false, false, false, true);
+                    });
+                }
+                Err(e) => self.muse_err = e,
+            }
+            self.muse_login = None;
+        }
     }
 
     /// The view, scrolling past `max_h`.
     pub fn show(&mut self, ui: &mut egui::Ui, cfg: &mut Config, max_h: f32) {
+        self.ctx = Some(ui.ctx().clone());
         egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             self.body(ui, cfg);
@@ -374,7 +454,7 @@ impl ProvidersEditor {
                         let (a, ctx) = (acc.clone(), ui.ctx().clone());
                         std::thread::spawn(move || {
                             let _ = tx.send(antigravity::plan_of(&a));
-                            crate::usage::refresh(false, true, false);
+                            crate::usage::refresh(false, true, false, false, false);
                             ctx.request_repaint();
                         });
                         self.checking.insert(acc.email.clone(), rx);
@@ -460,7 +540,7 @@ impl ProvidersEditor {
                         let (tx, rx) = mpsc::channel();
                         let ctx = ui.ctx().clone();
                         std::thread::spawn(move || {
-                            crate::usage::refresh(false, false, true);
+                            crate::usage::refresh(false, false, true, false, false);
                             let _ = tx.send(Ok(String::new()));
                             ctx.request_repaint();
                         });
@@ -513,10 +593,141 @@ impl ProvidersEditor {
             }
         }
 
+        // Ollama: local model runtime.
+        if let Some(ol) = cfg.providers.iter().position(|p| p.ollama) {
+            let pr = &mut cfg.providers[ol];
+            let title = if model_count(pr) > 0 { format!("{} ({})", pr.name, model_count(pr)) } else { pr.name.clone() };
+            row(ui, |ui, _| {
+                let mut on = !pr.disabled;
+                if switch(ui, &mut on, "").on_hover_text("Off: Ollama is not offered in the pickers and not used for routing.").changed() {
+                    pr.disabled = !on;
+                }
+                ui.allocate_space(vec2(28.0, 28.0));
+                self.fetch_btn(ui, pr);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(name_text(&title, on)).truncate());
+                });
+            });
+            if let Some(e) = self.fetch_errs.get(&pr.name) {
+                note(ui, e, p.danger);
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(INDENT);
+                ui.label(RichText::new("URL:").size(11.5).color(p.muted));
+                let mut u = pr.url.clone();
+                let te = ui.add(TextEdit::singleline(&mut u).desired_width(180.0));
+                if te.changed() {
+                    pr.url = u;
+                }
+                if pr.url.is_empty() {
+                    pr.url = crate::ollama::DEFAULT_URL.into();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(INDENT);
+                ui.label(RichText::new("Key:").size(11.5).color(p.muted));
+                let mut k = pr.key.clone();
+                let te = ui.add(TextEdit::singleline(&mut k).password(true).desired_width(180.0));
+                if te.changed() {
+                    pr.key = k;
+                }
+                let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
+                if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    open_browser("https://ollama.com/settings/keys");
+                }
+            });
+            if pr.models.is_empty() && pr.custom.is_empty() {
+                note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
+            }
+        }
+
+        // MuseAI: Meta Hatch Gateway VM via local sidecar bridge.
+        if let Some(mu_idx) = cfg.providers.iter().position(|p| p.muse) {
+            let pr = &mut cfg.providers[mu_idx];
+            let title = if model_count(pr) > 0 { format!("{} ({})", pr.name, model_count(pr)) } else { pr.name.clone() };
+            if pr.muse_account.is_none() {
+                pr.muse_account = crate::museai::active_account();
+            }
+            let has_account = pr.muse_account.is_some();
+            row(ui, |ui, _| {
+                let mut on = !pr.disabled;
+                if switch(ui, &mut on, "").on_hover_text("Off: MuseAI is not offered in the pickers and not used for routing.").changed() {
+                    pr.disabled = !on;
+                }
+                ui.allocate_space(vec2(28.0, 28.0));
+                self.fetch_btn(ui, pr);
+                let free = self.muse_login.is_none();
+                let tip = if has_account {
+                    "Sign in with MuseAI in Chrome (replaces existing session)"
+                } else {
+                    "Add a MuseAI account (opens Chrome)"
+                };
+                if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text(tip).clicked()).inner {
+                    match start_muse_login(ui.ctx()) {
+                        Ok(job) => (self.muse_login, self.muse_err) = (Some(job), String::new()),
+                        Err(e) => self.muse_err = e,
+                    }
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(name_text(&title, on)).truncate());
+                });
+            });
+            if let Some(job) = &self.muse_login {
+                ui.horizontal(|ui| {
+                    ui.add_space(INDENT);
+                    ui.spinner();
+                    ui.label(RichText::new("Finish signing in in Chrome…").size(11.5).color(p.subtle));
+                    if ui.button("Copy link").clicked() {
+                        ui.ctx().copy_text(job.url.clone());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+            if !self.muse_err.is_empty() {
+                note(ui, &self.muse_err, p.danger);
+            }
+            if let Some(e) = self.fetch_errs.get(&pr.name) {
+                note(ui, e, p.danger);
+            }
+
+            let mut clear_account = false;
+            if let Some(acc) = &mut pr.muse_account {
+                row(ui, |ui, hot| {
+                    let mut on = !acc.disabled;
+                    if switch(ui, &mut on, "").on_hover_text("Off: the proxy doesn't use this account.").changed() {
+                        acc.disabled = !on;
+                    }
+                    if trash(ui, hot, "Remove this account (clears login)") {
+                        clear_account = true;
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add_space(INDENT);
+                        let alias = if acc.viewer_id.is_empty() || acc.viewer_id == "Active session" {
+                            "Active session".to_string()
+                        } else {
+                            format!("Account {}", acc.viewer_id)
+                        };
+                        ui.label(RichText::new(&alias).size(12.5).color(if on { p.fg } else { p.muted }));
+                        let tier_badge = if acc.tier.is_empty() { "Free plan" } else { &acc.tier };
+                        badge(ui, tier_badge, on);
+                    });
+                });
+            } else if self.muse_login.is_none() {
+                note(ui, "No MuseAI account yet. Use + to sign in.", p.subtle);
+            }
+
+            if clear_account {
+                let _ = crate::museai::remove_account();
+                pr.muse_account = None;
+            }
+        }
+
         // The endpoints.
         let mut act = None;
         for i in 0..cfg.providers.len() {
-            if cfg.providers[i].antigravity || cfg.providers[i].chatgpt {
+            if cfg.providers[i].antigravity || cfg.providers[i].chatgpt || cfg.providers[i].ollama || cfg.providers[i].muse {
                 continue;
             }
             ui.add_space(4.0);

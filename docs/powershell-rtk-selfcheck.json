@@ -1,0 +1,62 @@
+[
+  {
+    "Original": "git status",
+    "Rewritten": "rtk git status",
+    "ExitCode": 0,
+    "BeforeChars": 951,
+    "AfterChars": 506
+  },
+  {
+    "Original": "cargo --version",
+    "Rewritten": "cargo --version",
+    "ExitCode": 0,
+    "BeforeChars": 37,
+    "AfterChars": 37
+  },
+  {
+    "Original": "git diff -- ccat_selfcheck_absent_file",
+    "Rewritten": "rtk git diff -- ccat_selfcheck_absent_file",
+    "ExitCode": 0,
+    "BeforeChars": 0,
+    "AfterChars": 2
+  },
+  {
+    "Original": "git diff ccat_selfcheck_ref_that_does_not_exist",
+    "Rewritten": "rtk git diff ccat_selfcheck_ref_that_does_not_exist",
+    "ExitCode": 128,
+    "BeforeChars": 222,
+    "AfterChars": 222
+  },
+  {
+    "Original": "Write-Output '日本語 marker with spaces'; git status",
+    "Rewritten": "Write-Output '日本語 marker with spaces'; rtk git status",
+    "ExitCode": 0,
+    "BeforeChars": 975,
+    "AfterChars": 530
+  },
+  {
+    "Original": "git -C 'D:\\eUp\\ccat' status",
+    "Rewritten": "rtk git -C 'D:\\eUp\\ccat' status",
+    "ExitCode": 0,
+    "BeforeChars": 951,
+    "AfterChars": 506
+  },
+  {
+    "Case": "Unicode repository path with spaces",
+    "ExitCode": 0,
+    "BeforeChars": 220,
+    "AfterChars": 220
+  },
+  {
+    "Case": "Native PowerShell pipeline with quoted path",
+    "ExitCode": 0,
+    "BeforeChars": 16,
+    "AfterChars": 16
+  },
+  {
+    "Case": "Failing cargo test retains failure marker, source location and test name",
+    "ExitCode": 101,
+    "BeforeChars": 955,
+    "AfterChars": 441
+  }
+]

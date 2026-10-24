@@ -6,6 +6,8 @@ mod antigravity;
 mod chatgpt;
 mod live;
 mod mcp;
+pub(crate) mod museai;
+pub(crate) mod ollama;
 mod profiles;
 mod providers_ui;
 mod proxy;
@@ -17,7 +19,7 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -38,6 +40,10 @@ const OFFICIAL: &str = "Claude";
 pub const AG_NAME: &str = "Antigravity";
 /// The built-in ChatGPT provider's fixed name.
 pub const GPT_NAME: &str = "ChatGPT";
+/// The built-in Ollama provider's fixed name.
+pub const OLLAMA_NAME: &str = "Ollama";
+/// The built-in MuseAI provider's fixed name.
+pub const MUSE_NAME: &str = "MuseAI";
 
 /// A connection: an Anthropic-compatible endpoint (`url` + `key`) or the built-in Antigravity account pool.
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -56,6 +62,12 @@ struct Provider {
     chatgpt_accounts: Vec<chatgpt::ChatgptAccount>,
     /// What the last model fetch learned of each ChatGPT model; `models` holds just the slugs.
     chatgpt_models: Vec<chatgpt::ChatgptModel>,
+    /// Served through the local proxy from local Ollama instance (`/v1/chat/completions`).
+    ollama: bool,
+    /// Served through the local proxy from MuseAI via local sidecar engine.
+    muse: bool,
+    #[serde(default)]
+    muse_account: Option<crate::museai::Account>,
     /// Turned off in the Providers view: not offered in the pickers, not used for routing.
     disabled: bool,
 }
@@ -122,7 +134,10 @@ struct Config {
     /// calls instead of tokens, grouping (0 total, 1 per model, 2 per provider) and running totals.
     analytics_view: u8,
     live_range: u8,
+    #[serde(default)]
     live_calls: bool,
+    #[serde(default)]
+    live_metric: u8,
     live_by: u8,
     live_cumulative: bool,
 }
@@ -146,11 +161,34 @@ pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Extract all model costs from models.dev and cache to pricing.json for the Live cost tab.
+fn save_pricing_cache(v: &serde_json::Value) {
+    let mut map: HashMap<&str, [f64; 4]> = HashMap::new();
+    if let Some(obj) = v.as_object() {
+        for prov in obj.values() {
+            if let Some(models) = prov.get("models").and_then(|m| m.as_object()) {
+                for (id, m) in models {
+                    if let Some(cost) = m.get("cost").and_then(|c| c.as_object()) {
+                        let num = |k: &str| cost.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        map.insert(id.as_str(), [num("input"), num("output"), num("cache_read"), num("cache_write")]);
+                    }
+                }
+            }
+        }
+    }
+    if !map.is_empty() {
+        if let Ok(json) = serde_json::to_string(&map) {
+            let _ = fs::write(config_path().with_file_name("pricing.json"), json);
+        }
+    }
+}
+
 /// Current Claude model ids, newest first, from models.dev (public, no key).
 fn fetch_claude_models() -> Result<Vec<String>, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
     let body = agent.get("https://models.dev/api.json").call().map_err(|e| e.to_string())?.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    save_pricing_cache(&v);
     let mut models: Vec<(&str, &str)> = v["anthropic"]["models"]
         .as_object()
         .ok_or("models.dev has no anthropic models")?
@@ -242,12 +280,21 @@ fn tier_names(tiers: &[Route; 4], routed: bool) -> ([String; 4], serde_json::Map
 
 // ---------------------------------------------------------------- storage / network
 
-pub fn config_path() -> PathBuf {
+fn user_config_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
     base.join("ccat").join("config.json")
+}
+
+#[cfg(not(test))]
+pub fn config_path() -> PathBuf { user_config_path() }
+
+#[cfg(test)]
+pub fn config_path() -> PathBuf {
+    // App::drop also saves settings; test launchers must never reach live accounts.
+    std::env::temp_dir().join(format!("ccat-tests-{}", std::process::id())).join("ccat/config.json")
 }
 
 /// The model list prefixes ids with the vendor ("anthropic/…"); endpoints want the bare id.
@@ -268,6 +315,9 @@ fn load() -> (Config, serde_json::Value) {
         serde_json::Value::Null
     });
     let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_default();
+    if raw.get("live_metric").is_none() && raw.get("live_calls").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cfg.live_metric = 1;
+    }
     if raw.get("tiers").is_none() {
         cfg.tiers = migrate_tiers(&raw);
     }
@@ -284,6 +334,8 @@ fn load() -> (Config, serde_json::Value) {
     }
     builtin_antigravity(&mut cfg);
     builtin_chatgpt(&mut cfg);
+    builtin_ollama(&mut cfg);
+    builtin_muse(&mut cfg);
     // Codex CLI's login is the ChatGPT account ccat shares (see `chatgpt::CODEX_CLI`).
     if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
         chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
@@ -432,6 +484,70 @@ fn builtin_chatgpt(cfg: &mut Config) {
     }
     cfg.providers = rest;
     cfg.providers.insert(1.min(cfg.providers.len()), gpt);
+}
+
+/// Ollama is the local built-in provider: exactly one, third in the list. An endpoint a user had named "Ollama" is
+/// renamed (its tiers follow).
+fn builtin_ollama(cfg: &mut Config) {
+    for p in cfg.providers.iter_mut().filter(|p| !p.ollama && p.name == OLLAMA_NAME) {
+        let to = format!("{OLLAMA_NAME} endpoint");
+        rename_routes(&mut cfg.tiers, OLLAMA_NAME, &to);
+        p.name = to;
+    }
+    let main = cfg.providers.iter().position(|p| p.ollama);
+    let mut ol = main.map_or_else(|| Provider {
+        name: OLLAMA_NAME.into(),
+        url: ollama::DEFAULT_URL.into(),
+        ollama: true,
+        ..Default::default()
+    }, |i| cfg.providers.remove(i));
+    if ol.url.trim().is_empty() {
+        ol.url = ollama::DEFAULT_URL.into();
+    }
+    let old = std::mem::replace(&mut ol.name, OLLAMA_NAME.into());
+    rename_routes(&mut cfg.tiers, &old, OLLAMA_NAME);
+    let mut rest = Vec::new();
+    for p in std::mem::take(&mut cfg.providers) {
+        if p.ollama {
+            rename_routes(&mut cfg.tiers, &p.name, OLLAMA_NAME);
+            continue;
+        }
+        rest.push(p);
+    }
+    cfg.providers = rest;
+    cfg.providers.insert(2.min(cfg.providers.len()), ol);
+}
+
+/// MuseAI is the Hatch Gateway VM built-in provider: exactly one, fourth in the list. An endpoint a user had named "MuseAI" is
+/// renamed (its tiers follow).
+fn builtin_muse(cfg: &mut Config) {
+    for p in cfg.providers.iter_mut().filter(|p| !p.muse && p.name == MUSE_NAME) {
+        let to = format!("{MUSE_NAME} endpoint");
+        rename_routes(&mut cfg.tiers, MUSE_NAME, &to);
+        p.name = to;
+    }
+    let main = cfg.providers.iter().position(|p| p.muse);
+    let mut mu = main.map_or_else(|| Provider {
+        name: MUSE_NAME.into(),
+        url: museai::DEFAULT_URL.into(),
+        muse: true,
+        ..Default::default()
+    }, |i| cfg.providers.remove(i));
+    if mu.url.trim().is_empty() {
+        mu.url = museai::DEFAULT_URL.into();
+    }
+    let old = std::mem::replace(&mut mu.name, MUSE_NAME.into());
+    rename_routes(&mut cfg.tiers, &old, MUSE_NAME);
+    let mut rest = Vec::new();
+    for p in std::mem::take(&mut cfg.providers) {
+        if p.muse {
+            rename_routes(&mut cfg.tiers, &p.name, MUSE_NAME);
+            continue;
+        }
+        rest.push(p);
+    }
+    cfg.providers = rest;
+    cfg.providers.insert(3.min(cfg.providers.len()), mu);
 }
 
 /// Several ccat windows may be open at once, so the file is never written in place (a reader could catch it half
@@ -600,11 +716,6 @@ fn anthropic() -> FontFamily {
     FontFamily::Name("anthropic".into())
 }
 
-fn label(ui: &mut egui::Ui, text: &str) {
-    let p = pal(ui);
-    ui.label(RichText::new(text).size(12.0).color(p.muted).strong());
-}
-
 fn hint(ui: &mut egui::Ui, text: &str) {
     let p = pal(ui);
     ui.label(RichText::new(text).size(11.5).color(p.subtle));
@@ -649,6 +760,9 @@ enum Btn {
 }
 
 fn win_btn(ui: &mut egui::Ui, kind: Btn) -> egui::Response {
+    if kind == Btn::Min {
+        return icon_btn(ui, Icon::Minimize);
+    }
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 34.0), Sense::click());
     let (bg, fg) = match (resp.hovered(), kind) {
@@ -673,12 +787,13 @@ fn win_btn(ui: &mut egui::Ui, kind: Btn) -> egui::Response {
 /// Chrome for a frameless window: thin bar with the window buttons, then the title as the body's heading, 1px outline, height fitted to the content.
 /// `buttons` are laid out right-to-left. Returns the clicked titlebar button.
 fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mut egui::Ui)) -> Option<Btn> {
-    const BAR: f32 = 32.0;
+    let bar = if title.is_empty() { 0.0 } else { 32.0 };
     const PAD: i8 = 14;
     let p = pal(ui);
     let mut clicked = None;
+    if !title.is_empty() {
     egui::Panel::top(egui::Id::new(("titlebar", title)))
-        .exact_size(BAR)
+        .exact_size(bar)
         .frame(egui::Frame::new().fill(p.bg))
         .show_separator_line(false)
         .show(ui, |ui| {
@@ -697,12 +812,15 @@ fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mu
                 });
             });
         });
+    }
     let mut used = 0.0;
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD })).show(ui, |ui| {
         used = ui
             .scope(|ui| {
-                ui.label(RichText::new(title).family(serif()).size(20.0));
-                ui.add_space(4.0);
+                if !title.is_empty() {
+                    ui.label(RichText::new(title).family(serif()).size(20.0));
+                    ui.add_space(4.0);
+                }
                 body(ui)
             })
             .response
@@ -712,7 +830,7 @@ fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mu
 
     // Not resizable, so the window simply follows its content — no dead space at the bottom.
     let screen = ui.ctx().content_rect();
-    let want = (BAR + 4.0 + PAD as f32 + used).ceil();
+    let want = (bar + 4.0 + PAD as f32 + used).ceil();
     if (screen.height() - want).abs() > 1.0 {
         ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
     }
@@ -757,13 +875,19 @@ enum Icon {
     Save,
     /// An arrow into a tray.
     Fetch,
+    Settings,
+    Minimize,
 }
 
 /// 28×28 icon button, drawn with strokes (no icon font): fill only on hover.
 fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
-    let hot = resp.hovered();
+    let hot = resp.hovered() || resp.has_focus();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), match icon {
+        Icon::New => "New", Icon::Delete => "Delete", Icon::GitHub => "GitHub", Icon::Reload => "Reload",
+        Icon::Rename => "Rename", Icon::Save => "Save", Icon::Fetch => "Fetch", Icon::Settings => "Settings", Icon::Minimize => "Minimize",
+    }));
     let danger = matches!(icon, Icon::Delete);
     if hot {
         ui.painter().rect_filled(rect, 6.0, p.hover);
@@ -777,6 +901,18 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let (c, s) = (rect.center(), Stroke::new(1.3, color));
     let pt = ui.painter();
     match icon {
+        Icon::Minimize => {
+            pt.line_segment([c - vec2(5.0, 0.0), c + vec2(5.0, 0.0)], s);
+        }
+        Icon::Settings => {
+            let teeth = (0..32).map(|i| {
+                let a = (i as f32 - 0.5) * std::f32::consts::TAU / 32.0;
+                let r = if i % 4 < 2 { 7.0 } else { 5.4 };
+                c + vec2(a.cos(), a.sin()) * r
+            }).collect();
+            pt.add(egui::Shape::closed_line(teeth, s));
+            pt.circle_stroke(c, 2.3, s);
+        }
         Icon::New => {
             pt.line_segment([c - vec2(5.5, 0.0), c + vec2(5.5, 0.0)], s);
             pt.line_segment([c - vec2(0.0, 5.5), c + vec2(0.0, 5.5)], s);
@@ -810,28 +946,32 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
             pt.add(egui::Shape::convex_polygon(vec![end + vec2(-3.2, -1.2), end + vec2(1.6, -3.0), end + vec2(1.2, 1.8)], color, Stroke::NONE));
         }
         Icon::GitHub => {
-            // The GitHub mark, simplified: a disc with the octocat (head, ears, body, tail) cut out in the background colour.
-            let cut = if hot { p.hover } else { p.bg };
-            pt.circle_filled(c, 7.0, color);
-            pt.circle_filled(c + vec2(0.0, -0.6), 3.4, cut);
-            pt.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -5.2), c + vec2(-0.6, -3.6), c + vec2(-3.4, -1.4)], cut, Stroke::NONE));
-            pt.add(egui::Shape::convex_polygon(vec![c + vec2(3.0, -5.2), c + vec2(3.4, -1.4), c + vec2(0.6, -3.6)], cut, Stroke::NONE));
-            pt.rect_filled(egui::Rect::from_min_max(c + vec2(-1.7, 2.0), c + vec2(1.7, 7.5)), 0.0, cut);
-            pt.line_segment([c + vec2(-1.7, 4.3), c + vec2(-4.2, 2.8)], Stroke::new(1.2, cut));
+            let at = |x: f32, y: f32| c + vec2(x - 12.0, y - 12.0) * 0.7;
+            let curve = |points: [(f32, f32); 4]| {
+                pt.add(egui::epaint::CubicBezierShape::from_points_stroke(points.map(|(x, y)| at(x, y)), false, Color32::TRANSPARENT, s));
+            };
+            curve([(9.0, 18.0), (3.0, 18.0), (2.0, 14.0), (4.0, 9.0)]);
+            pt.add(egui::Shape::line(vec![at(4.0, 9.0), at(4.0, 3.0), at(9.0, 5.0)], s));
+            curve([(9.0, 5.0), (11.0, 4.3), (13.0, 4.3), (15.0, 5.0)]);
+            pt.add(egui::Shape::line(vec![at(15.0, 5.0), at(20.0, 3.0), at(20.0, 9.0)], s));
+            curve([(20.0, 9.0), (22.0, 14.0), (21.0, 18.0), (15.0, 18.0)]);
+            curve([(15.0, 18.0), (16.0, 19.0), (16.0, 20.0), (16.0, 23.0)]);
+            curve([(9.0, 18.0), (8.0, 19.0), (8.0, 20.0), (8.0, 23.0)]);
+            curve([(8.0, 21.0), (4.0, 22.0), (5.0, 18.0), (2.0, 18.0)]);
         }
     }
     resp
 }
 
-/// Dropdown rows: hover shows only a fill — a 1px border on the hovered row reads as the text jumping.
-fn plain_rows(ui: &mut egui::Ui) {
-    let w = &mut ui.visuals_mut().widgets;
-    w.hovered.bg_stroke = Stroke::NONE;
-    w.active.bg_stroke = Stroke::NONE;
-}
-
 
 // ---------------------------------------------------------------- app
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum SettingsSub {
+    #[default]
+    Models,
+    Providers,
+}
 
 struct App {
     cfg: Config,
@@ -839,8 +979,14 @@ struct App {
     loaded: serde_json::Value,
     cwd: String,
     settings: bool,
+    settings_sub: SettingsSub,
     settings_pos: Option<egui::Pos2>,
     folder: String,
+    profile: profiles::Bar,
+    folder_choice: usize,
+    custom_folder: String,
+    running: (std::time::Instant, bool),
+    logo: Option<egui::TextureHandle>,
     folders: Vec<String>,
     /// The tier whose model picker is open, and the provider it is browsing ("" = official).
     tiers: TierEditor,
@@ -895,7 +1041,7 @@ fn selector_text(provider: &str, model: &str, claude: &[String], providers: &[Pr
 impl App {
     fn new((cfg, loaded): (Config, serde_json::Value), cwd: String, out: Arc<Mutex<Option<Launch>>>, ctx: &egui::Context) -> Self {
         // Checked recently (maybe by another ccat window): reuse that answer instead of asking again.
-        let fresh = now().saturating_sub(cfg.checked) < REFRESH_SECS;
+        let fresh = now().saturating_sub(cfg.checked) < REFRESH_SECS && config_path().with_file_name("pricing.json").exists();
         let (mut claude_list, mut release_rx) = (None, None);
         if !fresh {
             let (tx, rx) = mpsc::channel();
@@ -922,18 +1068,21 @@ impl App {
             rx
         });
         let latest = fresh.then(|| if cfg.latest.is_empty() { Err("the last check failed; trying again later".to_string()) } else { Ok(cfg.latest.clone()) });
-        // Most recently launched folder first and preselected; the terminal's cwd stays one click away.
-        let mut folders = cfg.recents.clone();
-        if !folders.contains(&cwd) {
-            folders.push(cwd.clone());
-        }
+        // Start in the invoking terminal's directory; the last workspace is one click away.
+        let folders = cfg.recents.clone();
         Self {
-            folder: folders[0].clone(),
+            folder: cwd.clone(),
+            custom_folder: cwd.clone(),
+            profile: Default::default(),
+            folder_choice: 0,
+            running: (std::time::Instant::now(), live::running()),
+            logo: None,
             folders,
             cfg,
             loaded,
             cwd,
             settings: false,
+            settings_sub: SettingsSub::Models,
             settings_pos: None,
             tiers: TierEditor::default(),
             providers: Default::default(),
@@ -965,6 +1114,7 @@ impl App {
                 _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{}” needs a signed-in ChatGPT account.", p.name), true)),
                 _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every account turned off.", p.name), true)),
                 _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable()) => Some((format!("“{}”: no account has plan usage granted; sign in again.", p.name), true)),
+                _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
                 _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{}” needs a URL and a key.", p.name), true)),
                 _ => None,
             }
@@ -976,6 +1126,10 @@ impl App {
     }
 
     fn launch(&mut self, ui: &egui::Ui) {
+        if !Path::new(&self.folder).is_dir() {
+            self.err = "Choose an existing folder before launching.".into();
+            return;
+        }
         if let Some((why, open)) = (0..TIERS.len()).find_map(|t| self.problem(t)) {
             self.err = why;
             self.settings |= open;
@@ -991,77 +1145,127 @@ impl App {
 
     fn launch_tab(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let p = pal(ui);
-        let before = self.cfg.tiers.clone();
-        self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| label(ui, "Models"));
-        self.tiers.rows(ui, &mut self.cfg);
-        if self.cfg.tiers != before {
-            self.err.clear();
-        }
-        hint(ui, if routed(&self.cfg.tiers) {
-            "Routed per tier by ccat's local proxy (models can be switched while it runs); Claude tiers keep your login."
-        } else {
-            "All on Claude: plain Claude Code with your normal login."
-        });
         ui.add_space(6.0);
-
-        label(ui, "Folder");
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(egui::Button::new("Browse…").min_size(vec2(68.0, 0.0))).clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_parent(frame).set_directory(&self.folder).pick_folder() {
-                    self.folder = d.display().to_string();
-                    if !self.folders.contains(&self.folder) {
-                        self.folders.insert(0, self.folder.clone());
-                    }
+        ui.horizontal(|ui| {
+            if self.logo.is_none() {
+                let icon = app_icon();
+                let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+                self.logo = Some(ui.ctx().load_texture("ccat-logo", image, Default::default()));
+            }
+            ui.add(egui::Image::new(self.logo.as_ref().unwrap()).fit_to_exact_size(vec2(30.0, 30.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if win_btn(ui, Btn::Min).on_hover_text("Minimize").clicked() {
+                    ui.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
-            }
-            egui::ComboBox::from_id_salt("folder").width(ui.available_width()).truncate().selected_text(&self.folder).show_ui(ui, |ui| {
-                plain_rows(ui);
-                for f in &self.folders {
-                    let text = if *f == self.cwd { format!("{f}  (current)") } else { f.clone() };
-                    ui.selectable_value(&mut self.folder, f.clone(), text);
-                }
-            });
-        });
-        ui.add_space(6.0);
-
-        switch(ui, &mut self.cfg.bypass, "Bypass permissions");
-        if !self.err.is_empty() {
-            ui.add_space(4.0);
-            ui.label(RichText::new(&self.err).size(12.0).color(p.danger));
-        }
-
-        ui.add_space(12.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
-            let go = egui::Button::new(RichText::new("Launch").color(p.bg).strong()).fill(p.fg).stroke(Stroke::NONE).min_size(vec2(72.0, 28.0));
-            if ui.add(go).clicked() {
-                self.launch(ui);
-            }
-            ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("Cancel").color(p.muted)).frame(false)).clicked() {
-                ui.send_viewport_cmd(ViewportCommand::Close);
-            }
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                // Frame only on hover / while open: fill appears, nothing shifts.
-                let cfg = egui::Button::new(RichText::new("Config").color(if self.settings { p.fg } else { p.muted }))
-                    .frame_when_inactive(self.settings)
-                    .stroke(Stroke::NONE);
-                if ui.add(cfg).clicked() {
+                if icon_btn(ui, Icon::Settings).on_hover_text("Settings").clicked() {
                     self.settings = !self.settings;
                 }
-                if icon_btn(ui, Icon::GitHub).on_hover_text(REPO_URL).clicked() {
+                let update = match &self.latest {
+                    Some(Ok(tag)) if is_newer(tag, VERSION) => format!("{VERSION} → {tag} available"),
+                    Some(Err(e)) => format!("{VERSION} · Update check failed: {e}"),
+                    None => format!("{VERSION} · Checking for updates…"),
+                    _ => format!("{VERSION} · Up to date"),
+                };
+                if icon_btn(ui, Icon::GitHub).on_hover_text(format!("{REPO_URL}\n{update}")).clicked() {
                     open_browser(REPO_URL);
                 }
-                let (text, color, tip) = match &self.latest {
-                    None => (VERSION.to_string(), p.subtle, "Checking for updates…".to_string()),
-                    Some(Ok(tag)) if is_newer(tag, VERSION) => (format!("{VERSION} → {tag}"), p.accent, format!("{tag} is available — open the release")),
-                    Some(Ok(_)) => (VERSION.to_string(), p.subtle, "Up to date".to_string()),
-                    Some(Err(e)) => (VERSION.to_string(), p.subtle, format!("Could not check for updates: {e}")),
-                };
-                let v = ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).sense(Sense::click()));
-                if v.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    open_browser(&format!("{REPO_URL}/releases"));
+                let drag = ui.available_rect_before_wrap();
+                if ui.interact(drag, ui.id().with("launcher-drag"), Sense::drag()).drag_started() {
+                    ui.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
             });
+        });
+        ui.add_space(8.0);
+
+        if self.running.0.elapsed() >= Duration::from_secs(1) {
+            self.running = (std::time::Instant::now(), live::running());
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        if !self.running.1 {
+            self.profile.show(ui, &mut self.cfg, frame, |ui| {
+                ui.label(RichText::new("Profile").size(14.0));
+            });
+            ui.add_space(6.0);
+        }
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), Layout::right_to_left(Align::Center), |ui| {
+            switch(ui, &mut self.cfg.bypass, "").on_hover_text("Bypass permissions: allow Claude Code to run tools without asking.");
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new("Bypass Permission").size(14.0));
+            });
+        });
+        ui.add_space(8.0);
+        ui.label(RichText::new("Folders").size(13.0));
+        ui.add_space(2.0);
+        let previous = self.folders.first().filter(|f| Path::new(f).is_dir()).cloned();
+        let name = |path: &str| Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.into());
+        let choices = [
+            format!("Current location\n/{}", name(&self.cwd)),
+            previous.as_ref().map_or_else(|| "Previous workspace\nNone yet".into(), |f| format!("Previous workspace\n/{}", name(f))),
+            "Custom".into(),
+        ];
+        ui.vertical_centered(|ui| {
+            let before = self.folder_choice;
+            let items = [(0, choices[0].as_str()), (1, choices[1].as_str()), (2, choices[2].as_str())];
+            if usage::segmented_full_width(ui, &mut self.folder_choice, &items) {
+                if self.folder_choice == 1 && previous.is_none() {
+                    self.folder_choice = before;
+                } else {
+                    self.err.clear();
+                }
+            }
+        }).response.on_hover_text(match self.folder_choice {
+            1 => previous.as_deref().unwrap_or("No previous workspace"),
+            2 => "Select a recent folder or browse for another",
+            _ => &self.cwd,
+        });
+        if self.folder_choice == 2 {
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 30.0), Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_sized([82.0, 30.0], egui::Button::new("Browse")).clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_parent(frame).set_directory(&self.custom_folder).pick_folder() {
+                        self.custom_folder = d.display().to_string();
+                        self.err.clear();
+                    }
+                }
+                let mut folders = self.folders.clone();
+                for folder in [&self.cwd, &self.custom_folder] {
+                    if !folders.contains(folder) {
+                        folders.push(folder.clone());
+                    }
+                }
+                ui.spacing_mut().interact_size.y = 30.0;
+                egui::ComboBox::from_id_salt("custom-folder")
+                    .width(ui.available_width())
+                    .truncate()
+                    .selected_text(&self.custom_folder)
+                    .show_ui(ui, |ui| {
+                        for folder in folders {
+                            if ui.selectable_value(&mut self.custom_folder, folder.clone(), &folder).changed() {
+                                self.err.clear();
+                            }
+                        }
+                    });
+            });
+        }
+        self.folder = match self.folder_choice {
+            1 => previous.unwrap_or_else(|| self.cwd.clone()),
+            2 => self.custom_folder.clone(),
+            _ => self.cwd.clone(),
+        };
+        if !self.err.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new(&self.err).size(12.0).color(p.danger));
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            if ui.add_sized([width, 30.0], egui::Button::new("Cancel").fill(p.hover).stroke(Stroke::NONE).corner_radius(6)).clicked() {
+                ui.send_viewport_cmd(ViewportCommand::Close);
+            }
+            let launch = egui::Button::new(RichText::new("Launch").strong().color(LIGHT.fg)).fill(Color32::WHITE).stroke(Stroke::NONE).corner_radius(6);
+            if ui.add_sized([width, 30.0], launch).clicked() {
+                self.launch(ui);
+            }
         });
     }
 
@@ -1093,49 +1297,95 @@ impl eframe::App for App {
             self.release_rx = None;
         }
         self.providers.poll(&mut self.cfg);
-        if !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
+        if !self.profile.active() && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
             ui.send_viewport_cmd(ViewportCommand::Close);
         }
-        let typing = ui.ctx().memory(|m| m.focused().is_some());
-        if !typing && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        window(ui, "", &[], |ui| self.launch_tab(ui, frame));
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        if !typing && !self.settings && !self.profile.active() && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
             self.launch(ui);
-        }
-
-        match window(ui, "Launch Claude Code with", &[Btn::Close, Btn::Min], |ui| self.launch_tab(ui, frame)) {
-            Some(Btn::Close) => ui.send_viewport_cmd(ViewportCommand::Close),
-            Some(Btn::Min) => ui.send_viewport_cmd(ViewportCommand::Minimized(true)),
-            None => {}
         }
 
         if self.settings {
             if self.settings_pos.is_none() {
                 self.settings_pos = ui.input(|i| i.viewport().outer_rect).map(|r| r.right_top() + vec2(8.0, 0.0));
             }
-            self.settings_window(ui.ctx());
+            self.settings_window(ui.ctx(), frame);
         }
     }
 }
 
 impl App {
-    /// Providers live in their own OS window (an egui immediate viewport).
-    fn settings_window(&mut self, ctx: &egui::Context) {
+    fn settings_tab(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let p = pal(ui);
+        ui.add_space(2.0);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
+            if win_btn(ui, Btn::Close).on_hover_text("Close").clicked() {
+                self.settings = false;
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                if self.settings_sub == SettingsSub::Models && !self.running.1 {
+                    self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
+                        usage::segmented(ui, &mut self.settings_sub, &[(SettingsSub::Models, "Models"), (SettingsSub::Providers, "Providers")]);
+                    });
+                } else {
+                    usage::segmented(ui, &mut self.settings_sub, &[(SettingsSub::Models, "Models"), (SettingsSub::Providers, "Providers")]);
+                    let drag = ui.available_rect_before_wrap();
+                    if ui.interact(drag, ui.id().with("settings-drag"), Sense::drag()).drag_started() {
+                        ui.send_viewport_cmd(ViewportCommand::StartDrag);
+                    }
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        if self.settings_sub == SettingsSub::Providers {
+            self.tiers.pick = None;
+            egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(580.0).show(ui, |ui| {
+                self.providers.show(ui, &mut self.cfg, 420.0);
+                ui.add_space(10.0);
+                usage::display_block(ui, &mut self.cfg);
+            });
+            return;
+        }
+
+        let before = self.cfg.tiers.clone();
+        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(580.0).show(ui, |ui| {
+            self.tiers.rows(ui, &mut self.cfg);
+            if self.cfg.tiers != before {
+                self.err.clear();
+            }
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(egui::RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
+            ui.add_space(8.0);
+            let mut wait = !self.cfg.fail_on_limit;
+            ui.horizontal(|ui| {
+                switch(ui, &mut wait, "Wait out usage limits")
+                    .on_hover_text("When every route and fallback of a request is at its usage limit, the request waits until one can run, so an agent pauses instead of stopping. Esc in Claude Code still cancels it. Routed sessions only.");
+            });
+            self.cfg.fail_on_limit = !wait;
+            ui.add_space(10.0);
+            usage::display_block(ui, &mut self.cfg);
+        });
+    }
+
+    /// Providers and tier settings live in their own OS window (an egui immediate viewport).
+    fn settings_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let mut builder = egui::ViewportBuilder::default()
-            .with_title("ccat — Providers")
+            .with_title("ccat — Settings")
             .with_icon(app_icon())
             .with_decorations(false)
             .with_resizable(false)
-            .with_inner_size([440.0, 400.0]);
+            .with_inner_size([440.0, 520.0]);
         if let Some(pos) = self.settings_pos {
             builder = builder.with_position(pos);
         }
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("providers"), builder, |ui, _| {
             // Esc cancels a rename in progress before it closes the window.
-            if ui.input(|i| (i.key_pressed(Key::Escape) && !self.providers.active()) || i.viewport().close_requested()) {
+            if ui.input(|i| (i.key_pressed(Key::Escape) && !self.providers.active() && !self.tiers.active()) || i.viewport().close_requested()) {
                 self.settings = false;
             }
-            if window(ui, "Providers", &[Btn::Close], |ui| self.providers.show(ui, &mut self.cfg, 420.0)) == Some(Btn::Close) {
-                self.settings = false;
-            }
+            window(ui, "", &[], |ui| self.settings_tab(ui, frame));
         });
     }
 }
@@ -1491,7 +1741,7 @@ fn main() {
             .with_icon(app_icon())
             .with_decorations(false) // titlebar is drawn by App::titlebar
             .with_resizable(false)
-            .with_inner_size([480.0, 400.0]),
+            .with_inner_size([400.0, 300.0]),
         centered: true,
         ..Default::default()
     };
@@ -1527,6 +1777,16 @@ struct Prepared {
     uses_ag: bool,
 }
 
+/// Why the built-in MuseAI on the local bridge can't serve: nobody is signed in, or its account is turned off. It
+/// signs in by cookie login and needs no key; `login` finds the muse-cli login for configs saved before accounts were.
+fn muse_blocked(p: &Provider, login: impl FnOnce() -> Option<museai::Account>) -> Option<String> {
+    match p.muse_account.clone().or_else(login) {
+        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", p.name)),
+        Some(a) if a.disabled => Some(format!("“{}” has its account turned off.", p.name)),
+        Some(_) => None,
+    }
+}
+
 /// Where a tier's requests go in the proxy and the model they run there; `None` when that can't be served (a
 /// provider gone, no model, no key or account). `sent` is the name Claude Code sends for the tier (fixed at launch).
 fn target(provider: &str, model: &str, providers: &[Provider], claude_models: &[String], t: usize, sent: &str) -> Option<(proxy::Upstream, String)> {
@@ -1547,7 +1807,10 @@ fn target(provider: &str, model: &str, providers: &[Provider], claude_models: &[
         _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => None,
         _ if p.antigravity => Some((proxy::Upstream::Antigravity, model)),
         _ if p.chatgpt => p.chatgpt_accounts.iter().any(|a| a.usable()).then_some((proxy::Upstream::ChatGPT, model)),
+        _ if p.ollama => Some((proxy::Upstream::Ollama { url: p.url.clone(), key: p.key.clone() }, model)),
+        _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).is_none().then_some((proxy::Upstream::MuseAI { url: p.url.clone(), key: p.key.clone() }, model)),
         _ if p.url.trim().is_empty() || p.key.trim().is_empty() => None,
+        _ if p.muse => Some((proxy::Upstream::MuseAI { url: p.url.clone(), key: p.key.clone() }, model)),
         _ => Some((proxy::Upstream::Endpoint { name: p.name.clone(), url: p.url.clone(), key: p.key.trim().to_string() }, model)),
     }
 }
@@ -1681,6 +1944,16 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
     Ok(Prepared { env, overrides, mcp_config, names, routed, uses_ag })
 }
 
+fn claude_settings(overrides: &serde_json::Map<String, serde_json::Value>, env: &[(&str, String)]) -> serde_json::Value {
+    let mut settings = serde_json::json!({});
+    if !overrides.is_empty() { settings["modelOverrides"] = serde_json::json!(overrides); }
+    // Claude settings can override inherited env; a routed launch owns this non-secret endpoint.
+    if let Some((_, url)) = env.iter().find(|(key, _)| *key == "ANTHROPIC_BASE_URL") {
+        settings["env"] = serde_json::json!({"ANTHROPIC_BASE_URL": url});
+    }
+    settings
+}
+
 fn run_claude(l: Launch, cwd: &str) {
     let folder = if l.folder.is_empty() { cwd.to_string() } else { l.folder.clone() };
     let Prepared { env, overrides, mcp_config, names, routed, uses_ag } = prepare(&l, &folder).unwrap_or_else(|e| {
@@ -1710,8 +1983,9 @@ fn run_claude(l: Launch, cwd: &str) {
         if l.bypass {
             cmd.arg("--dangerously-skip-permissions");
         }
-        if !overrides.is_empty() {
-            cmd.arg("--settings").arg(serde_json::json!({ "modelOverrides": overrides }).to_string());
+        let settings = claude_settings(&overrides, &env);
+        if settings.as_object().is_some_and(|s| !s.is_empty()) {
+            cmd.arg("--settings").arg(settings.to_string());
         }
         cmd.args(std::env::args_os().skip(1)); // `ccat --resume` → `claude --resume`
         // Last on purpose: `--mcp-config` is variadic and would swallow a positional prompt that followed it.
@@ -1725,17 +1999,10 @@ fn run_claude(l: Launch, cwd: &str) {
         cmd
     };
 
-    // The proxy lives in this process, so then ccat waits for claude instead of exec-ing it.
-    #[cfg(unix)]
-    if !routed {
-        use std::os::unix::process::CommandExt;
-        let e = build("claude").exec();
-        eprintln!("ccat: failed to start claude: {e}");
-        std::process::exit(127);
-    }
+    // Keep the parent alive for plain sessions too: its OS lock identifies an active CLI, not a tray or launcher.
+    let _session = live::session().map_err(|e| eprintln!("ccat: could not mark the running session: {e}")).ok();
 
     // Ctrl+C belongs to claude; a handler fn (unlike SIG_IGN) is not inherited by the child.
-    #[cfg(windows)]
     let _ = ctrlc::set_handler(|| {});
     // The usage tray is shared by every ccat: bring it back if the terminal that started it went away.
     std::thread::spawn(|| loop {
@@ -1755,6 +2022,33 @@ fn run_claude(l: Launch, cwd: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_launch_pins_its_endpoint_without_putting_secrets_in_arguments() {
+        let overrides = serde_json::Map::from_iter([("claude-haiku-5-5".into(), serde_json::json!("muse-chat@haiku"))]);
+        let env = vec![("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321".into()), ("ANTHROPIC_AUTH_TOKEN", "private-auth".into()), ("ANTHROPIC_CUSTOM_HEADERS", "x-ccat-token: private-header".into())];
+        let settings = claude_settings(&overrides, &env);
+        assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:54321");
+        assert_eq!(settings["modelOverrides"]["claude-haiku-5-5"], "muse-chat@haiku");
+        assert!(!settings.to_string().contains("private-"));
+        assert_eq!(settings["env"].as_object().unwrap().len(), 1);
+        assert!(claude_settings(&serde_json::Map::new(), &[]).as_object().unwrap().is_empty());
+    }
+
+    pub(super) fn live_config() -> Config {
+        let text = fs::read_to_string(user_config_path()).expect("Existing ccat config required");
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        let path = config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        museai::secure_directory(path.parent().unwrap()).unwrap();
+        save(&cfg, &serde_json::Value::Null).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn unit_tests_never_use_the_live_config() {
+        assert!(config_path().starts_with(std::env::temp_dir().join(format!("ccat-tests-{}", std::process::id()))));
+    }
 
     fn route(provider: &str, model: &str, claude_as: &str) -> Route {
         Route { provider: provider.into(), model: model.into(), claude_as: claude_as.into(), ..Default::default() }
@@ -1958,6 +2252,125 @@ mod tests {
     }
 
     #[test]
+    fn ollama_is_one_builtin_provider_third_in_the_list() {
+        let mut cfg = Config {
+            providers: vec![
+                Provider { name: AG_NAME.into(), antigravity: true, ..Default::default() },
+                Provider { name: GPT_NAME.into(), chatgpt: true, ..Default::default() },
+                endpoint("OR"),
+                Provider { name: OLLAMA_NAME.into(), url: "http://192.168.1.5:11434".into(), ..Default::default() },
+            ],
+            tiers: [route(OLLAMA_NAME, "llama3.3", ""), Route::default(), Route::default(), Route::default()],
+            ..Default::default()
+        };
+        builtin_antigravity(&mut cfg);
+        builtin_chatgpt(&mut cfg);
+        builtin_ollama(&mut cfg);
+        builtin_muse(&mut cfg);
+        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME, "OR", "Ollama endpoint"], "Antigravity, ChatGPT, Ollama, MuseAI, then endpoints");
+        assert_eq!(cfg.providers.iter().filter(|p| p.ollama).count(), 1);
+        assert_eq!(cfg.providers[2].url, ollama::DEFAULT_URL);
+        assert_eq!(cfg.tiers[0].provider, "Ollama endpoint", "tiers follow rename");
+
+        let claude: Vec<String> = Vec::new();
+        let ol = &cfg.providers[2];
+        let t = target(OLLAMA_NAME, "qwen2.5-coder:32b", &[ol.clone()], &claude, 0, "");
+        assert_eq!(t.map(|(u, m)| (format!("{u:?}"), m)), Some(("Ollama".into(), "qwen2.5-coder:32b".into())));
+
+        let mu = Provider { muse_account: Some(museai::Account::default()), ..cfg.providers[3].clone() };
+        let t_mu = target(MUSE_NAME, "muse-chat", &[mu], &claude, 0, "");
+        assert_eq!(t_mu.map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
+    }
+
+    #[test]
+    fn muse_account_launcher_and_routing_agreements() {
+        let claude: Vec<String> = Vec::new();
+        let make_app = |p: Provider| {
+            let cfg = Config {
+                providers: vec![p],
+                tiers: [route(MUSE_NAME, "muse-chat", ""), Route::default(), Route::default(), Route::default()],
+                ..Default::default()
+            };
+            App {
+                cfg,
+                loaded: serde_json::Value::Null,
+                cwd: String::new(),
+                settings: false,
+                settings_sub: SettingsSub::default(),
+                settings_pos: None,
+                folder: String::new(),
+                profile: profiles::Bar::default(),
+                folder_choice: 0,
+                custom_folder: String::new(),
+                running: (std::time::Instant::now(), false),
+                logo: None,
+                folders: Vec::new(),
+                tiers: TierEditor::default(),
+                providers: providers_ui::ProvidersEditor::default(),
+                err: String::new(),
+                claude_list: None,
+                release_rx: None,
+                latest: None,
+                plans: None,
+                out: Arc::new(Mutex::new(None)),
+            }
+        };
+
+        // 1. Valid signed-in enabled local Muse: must be ready with no manual API key
+        let ready_mu = Provider {
+            name: MUSE_NAME.into(),
+            muse: true,
+            url: museai::DEFAULT_URL.into(),
+            muse_account: Some(museai::Account { viewer_id: "test-viewer".into(), disabled: false, ..Default::default() }),
+            ..Default::default()
+        };
+        let app = make_app(ready_mu.clone());
+        assert_eq!(app.problem(0), None, "signed-in enabled Muse must be ready to launch with no key");
+        assert_eq!(target(MUSE_NAME, "muse-chat", &[ready_mu.clone()], &claude, 0, "").map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
+
+        // 2. Disabled local Muse account: must not be treated ready or routed
+        let disabled_acc_mu = Provider {
+            name: MUSE_NAME.into(),
+            muse: true,
+            url: museai::DEFAULT_URL.into(),
+            muse_account: Some(museai::Account { viewer_id: "test-viewer".into(), disabled: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let app_disabled_acc = make_app(disabled_acc_mu.clone());
+        assert_eq!(app_disabled_acc.problem(0), Some(("“MuseAI” has its account turned off.".into(), true)));
+        assert!(target(MUSE_NAME, "muse-chat", &[disabled_acc_mu], &claude, 0, "").is_none(), "disabled account must not route");
+
+        // 3. Signed out (no saved account, no login on disk): the message points at + sign-in, not key fields.
+        let signed_out = Provider { muse_account: None, ..ready_mu.clone() };
+        let why = muse_blocked(&signed_out, || None).unwrap();
+        assert!(why.contains("signed-in") && why.contains("+") && !why.contains("key"), "{why}");
+        // ... but a muse-cli login on disk from before accounts were saved still counts.
+        assert_eq!(muse_blocked(&signed_out, || Some(museai::Account::default())), None);
+        assert_eq!(muse_blocked(&signed_out, || Some(museai::Account { disabled: true, ..Default::default() })).as_deref(), Some("“MuseAI” has its account turned off."));
+
+        // 4. Parent provider turned off wins over a good account.
+        let off = Provider { disabled: true, ..ready_mu.clone() };
+        assert_eq!(make_app(off.clone()).problem(0), Some(("“MuseAI” is turned off.".into(), true)));
+        assert!(target(MUSE_NAME, "muse-chat", &[off], &claude, 0, "").is_none());
+
+        // 5. A custom remote Muse endpoint keeps the generic URL + key rules, in both places.
+        let remote = Provider { url: "https://muse.example.com".into(), muse_account: None, ..ready_mu.clone() };
+        assert_eq!(make_app(remote.clone()).problem(0), Some(("“MuseAI” needs a URL and a key.".into(), true)));
+        assert!(target(MUSE_NAME, "muse-chat", &[remote.clone()], &claude, 0, "").is_none());
+        let remote = Provider { key: "k".into(), ..remote };
+        assert_eq!(make_app(remote.clone()).problem(0), None);
+        assert!(target(MUSE_NAME, "muse-chat", &[remote], &claude, 0, "").is_some());
+
+        // 6. A plain endpoint without a key is still refused.
+        let keyless = Provider { key: String::new(), ..endpoint("OR") };
+        let mut app = make_app(keyless.clone());
+        app.cfg.tiers[0] = route("OR", "m", "");
+        assert_eq!(app.problem(0), Some(("“OR” needs a URL and a key.".into(), true)));
+        assert!(target("OR", "m", &[keyless], &claude, 0, "").is_none());
+    }
+
+    #[test]
     fn a_single_fallback_becomes_the_chain() {
         let c: Config = serde_json::from_str(r#"{"tiers":[{"provider":"","fallback":{"provider":"OR","model":"m"}},{},{},{}]}"#).unwrap();
         let mut r = c.tiers[0].clone();
@@ -2121,7 +2534,7 @@ mod tests {
     #[test]
     #[ignore = "uses your Claude login and your Antigravity account"]
     fn live_mixed_tiers() {
-        let (cfg, _) = load();
+        let cfg = live_config();
         let tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false };
         let dir = std::env::temp_dir().display().to_string();
@@ -2167,11 +2580,7 @@ mod tests {
     #[test]
     #[ignore = "uses your Claude login and your Antigravity account"]
     fn live_switch_while_running() {
-        let (mut cfg, _) = load();
-        let dir = std::env::temp_dir().join(format!("ccat-live-{}", std::process::id()));
-        fs::create_dir_all(dir.join("ccat")).unwrap();
-        // SAFETY: an ignored test, run on its own: nothing else reads the environment meanwhile.
-        unsafe { std::env::set_var("APPDATA", &dir) };
+        let mut cfg = live_config();
         cfg.tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         save(&cfg, &serde_json::Value::Null).unwrap();
         let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false };
@@ -2199,7 +2608,6 @@ mod tests {
         save(&cfg, &serde_json::to_value(&l.tiers).unwrap()).unwrap();
         std::thread::sleep(Duration::from_secs(5));
         assert!(ask(), "the same session's next Sonnet request went to Anthropic");
-        let _ = fs::remove_dir_all(&dir);
     }
 
 }

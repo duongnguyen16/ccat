@@ -1,0 +1,3700 @@
+{
+  "sample_sessions": 20,
+  "sample_bytes": 172472801,
+  "deduplication": "Max usage per assistant message id across sampled sessions; tool calls/results deduplicated by tool-use id. Local session totals retained separately.",
+  "sessions": [
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "file_bytes": 5045136,
+      "assistant_messages": 83,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 400133,
+        "output_tokens": 33899,
+        "cache_read_input_tokens": 16798336,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 98,
+      "tool_result_chars": 279700,
+      "large_results": 7,
+      "max_result_chars": 24563,
+      "startup_system_chars_max": 50528,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "1d6067af-2b3d-45c2-b642-907506efea5d",
+      "project": "C--Users-duncuti16",
+      "file_bytes": 2364254,
+      "assistant_messages": 4,
+      "zero_usage_messages": 4,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 46012,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "ef6b5a67-4f0d-42e9-86f4-de8c79f76ab5",
+      "project": "C--Users-duncuti16",
+      "file_bytes": 1129345,
+      "assistant_messages": 3,
+      "zero_usage_messages": 3,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 50540,
+      "compaction_events": 0,
+      "api_error_messages": 3
+    },
+    {
+      "session": "afc6d902-c521-4711-b94a-abc30d33ff32",
+      "project": "C--Users-duncuti16",
+      "file_bytes": 726765,
+      "assistant_messages": 2,
+      "zero_usage_messages": 2,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 50540,
+      "compaction_events": 0,
+      "api_error_messages": 2
+    },
+    {
+      "session": "99227223-a57b-4003-8ddf-f9eb212698ea",
+      "project": "C--Users-duncuti16",
+      "file_bytes": 2740153,
+      "assistant_messages": 2,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 275602,
+        "output_tokens": 1014,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 50542,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "file_bytes": 11642652,
+      "assistant_messages": 266,
+      "zero_usage_messages": 2,
+      "usage": {
+        "input_tokens": 3037978,
+        "output_tokens": 122624,
+        "cache_read_input_tokens": 50954355,
+        "cache_creation_input_tokens": 378903
+      },
+      "tool_calls": 284,
+      "tool_result_chars": 644196,
+      "large_results": 6,
+      "max_result_chars": 133056,
+      "startup_system_chars_max": 109635,
+      "compaction_events": 1,
+      "api_error_messages": 1
+    },
+    {
+      "session": "84666219-77b9-4ae2-8304-c44334105cf3",
+      "project": "D--Dev-ccat",
+      "file_bytes": 24122,
+      "assistant_messages": 0,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 0,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "file_bytes": 31314143,
+      "assistant_messages": 461,
+      "zero_usage_messages": 8,
+      "usage": {
+        "input_tokens": 19738536,
+        "output_tokens": 353065,
+        "cache_read_input_tokens": 233078603,
+        "cache_creation_input_tokens": 6150932
+      },
+      "tool_calls": 405,
+      "tool_result_chars": 674696,
+      "large_results": 12,
+      "max_result_chars": 32704,
+      "startup_system_chars_max": 70336,
+      "compaction_events": 0,
+      "api_error_messages": 7
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "file_bytes": 3291449,
+      "assistant_messages": 51,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 104,
+        "output_tokens": 54095,
+        "cache_read_input_tokens": 10834672,
+        "cache_creation_input_tokens": 418253
+      },
+      "tool_calls": 61,
+      "tool_result_chars": 141436,
+      "large_results": 7,
+      "max_result_chars": 17999,
+      "startup_system_chars_max": 45380,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "8cc0a637-0039-4c27-8106-e54d7b88d512",
+      "project": "D--Dev-ccat",
+      "file_bytes": 1479813,
+      "assistant_messages": 1,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 2,
+        "output_tokens": 245,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 217573
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 50524,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "file_bytes": 6289768,
+      "assistant_messages": 46,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 665119,
+        "output_tokens": 38516,
+        "cache_read_input_tokens": 8321280,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 77,
+      "tool_result_chars": 294144,
+      "large_results": 7,
+      "max_result_chars": 47942,
+      "startup_system_chars_max": 138912,
+      "compaction_events": 1,
+      "api_error_messages": 0
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "file_bytes": 57332167,
+      "assistant_messages": 1485,
+      "zero_usage_messages": 4,
+      "usage": {
+        "input_tokens": 3358,
+        "output_tokens": 1048274,
+        "cache_read_input_tokens": 832045163,
+        "cache_creation_input_tokens": 26504262
+      },
+      "tool_calls": 1067,
+      "tool_result_chars": 1914099,
+      "large_results": 26,
+      "max_result_chars": 188593,
+      "startup_system_chars_max": 57072,
+      "compaction_events": 5,
+      "api_error_messages": 2
+    },
+    {
+      "session": "19b73507-5567-4044-bf91-6aeb2a7df6fb",
+      "project": "D--Dev-ccat",
+      "file_bytes": 26161,
+      "assistant_messages": 0,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 0,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "file_bytes": 3574704,
+      "assistant_messages": 219,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 760698,
+        "output_tokens": 86091,
+        "cache_read_input_tokens": 61430643,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 214,
+      "tool_result_chars": 263063,
+      "large_results": 6,
+      "max_result_chars": 27419,
+      "startup_system_chars_max": 50528,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "file_bytes": 20021921,
+      "assistant_messages": 1346,
+      "zero_usage_messages": 1,
+      "usage": {
+        "input_tokens": 17408337,
+        "output_tokens": 139615,
+        "cache_read_input_tokens": 707376125,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 1326,
+      "tool_result_chars": 2493530,
+      "large_results": 3,
+      "max_result_chars": 537940,
+      "startup_system_chars_max": 55687,
+      "compaction_events": 1,
+      "api_error_messages": 0
+    },
+    {
+      "session": "463b26f8-b5b7-45dd-be87-aa5af742a40e",
+      "project": "C--Users-duncuti16-AppData-Local-Claude-Data-claude-pzs8sxrjxfjjc-scratch-workspaces-aeeb11e4-0287-431b-8d3a-90ff7065b977-331cbcf1-0b68-4875-aa59-622253fbdb7a-scratch-2026-10-23-34932a",
+      "file_bytes": 3519856,
+      "assistant_messages": 2,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 4,
+        "output_tokens": 2304,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 534384
+      },
+      "tool_calls": 0,
+      "tool_result_chars": 0,
+      "large_results": 0,
+      "max_result_chars": 0,
+      "startup_system_chars_max": 50717,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "file_bytes": 1148293,
+      "assistant_messages": 6,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 1720,
+        "cache_read_input_tokens": 578807,
+        "cache_creation_input_tokens": 135107
+      },
+      "tool_calls": 7,
+      "tool_result_chars": 59945,
+      "large_results": 3,
+      "max_result_chars": 17155,
+      "startup_system_chars_max": 35880,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "file_bytes": 6205093,
+      "assistant_messages": 213,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 460,
+        "output_tokens": 143104,
+        "cache_read_input_tokens": 62968887,
+        "cache_creation_input_tokens": 963139
+      },
+      "tool_calls": 287,
+      "tool_result_chars": 385165,
+      "large_results": 8,
+      "max_result_chars": 36696,
+      "startup_system_chars_max": 44047,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "file_bytes": 9775165,
+      "assistant_messages": 388,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 3397242,
+        "output_tokens": 121368,
+        "cache_read_input_tokens": 108307822,
+        "cache_creation_input_tokens": 0
+      },
+      "tool_calls": 388,
+      "tool_result_chars": 977218,
+      "large_results": 16,
+      "max_result_chars": 99084,
+      "startup_system_chars_max": 51019,
+      "compaction_events": 1,
+      "api_error_messages": 0
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "file_bytes": 4821841,
+      "assistant_messages": 54,
+      "zero_usage_messages": 0,
+      "usage": {
+        "input_tokens": 114,
+        "output_tokens": 53452,
+        "cache_read_input_tokens": 12378868,
+        "cache_creation_input_tokens": 431460
+      },
+      "tool_calls": 57,
+      "tool_result_chars": 735328,
+      "large_results": 11,
+      "max_result_chars": 296512,
+      "startup_system_chars_max": 44243,
+      "compaction_events": 0,
+      "api_error_messages": 0
+    }
+  ],
+  "sample_usage_totals": {
+    "input_tokens": 45687699,
+    "output_tokens": 2199386,
+    "cache_read_input_tokens": 2105073561,
+    "cache_creation_input_tokens": 35734013
+  },
+  "tool_calls": {
+    "Read": 1443,
+    "Bash": 1085,
+    "PowerShell": 459,
+    "Edit": 294,
+    "Grep": 170,
+    "mcp__migii-orchestrator__message_worker": 106,
+    "SendMessage": 95,
+    "Write": 83,
+    "Agent": 80,
+    "mcp__migii-orchestrator__spawn_worker": 52,
+    "AskUserQuestion": 47,
+    "mcp__migii-orchestrator__list_workers": 47,
+    "Skill": 43,
+    "mcp__report-dailies__get_task": 34,
+    "Glob": 32,
+    "mcp__migii-orchestrator__stop_worker": 23,
+    "WebFetch": 17,
+    "ListAgents": 15,
+    "mcp__report-dailies__add_worklog": 13,
+    "mcp__ccd_host__open_in_editor": 12,
+    "mcp__context7__resolve-library-id": 10,
+    "mcp__context7__query-docs": 10,
+    "Monitor": 9,
+    "Artifact": 8,
+    "mcp__migii-orchestrator__refresh_workers": 6,
+    "mcp__report-dailies__list_tasks": 5,
+    "mcp__migii-orchestrator__ask_user": 5,
+    "EnterPlanMode": 3,
+    "ExitPlanMode": 3,
+    "TaskStop": 3,
+    "WebSearch": 3,
+    "mcp__report-dailies__docs_search": 3,
+    "SendUserFile": 3,
+    "mcp__apkb__apkb_jobs": 3,
+    "mcp__migii-orchestrator__set_token_mode": 3,
+    "mcp__claude-in-chrome__tabs_context_mcp": 3,
+    "mcp__claude-in-chrome__browser_batch": 3,
+    "CronCreate": 2,
+    "CronList": 2,
+    "CronDelete": 2,
+    "mcp__supabase__list_migrations": 2,
+    "mcp__supabase__apply_migration": 2,
+    "mcp__vercel__get_deployment": 2,
+    "ReportFindings": 2,
+    "mcp__report-dailies__list_calendar_events": 2,
+    "mcp__ccd_session_mgmt__list_sessions": 2,
+    "mcp__apkb__apkb_apks": 2,
+    "mcp__claude-in-chrome__list_connected_browsers": 2,
+    "mcp__supabase__search_docs": 1,
+    "mcp__supabase__get_project_url": 1,
+    "mcp__supabase__list_edge_functions": 1,
+    "PushNotification": 1,
+    "mcp__ccd_session_mgmt__get_usage": 1,
+    "mcp__report-dailies__docs_get_page": 1,
+    "mcp__ccd_session_mgmt__get_session": 1,
+    "mcp__ccd_session_mgmt__list_events": 1,
+    "mcp__ccd_host__reveal_path": 1,
+    "mcp__apkb__apkb_status": 1,
+    "mcp__apkb__apkb_build": 1,
+    "mcp__apkb__apkb_job": 1,
+    "mcp__apkb__apkb_power": 1,
+    "mcp__ccd_pr__get_status": 1,
+    "EnterWorktree": 1,
+    "ScheduleWakeup": 1
+  },
+  "large_tool_results": [
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 537940,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 296512,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 188593,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 133056,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 113097,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 99084,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 90357,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 69784,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 67140,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 66712,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 61112,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 53964,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 50224,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Artifact",
+      "chars": 50000,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 48848,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__report-dailies__docs_get_page",
+      "chars": 48020,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "WebFetch",
+      "chars": 47942,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 43856,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 42480,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 41556,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 36696,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 34704,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "WebFetch",
+      "chars": 32704,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "ExitPlanMode",
+      "chars": 30874,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 29954,
+      "error": false
+    },
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 27941,
+      "error": false
+    },
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27589,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27419,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27324,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 26969,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 24563,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 23645,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 23206,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 22611,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 22280,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 22280,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 21394,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 21334,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 20309,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 19716,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 19187,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 18643,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 18241,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17999,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17888,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17877,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17512,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 17497,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 17443,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17412,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17381,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 17331,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 17155,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 16670,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 16423,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 16021,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 15717,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 15679,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 15325,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 15058,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 14747,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 14443,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14166,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 14079,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14041,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14039,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 14002,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 13859,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13776,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 13695,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 13646,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13629,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 13553,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 13088,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13087,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 12998,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 12697,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Agent",
+      "chars": 11945,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11847,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 11631,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11620,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11620,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11558,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 11409,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11302,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11299,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11240,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 11138,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 11073,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 11063,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "WebFetch",
+      "chars": 11017,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10779,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10682,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10633,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10568,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10568,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10513,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 10365,
+      "error": true
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 10312,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10305,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10283,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10276,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "PowerShell",
+      "chars": 10253,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 10252,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "PowerShell",
+      "chars": 10210,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10109,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10071,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10060,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10055,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Grep",
+      "chars": 10041,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10040,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 10022,
+      "error": false
+    }
+  ],
+  "ccat": {
+    "rows": 16513,
+    "providers": {
+      "Claude": {
+        "input": 2460890,
+        "output": 1946388,
+        "cache_read": 769905095,
+        "cache_write": 27500700,
+        "requests": 1316,
+        "cached_fraction_of_reported_input": 0.9625417703201378
+      },
+      "Antigravity": {
+        "input": 173527792,
+        "output": 6490182,
+        "cache_read": 4290281722,
+        "cache_write": 0,
+        "requests": 13353,
+        "cached_fraction_of_reported_input": 0.9611256279068902
+      },
+      "ChatGPT": {
+        "input": 17563461,
+        "output": 1048025,
+        "cache_read": 462449408,
+        "cache_write": 0,
+        "requests": 1844,
+        "cached_fraction_of_reported_input": 0.9634104372314235
+      }
+    },
+    "from_epoch": 1792503994,
+    "through_epoch": 1792831430,
+    "log_patterns": {
+      "retrying": 50,
+      "giving_up": 6,
+      "all_routes_blocked": 105,
+      "schema_errors": 5,
+      "empty_answer": 0,
+      "muse_mentions": 62
+    },
+    "from_local": "2026-10-20T20:46:34+07:00",
+    "through_local": "2026-10-24T15:43:50+07:00"
+  },
+  "unique_assistant_messages_across_sessions": 4632,
+  "deduplicated_usage_totals": {
+    "input_tokens": 45687699,
+    "output_tokens": 2199386,
+    "cache_read_input_tokens": 2105073561,
+    "cache_creation_input_tokens": 35734013
+  },
+  "deduplicated_tool_calls": {
+    "Read": 1443,
+    "Bash": 1085,
+    "PowerShell": 459,
+    "Edit": 294,
+    "Grep": 170,
+    "mcp__migii-orchestrator__message_worker": 106,
+    "SendMessage": 95,
+    "Write": 83,
+    "Agent": 80,
+    "mcp__migii-orchestrator__spawn_worker": 52,
+    "AskUserQuestion": 47,
+    "mcp__migii-orchestrator__list_workers": 47,
+    "Skill": 43,
+    "mcp__report-dailies__get_task": 34,
+    "Glob": 32,
+    "mcp__migii-orchestrator__stop_worker": 23,
+    "WebFetch": 17,
+    "ListAgents": 15,
+    "mcp__report-dailies__add_worklog": 13,
+    "mcp__ccd_host__open_in_editor": 12,
+    "mcp__context7__resolve-library-id": 10,
+    "mcp__context7__query-docs": 10,
+    "Monitor": 9,
+    "Artifact": 8,
+    "mcp__migii-orchestrator__refresh_workers": 6,
+    "mcp__report-dailies__list_tasks": 5,
+    "mcp__migii-orchestrator__ask_user": 5,
+    "EnterPlanMode": 3,
+    "ExitPlanMode": 3,
+    "TaskStop": 3,
+    "WebSearch": 3,
+    "mcp__report-dailies__docs_search": 3,
+    "SendUserFile": 3,
+    "mcp__apkb__apkb_jobs": 3,
+    "mcp__migii-orchestrator__set_token_mode": 3,
+    "mcp__claude-in-chrome__tabs_context_mcp": 3,
+    "mcp__claude-in-chrome__browser_batch": 3,
+    "CronCreate": 2,
+    "CronList": 2,
+    "CronDelete": 2,
+    "mcp__supabase__list_migrations": 2,
+    "mcp__supabase__apply_migration": 2,
+    "mcp__vercel__get_deployment": 2,
+    "ReportFindings": 2,
+    "mcp__report-dailies__list_calendar_events": 2,
+    "mcp__ccd_session_mgmt__list_sessions": 2,
+    "mcp__apkb__apkb_apks": 2,
+    "mcp__claude-in-chrome__list_connected_browsers": 2,
+    "mcp__supabase__search_docs": 1,
+    "mcp__supabase__get_project_url": 1,
+    "mcp__supabase__list_edge_functions": 1,
+    "PushNotification": 1,
+    "mcp__ccd_session_mgmt__get_usage": 1,
+    "mcp__report-dailies__docs_get_page": 1,
+    "mcp__ccd_session_mgmt__get_session": 1,
+    "mcp__ccd_session_mgmt__list_events": 1,
+    "mcp__ccd_host__reveal_path": 1,
+    "mcp__apkb__apkb_status": 1,
+    "mcp__apkb__apkb_build": 1,
+    "mcp__apkb__apkb_job": 1,
+    "mcp__apkb__apkb_power": 1,
+    "mcp__ccd_pr__get_status": 1,
+    "EnterWorktree": 1,
+    "ScheduleWakeup": 1
+  },
+  "deduplicated_large_tool_results": [
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 537940,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 296512,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 188593,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 133056,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 113097,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 99084,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 90357,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 69784,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 67140,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 66712,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 61112,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 53964,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 50224,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Artifact",
+      "chars": 50000,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 48848,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__report-dailies__docs_get_page",
+      "chars": 48020,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "WebFetch",
+      "chars": 47942,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 43856,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 42480,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 41556,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 36696,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 34704,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "WebFetch",
+      "chars": 32704,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "ExitPlanMode",
+      "chars": 30874,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 29954,
+      "error": false
+    },
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 27941,
+      "error": false
+    },
+    {
+      "session": "dce781d6-99c7-4cdd-aab7-863050df81ef",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27589,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27419,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 27324,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 26969,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 24563,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 23645,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 23206,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 22611,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 22280,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 22280,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 21394,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 21334,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Read",
+      "chars": 20309,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 19716,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 19187,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 18643,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 18241,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17999,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17888,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17877,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17512,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 17497,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 17443,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 17412,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 17381,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 17331,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 17155,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 16670,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 16423,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 16021,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 15717,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 15679,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 15325,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 15058,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Read",
+      "chars": 14747,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Glob",
+      "chars": 14443,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14166,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 14079,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14041,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 14039,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 14002,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 13859,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13776,
+      "error": false
+    },
+    {
+      "session": "ba1ae49a-31e4-49bc-8260-9e9224ef5dc8",
+      "project": "D--eUp-worktrees-migii-hsk-flutter-KB-16377",
+      "tool": "Bash",
+      "chars": 13695,
+      "error": false
+    },
+    {
+      "session": "62827388-8d08-46d0-bfb1-29e011ab1b95",
+      "project": "D--Dev-ccat",
+      "tool": "Grep",
+      "chars": 13646,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13629,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 13553,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 13088,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 13087,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 12998,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 12697,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Agent",
+      "chars": 11945,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11847,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 11631,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11620,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11620,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11558,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 11409,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11302,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11299,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 11240,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 11138,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Bash",
+      "chars": 11073,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 11063,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "WebFetch",
+      "chars": 11017,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10779,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10682,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10633,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10568,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10568,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10513,
+      "error": false
+    },
+    {
+      "session": "6bdfbc42-8139-4c47-ac02-92c6680ae8dc",
+      "project": "D--Dev-ccat",
+      "tool": "Bash",
+      "chars": 10365,
+      "error": true
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Bash",
+      "chars": 10312,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10305,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10283,
+      "error": false
+    },
+    {
+      "session": "8c4651d3-2e4e-4d06-afe7-1cbe78e2f235",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10276,
+      "error": false
+    },
+    {
+      "session": "d6264a3e-c37c-490b-8860-d2621ab44bfc",
+      "project": "D--Dev-ccat",
+      "tool": "PowerShell",
+      "chars": 10253,
+      "error": false
+    },
+    {
+      "session": "11c36de1-2912-4308-b573-bbedea4b985a",
+      "project": "D--dun-core",
+      "tool": "Read",
+      "chars": 10252,
+      "error": false
+    },
+    {
+      "session": "7a9ee0d5-8eed-47e6-b8b7-b2ed5d45c851",
+      "project": "D--Dev-ccat",
+      "tool": "PowerShell",
+      "chars": 10210,
+      "error": false
+    },
+    {
+      "session": "fba63bc3-e596-48ca-a35a-444fcdd6986c",
+      "project": "d--eUp",
+      "tool": "Bash",
+      "chars": 10109,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10071,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10060,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10055,
+      "error": false
+    },
+    {
+      "session": "9b2ec868-19c8-4803-8017-e757864ffddd",
+      "project": "D--eUp-script-test-KB-16377-src",
+      "tool": "Grep",
+      "chars": 10041,
+      "error": false
+    },
+    {
+      "session": "5728f7e7-d9a9-476c-87dd-91ad6c7a63af",
+      "project": "d--eUp",
+      "tool": "mcp__migii-orchestrator__list_workers",
+      "chars": 10040,
+      "error": false
+    },
+    {
+      "session": "d2c90591-bdd7-4826-986f-3384a1e6b3af",
+      "project": "D--Dev-ccat",
+      "tool": "Read",
+      "chars": 10022,
+      "error": false
+    }
+  ],
+  "unique_tool_result_characters": 8862326,
+  "tool_result_statistics": {
+    "Skill": {
+      "results": 43,
+      "reported_errors": 0,
+      "result_characters": 1729,
+      "max_result_characters": 59
+    },
+    "PowerShell": {
+      "results": 459,
+      "reported_errors": 47,
+      "result_characters": 266838,
+      "max_result_characters": 10253
+    },
+    "Read": {
+      "results": 1443,
+      "reported_errors": 4,
+      "result_characters": 5023147,
+      "max_result_characters": 537940
+    },
+    "Agent": {
+      "results": 80,
+      "reported_errors": 0,
+      "result_characters": 119784,
+      "max_result_characters": 11945
+    },
+    "SendMessage": {
+      "results": 95,
+      "reported_errors": 0,
+      "result_characters": 27229,
+      "max_result_characters": 415
+    },
+    "WebFetch": {
+      "results": 17,
+      "reported_errors": 1,
+      "result_characters": 119774,
+      "max_result_characters": 47942
+    },
+    "EnterPlanMode": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 1743,
+      "max_result_characters": 581
+    },
+    "mcp__context7__resolve-library-id": {
+      "results": 10,
+      "reported_errors": 0,
+      "result_characters": 13522,
+      "max_result_characters": 1955
+    },
+    "mcp__context7__query-docs": {
+      "results": 10,
+      "reported_errors": 0,
+      "result_characters": 57053,
+      "max_result_characters": 9999
+    },
+    "Write": {
+      "results": 83,
+      "reported_errors": 0,
+      "result_characters": 13918,
+      "max_result_characters": 247
+    },
+    "AskUserQuestion": {
+      "results": 47,
+      "reported_errors": 0,
+      "result_characters": 14983,
+      "max_result_characters": 1093
+    },
+    "Glob": {
+      "results": 32,
+      "reported_errors": 0,
+      "result_characters": 99797,
+      "max_result_characters": 17497
+    },
+    "Edit": {
+      "results": 294,
+      "reported_errors": 6,
+      "result_characters": 33882,
+      "max_result_characters": 347
+    },
+    "ExitPlanMode": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 46697,
+      "max_result_characters": 30874
+    },
+    "Grep": {
+      "results": 170,
+      "reported_errors": 8,
+      "result_characters": 265170,
+      "max_result_characters": 17443
+    },
+    "ListAgents": {
+      "results": 15,
+      "reported_errors": 0,
+      "result_characters": 8975,
+      "max_result_characters": 881
+    },
+    "Bash": {
+      "results": 1085,
+      "reported_errors": 62,
+      "result_characters": 2096224,
+      "max_result_characters": 29954
+    },
+    "TaskStop": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 3951,
+      "max_result_characters": 2977
+    },
+    "WebSearch": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 8995,
+      "max_result_characters": 3867
+    },
+    "mcp__supabase__search_docs": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 2255,
+      "max_result_characters": 2255
+    },
+    "CronCreate": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 338,
+      "max_result_characters": 170
+    },
+    "CronList": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 287,
+      "max_result_characters": 154
+    },
+    "CronDelete": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 46,
+      "max_result_characters": 23
+    },
+    "mcp__supabase__list_migrations": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 3920,
+      "max_result_characters": 1960
+    },
+    "mcp__supabase__get_project_url": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 81,
+      "max_result_characters": 81
+    },
+    "mcp__supabase__list_edge_functions": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 496,
+      "max_result_characters": 496
+    },
+    "mcp__supabase__apply_migration": {
+      "results": 2,
+      "reported_errors": 1,
+      "result_characters": 76,
+      "max_result_characters": 45
+    },
+    "mcp__vercel__get_deployment": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 2880,
+      "max_result_characters": 1440
+    },
+    "PushNotification": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 75,
+      "max_result_characters": 75
+    },
+    "ReportFindings": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 40,
+      "max_result_characters": 20
+    },
+    "mcp__migii-orchestrator__list_workers": {
+      "results": 47,
+      "reported_errors": 0,
+      "result_characters": 430029,
+      "max_result_characters": 11847
+    },
+    "mcp__migii-orchestrator__stop_worker": {
+      "results": 23,
+      "reported_errors": 0,
+      "result_characters": 2135,
+      "max_result_characters": 125
+    },
+    "mcp__migii-orchestrator__spawn_worker": {
+      "results": 52,
+      "reported_errors": 0,
+      "result_characters": 4864,
+      "max_result_characters": 163
+    },
+    "mcp__report-dailies__get_task": {
+      "results": 34,
+      "reported_errors": 0,
+      "result_characters": 27477,
+      "max_result_characters": 2334
+    },
+    "mcp__ccd_session_mgmt__get_usage": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 1611,
+      "max_result_characters": 1611
+    },
+    "mcp__migii-orchestrator__message_worker": {
+      "results": 106,
+      "reported_errors": 0,
+      "result_characters": 7735,
+      "max_result_characters": 220
+    },
+    "mcp__report-dailies__docs_search": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 6418,
+      "max_result_characters": 5700
+    },
+    "mcp__report-dailies__docs_get_page": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 48020,
+      "max_result_characters": 48020
+    },
+    "mcp__report-dailies__add_worklog": {
+      "results": 13,
+      "reported_errors": 0,
+      "result_characters": 670,
+      "max_result_characters": 53
+    },
+    "mcp__ccd_session_mgmt__get_session": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 786,
+      "max_result_characters": 786
+    },
+    "Artifact": {
+      "results": 8,
+      "reported_errors": 0,
+      "result_characters": 64963,
+      "max_result_characters": 50000
+    },
+    "mcp__ccd_session_mgmt__list_events": {
+      "results": 1,
+      "reported_errors": 1,
+      "result_characters": 27,
+      "max_result_characters": 27
+    },
+    "mcp__report-dailies__list_tasks": {
+      "results": 5,
+      "reported_errors": 0,
+      "result_characters": 656,
+      "max_result_characters": 165
+    },
+    "mcp__report-dailies__list_calendar_events": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 148,
+      "max_result_characters": 74
+    },
+    "mcp__migii-orchestrator__ask_user": {
+      "results": 5,
+      "reported_errors": 0,
+      "result_characters": 571,
+      "max_result_characters": 186
+    },
+    "mcp__ccd_host__open_in_editor": {
+      "results": 12,
+      "reported_errors": 1,
+      "result_characters": 1349,
+      "max_result_characters": 176
+    },
+    "mcp__ccd_host__reveal_path": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 125,
+      "max_result_characters": 125
+    },
+    "mcp__migii-orchestrator__refresh_workers": {
+      "results": 6,
+      "reported_errors": 0,
+      "result_characters": 510,
+      "max_result_characters": 85
+    },
+    "mcp__ccd_session_mgmt__list_sessions": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 6040,
+      "max_result_characters": 5989
+    },
+    "SendUserFile": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 358,
+      "max_result_characters": 132
+    },
+    "mcp__apkb__apkb_status": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 455,
+      "max_result_characters": 455
+    },
+    "mcp__apkb__apkb_build": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 70,
+      "max_result_characters": 70
+    },
+    "mcp__apkb__apkb_job": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 1113,
+      "max_result_characters": 1113
+    },
+    "mcp__apkb__apkb_power": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 129,
+      "max_result_characters": 129
+    },
+    "mcp__apkb__apkb_jobs": {
+      "results": 3,
+      "reported_errors": 1,
+      "result_characters": 12080,
+      "max_result_characters": 9024
+    },
+    "mcp__apkb__apkb_apks": {
+      "results": 2,
+      "reported_errors": 1,
+      "result_characters": 2760,
+      "max_result_characters": 2676
+    },
+    "mcp__migii-orchestrator__set_token_mode": {
+      "results": 3,
+      "reported_errors": 0,
+      "result_characters": 610,
+      "max_result_characters": 270
+    },
+    "mcp__ccd_pr__get_status": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 820,
+      "max_result_characters": 820
+    },
+    "mcp__claude-in-chrome__tabs_context_mcp": {
+      "results": 3,
+      "reported_errors": 1,
+      "result_characters": 1279,
+      "max_result_characters": 537
+    },
+    "mcp__claude-in-chrome__browser_batch": {
+      "results": 3,
+      "reported_errors": 1,
+      "result_characters": 1048,
+      "max_result_characters": 577
+    },
+    "mcp__claude-in-chrome__list_connected_browsers": {
+      "results": 2,
+      "reported_errors": 0,
+      "result_characters": 392,
+      "max_result_characters": 196
+    },
+    "EnterWorktree": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 227,
+      "max_result_characters": 227
+    },
+    "Monitor": {
+      "results": 9,
+      "reported_errors": 0,
+      "result_characters": 2713,
+      "max_result_characters": 302
+    },
+    "ScheduleWakeup": {
+      "results": 1,
+      "reported_errors": 0,
+      "result_characters": 233,
+      "max_result_characters": 233
+    }
+  },
+  "hook_error_string_counts": {},
+  "largest_read_basenames": [
+    {
+      "name": "Read",
+      "file_basename": "probe3_coding_reasoning_screenshot.png",
+      "chars": 537940,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "61.png",
+      "chars": 296512,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "azure-s1-now.png",
+      "chars": 188593,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "ccat-usage-dpi.png",
+      "chars": 133056,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "63.webp",
+      "chars": 113097,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "launcher-settings-providers.png",
+      "chars": 99084,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "62.webp",
+      "chars": 90357,
+      "error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "ccat-usage-render.png",
+      "chars": 69784,
+      "error": false
+    }
+  ],
+  "model_visible_tool_text_by_tool": {
+    "Skill": {
+      "text_characters": 1729,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "PowerShell": {
+      "text_characters": 266838,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Read": {
+      "text_characters": 2925756,
+      "base64_characters": 2095628,
+      "media_blocks": 22
+    },
+    "Agent": {
+      "text_characters": 116069,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "SendMessage": {
+      "text_characters": 22606,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "WebFetch": {
+      "text_characters": 119774,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "EnterPlanMode": {
+      "text_characters": 1743,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__context7__resolve-library-id": {
+      "text_characters": 12992,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__context7__query-docs": {
+      "text_characters": 54974,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Write": {
+      "text_characters": 13918,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "AskUserQuestion": {
+      "text_characters": 14983,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Glob": {
+      "text_characters": 99797,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Edit": {
+      "text_characters": 33882,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "ExitPlanMode": {
+      "text_characters": 46697,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Grep": {
+      "text_characters": 265170,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "ListAgents": {
+      "text_characters": 8975,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Bash": {
+      "text_characters": 2096224,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "TaskStop": {
+      "text_characters": 3951,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "WebSearch": {
+      "text_characters": 8995,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__supabase__search_docs": {
+      "text_characters": 2255,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "CronCreate": {
+      "text_characters": 338,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "CronList": {
+      "text_characters": 287,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "CronDelete": {
+      "text_characters": 46,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__supabase__list_migrations": {
+      "text_characters": 3398,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__supabase__get_project_url": {
+      "text_characters": 50,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__supabase__list_edge_functions": {
+      "text_characters": 433,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__supabase__apply_migration": {
+      "text_characters": 47,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__vercel__get_deployment": {
+      "text_characters": 2528,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "PushNotification": {
+      "text_characters": 75,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "ReportFindings": {
+      "text_characters": 40,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__list_workers": {
+      "text_characters": 430029,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__stop_worker": {
+      "text_characters": 2135,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__spawn_worker": {
+      "text_characters": 4864,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__get_task": {
+      "text_characters": 25889,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_session_mgmt__get_usage": {
+      "text_characters": 1385,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__message_worker": {
+      "text_characters": 7735,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__docs_search": {
+      "text_characters": 6281,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__docs_get_page": {
+      "text_characters": 46308,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__add_worklog": {
+      "text_characters": 319,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_session_mgmt__get_session": {
+      "text_characters": 665,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Artifact": {
+      "text_characters": 64963,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_session_mgmt__list_events": {
+      "text_characters": 27,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__list_tasks": {
+      "text_characters": 513,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__report-dailies__list_calendar_events": {
+      "text_characters": 94,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__ask_user": {
+      "text_characters": 571,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_host__open_in_editor": {
+      "text_characters": 1009,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_host__reveal_path": {
+      "text_characters": 95,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__refresh_workers": {
+      "text_characters": 510,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_session_mgmt__list_sessions": {
+      "text_characters": 5405,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "SendUserFile": {
+      "text_characters": 358,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_status": {
+      "text_characters": 374,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_build": {
+      "text_characters": 37,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_job": {
+      "text_characters": 953,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_power": {
+      "text_characters": 89,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_jobs": {
+      "text_characters": 10345,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__apkb__apkb_apks": {
+      "text_characters": 2536,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__migii-orchestrator__set_token_mode": {
+      "text_characters": 610,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__ccd_pr__get_status": {
+      "text_characters": 696,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__claude-in-chrome__tabs_context_mcp": {
+      "text_characters": 1125,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__claude-in-chrome__browser_batch": {
+      "text_characters": 855,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "mcp__claude-in-chrome__list_connected_browsers": {
+      "text_characters": 302,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "EnterWorktree": {
+      "text_characters": 227,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "Monitor": {
+      "text_characters": 2713,
+      "base64_characters": 0,
+      "media_blocks": 0
+    },
+    "ScheduleWakeup": {
+      "text_characters": 233,
+      "base64_characters": 0,
+      "media_blocks": 0
+    }
+  },
+  "large_text_tool_results": [
+    {
+      "name": "Artifact",
+      "file_basename": "",
+      "text_characters": 50000,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "WebFetch",
+      "file_basename": "",
+      "text_characters": 47942,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__report-dailies__docs_get_page",
+      "file_basename": "",
+      "text_characters": 46308,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "WebFetch",
+      "file_basename": "",
+      "text_characters": 32704,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "ExitPlanMode",
+      "file_basename": "",
+      "text_characters": 30874,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 29954,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "museai-live-usage.json",
+      "text_characters": 27941,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 27589,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 27419,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 27324,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 26969,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "muse_login.py",
+      "text_characters": 24563,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 23645,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 23206,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 22611,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "CLAUDE.md",
+      "text_characters": 22280,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "CLAUDE.md",
+      "text_characters": 22280,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 21394,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "CLAUDE.md",
+      "text_characters": 21334,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "hangen.md",
+      "text_characters": 20309,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 19716,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "muse_sidecar.py",
+      "text_characters": 19187,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "MainWindow.License.cs",
+      "text_characters": 18643,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "theory_vocab_cubit.dart",
+      "text_characters": 18241,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 17999,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "main.rs",
+      "text_characters": 17888,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "museai.rs",
+      "text_characters": 17877,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 17512,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Glob",
+      "file_basename": "",
+      "text_characters": 17497,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Grep",
+      "file_basename": "",
+      "text_characters": 17443,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 17381,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 17331,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 17155,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 16670,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 16423,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Glob",
+      "file_basename": "",
+      "text_characters": 16021,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "cost-optimization.md",
+      "text_characters": 15717,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Glob",
+      "file_basename": "",
+      "text_characters": 15679,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 15325,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 15058,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "download_theory_page.dart",
+      "text_characters": 14747,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Glob",
+      "file_basename": "",
+      "text_characters": 14443,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "profiles.rs",
+      "text_characters": 14166,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 14079,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "museai.rs",
+      "text_characters": 14041,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "main.rs",
+      "text_characters": 14039,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Grep",
+      "file_basename": "",
+      "text_characters": 14002,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "README.md",
+      "text_characters": 13859,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 13776,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 13695,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Grep",
+      "file_basename": "",
+      "text_characters": 13646,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 13629,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "webview-k1-report.md",
+      "text_characters": 13553,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "usage.rs",
+      "text_characters": 13088,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 13087,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "task-2a-report.md",
+      "text_characters": 12998,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 12697,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11847,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Agent",
+      "file_basename": "",
+      "text_characters": 11772,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 11631,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11620,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11620,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11558,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "gateway.py",
+      "text_characters": 11409,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11302,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11299,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 11240,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 11138,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 11073,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 11063,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "WebFetch",
+      "file_basename": "",
+      "text_characters": 11017,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10779,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10682,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10633,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10568,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10568,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10513,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10365,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": true
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10312,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10305,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10283,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10276,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "PowerShell",
+      "file_basename": "",
+      "text_characters": 10253,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "20261021110000_offline_license_authority.sql",
+      "text_characters": 10252,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "PowerShell",
+      "file_basename": "",
+      "text_characters": 10210,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Bash",
+      "file_basename": "",
+      "text_characters": 10109,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10071,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10060,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10055,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Grep",
+      "file_basename": "",
+      "text_characters": 10041,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "mcp__migii-orchestrator__list_workers",
+      "file_basename": "",
+      "text_characters": 10040,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    },
+    {
+      "name": "Read",
+      "file_basename": "main.rs",
+      "text_characters": 10022,
+      "base64_characters": 0,
+      "media_blocks": 0,
+      "reported_error": false
+    }
+  ],
+  "image_accounting_note": "Raw JSON character sizes include base64 images and are not token counts. Text-only figures count text blocks/string results separately; media blocks need provider vision accounting.",
+  "agent_allowlist_inventory": [
+    {
+      "plugin": "code-simplifier@claude-plugins-official",
+      "agent": "code-simplifier",
+      "tool_allowlist": "(inherits parent tools)"
+    },
+    {
+      "plugin": "feature-dev@claude-plugins-official",
+      "agent": "code-architect",
+      "tool_allowlist": "Glob, Grep, LS, Read, NotebookRead, WebFetch, TodoWrite, WebSearch, KillShell, BashOutput"
+    },
+    {
+      "plugin": "feature-dev@claude-plugins-official",
+      "agent": "code-explorer",
+      "tool_allowlist": "Glob, Grep, LS, Read, NotebookRead, WebFetch, TodoWrite, WebSearch, KillShell, BashOutput"
+    },
+    {
+      "plugin": "feature-dev@claude-plugins-official",
+      "agent": "code-reviewer",
+      "tool_allowlist": "Glob, Grep, LS, Read, NotebookRead, WebFetch, TodoWrite, WebSearch, KillShell, BashOutput"
+    }
+  ],
+  "configuration_snapshot": {
+    "ENABLE_TOOL_SEARCH": "true",
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
+    "default_model": "haiku",
+    "effortLevel": "high",
+    "advisorModel": "opus",
+    "chrome_default_enabled": true,
+    "user_claude_md_characters": 1057,
+    "rtk_md_characters": 955,
+    "context7_rule_bytes": 1679,
+    "rtk_hook_matcher": "Bash",
+    "native_powershell_user_alias_version": "7.6.8",
+    "native_powershell_codex_runtime_version": "7.6.5"
+  }
+}

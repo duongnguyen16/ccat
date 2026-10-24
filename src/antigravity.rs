@@ -481,6 +481,10 @@ impl Pool {
         Pool { accounts, disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
     fn off(&self, i: usize) -> bool {
         self.disabled.read().unwrap().contains(&self.accounts[i].email)
     }

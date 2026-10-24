@@ -49,6 +49,28 @@ pub fn write(s: &Session) {
     }
 }
 
+/// A held OS file lock identifies a running CLI, including plain Claude sessions without a proxy.
+/// Process exit releases the lock, even when a terminal is killed.
+pub fn session() -> std::io::Result<fs::File> {
+    fs::create_dir_all(dir())?;
+    let file = fs::File::create(dir().join(format!("{}.running", std::process::id())))?;
+    file.try_lock().map_err(std::io::Error::from)?;
+    Ok(file)
+}
+
+pub fn running() -> bool {
+    running_in(&dir())
+}
+
+fn running_in(dir: &std::path::Path) -> bool {
+    fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+        e.path().extension().is_some_and(|x| x == "running")
+            && fs::OpenOptions::new().read(true).write(true).open(e.path()).is_ok_and(|f| {
+                matches!(f.try_lock(), Err(fs::TryLockError::WouldBlock))
+            })
+    })
+}
+
 /// Every running session merged per tier: the most recent route used in the last `RECENT` seconds, held requests
 /// added up, the waits of every session (each route at its soonest). A session that stopped writing (it heartbeats
 /// every minute) is left out, and its file removed once it is a day old.
@@ -134,6 +156,21 @@ pub fn nearest_wait(t: &Tier, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_locked_cli_markers_count_as_running() {
+        let dir = std::env::temp_dir().join(format!("ccat-session-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!running_in(&dir));
+        fs::write(dir.join("proxy.json"), b"{}").unwrap();
+        let file = fs::File::create(dir.join("test.running")).unwrap();
+        assert!(!running_in(&dir), "stale files and proxy reports aren't sessions");
+        file.try_lock().unwrap();
+        assert!(running_in(&dir), "an active CLI holds its lock");
+        drop(file);
+        assert!(!running_in(&dir), "exit releases the lock without requiring cleanup");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn rows_match_routes_and_waits_read_plainly() {

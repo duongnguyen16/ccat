@@ -107,6 +107,8 @@ fn hop(u: &Upstream, model: &str) -> crate::live::Hop {
         Upstream::Endpoint { name, .. } => name.clone(),
         Upstream::Antigravity => crate::AG_NAME.into(),
         Upstream::ChatGPT => crate::GPT_NAME.into(),
+        Upstream::Ollama { .. } => crate::OLLAMA_NAME.into(),
+        Upstream::MuseAI { .. } => crate::MUSE_NAME.into(),
     };
     crate::live::Hop { provider, model: model.to_string() }
 }
@@ -149,6 +151,10 @@ pub enum Upstream {
     Antigravity,
     /// The ChatGPT plan: Anthropic Messages translated to the Responses API.
     ChatGPT,
+    /// Ollama model server (Cloud or Local): Anthropic Messages translated to OpenAI Chat Completions.
+    Ollama { url: String, key: String },
+    /// MuseAI Hatch Gateway VM via local sidecar: Anthropic Messages translated to OpenAI Chat Completions.
+    MuseAI { url: String, key: String },
 }
 
 /// Names the provider and never the key, so a route can be logged.
@@ -159,6 +165,8 @@ impl std::fmt::Debug for Upstream {
             Upstream::Endpoint { name, .. } => name,
             Upstream::Antigravity => "Antigravity",
             Upstream::ChatGPT => "ChatGPT",
+            Upstream::Ollama { .. } => "Ollama",
+            Upstream::MuseAI { .. } => "MuseAI",
         })
     }
 }
@@ -445,6 +453,9 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             // Claude Code may tag a name with a context hint such as `[1m]`.
             let asked = body["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
             let counted = path == "/v1/messages";
+            if counted {
+                antigravity::log(&json!({"event":"api_request","model":asked,"request_bytes":req.body.len(),"declared_tools":body["tools"].as_array().map_or(0, Vec::len)}).to_string());
+            }
 
             // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
             // Every try out of quota: the request waits, open, until one can run (or Claude Code stops waiting), so an
@@ -582,6 +593,16 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
             Ok(())
         }
         Upstream::ChatGPT => chatgpt_messages(s, ctx, req, body, asked, model, tier, may_fail),
+        Upstream::Ollama { .. } if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("ollama", body) }), "");
+            Ok(())
+        }
+        Upstream::Ollama { url, key } => ollama_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
+        Upstream::MuseAI { .. } if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("muse", body) }), "");
+            Ok(())
+        }
+        Upstream::MuseAI { url, key } => muse_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
     }
 }
 
@@ -969,9 +990,8 @@ fn response_input(req: &Value, wrap: bool) -> Vec<Value> {
                         let (mut text, mut images) = (Vec::new(), Vec::new());
                         for c in blocks(&b["content"]) {
                             match c["type"].as_str() {
-                                Some("text") => text.extend(c["text"].as_str().map(String::from)),
                                 Some("image") => images.extend(input_image(&c)),
-                                _ => {}
+                                _ => text.extend(tool_result_text(&c)),
                             }
                         }
                         let output = if !text.is_empty() { text.join("\n") } else if !images.is_empty() { "(see attached image)".into() } else { String::new() };
@@ -996,7 +1016,7 @@ fn response_input(req: &Value, wrap: bool) -> Vec<Value> {
 /// Client tools as function tools (or inside one namespace when the API refused them bare); a web-search server tool as
 /// `web_search`; other server tools have no equivalent and are dropped.
 fn response_tools(req: &Value, wrap: bool) -> Vec<Value> {
-    let tools = req["tools"].as_array().cloned().unwrap_or_default();
+    let tools = client_tools(req).as_array().cloned().unwrap_or_default();
     let fns: Vec<Value> = tools
         .iter()
         .filter(|t| t.get("input_schema").is_some())
@@ -1127,6 +1147,153 @@ fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked
     }
 }
 
+/// An Ollama route: the request goes to Ollama's local OpenAI-compatible endpoint.
+#[allow(clippy::too_many_arguments)]
+fn ollama_messages(
+    s: &mut TcpStream,
+    ctx: &Ctx,
+    _req: &Req,
+    body: &Value,
+    asked: &str,
+    model: &str,
+    url: &str,
+    key: &str,
+    tier: &str,
+    may_fail: Fail,
+) -> Result<(), Failure> {
+    if model.is_empty() {
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
+    }
+    let stream = body["stream"].as_bool().unwrap_or(false);
+
+    // WebSearch support:
+    // If an Ollama Cloud API key is available, query Ollama's native web search endpoint!
+    // Otherwise, delegate to Gemini Flash if Antigravity is active.
+    if web_search(body).is_some() {
+        let q = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| {
+            if let Some(s) = m["content"].as_str() {
+                Some(s.to_string())
+            } else if let Some(arr) = m["content"].as_array() {
+                arr.iter().find_map(|b| b["text"].as_str()).map(String::from)
+            } else {
+                None
+            }
+        }).unwrap_or_default();
+
+        if !key.trim().is_empty() {
+            if let Ok(links) = crate::ollama::web_search(url, key, &q) {
+                let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+                tx.queries = vec![q];
+                tx.links = links;
+                let _ = tx.search_results();
+                let _ = tx.begin();
+                let (usage, stop) = (tx.usage_json(), "end_turn");
+                let _ = tx.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }));
+                let _ = tx.send("message_stop", json!({ "type": "message_stop" }));
+                if !stream {
+                    let msg = tx.message();
+                    respond(s, 200, &msg, "");
+                }
+                return Ok(());
+            }
+        }
+        if !ctx.pool.is_empty() {
+            return messages(s, ctx, body, asked, SEARCH_MODEL.to_string(), tier, may_fail);
+        }
+    }
+
+    let payload = crate::ollama::chat_body(body, model, true);
+    let key_opt = (!key.trim().is_empty()).then_some(key);
+    let reader = match crate::ollama::open(url, key_opt, &payload) {
+        Ok(r) => r,
+        Err(f) => {
+            antigravity::log(&format!("{model} via Ollama ({url}): {} {}", f.status, f.message));
+            if may_fail.takes(f.status) {
+                return Err(f);
+            }
+            respond_error(s, &f);
+            return Ok(());
+        }
+    };
+
+    let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+    match tx.run_openai_chat(reader, "Ollama") {
+        Ok(()) => {
+            let msg = tx.message();
+            let prompt = tx.usage.0;
+            drop(tx);
+            record(tier, crate::OLLAMA_NAME, model, &msg["usage"]);
+            ctx.learn("ollama", body, prompt);
+            if !stream {
+                respond(s, 200, &msg, "");
+            }
+            Ok(())
+        }
+        Err(Stop::Retry(f, _)) if may_fail.takes(f.status) => Err(f),
+        Err(Stop::Retry(f, _)) => {
+            respond_error(s, &f);
+            Ok(())
+        }
+        Err(Stop::Gone) => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn muse_messages(
+    s: &mut TcpStream,
+    ctx: &Ctx,
+    _req: &Req,
+    body: &Value,
+    asked: &str,
+    model: &str,
+    url: &str,
+    key: &str,
+    tier: &str,
+    may_fail: Fail,
+) -> Result<(), Failure> {
+    if model.is_empty() {
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
+    }
+    let stream = body["stream"].as_bool().unwrap_or(false);
+
+    let payload = crate::museai::chat_body(body, model, true);
+    let key_opt = (!key.trim().is_empty()).then_some(key);
+    let reader = match crate::museai::open(url, key_opt, &payload) {
+        Ok(r) => r,
+        Err(f) => {
+            antigravity::log(&format!("{model} via MuseAI ({url}): {} {}", f.status, f.message));
+            if may_fail.takes(f.status) {
+                return Err(f);
+            }
+            respond_error(s, &f);
+            return Ok(());
+        }
+    };
+
+    let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+    match tx.run_openai_chat(reader, "MuseAI") {
+        Ok(()) => {
+            let msg = tx.message();
+            let prompt = tx.usage.0;
+            drop(tx);
+            record(tier, crate::MUSE_NAME, model, &msg["usage"]);
+            ctx.learn("muse", body, prompt);
+            if !stream {
+                respond(s, 200, &msg, "");
+            }
+            Ok(())
+        }
+        Err(Stop::Retry(f, _)) if may_fail.takes(f.status) => Err(f),
+        Err(Stop::Retry(f, _)) => {
+            respond_error(s, &f);
+            Ok(())
+        }
+        Err(Stop::Gone) => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------- Anthropic → Cloud Code
 
 /// Signatures handed to Claude Code are tagged with the model family that made them, so a resumed session
@@ -1155,14 +1322,55 @@ fn media(b: &Value) -> Option<Value> {
     (src["type"] == "base64").then(|| json!({ "inlineData": { "mimeType": src["media_type"], "data": src["data"] } }))
 }
 
+/// Resolve Claude's on-demand tool declarations once for every translated provider.
+pub(crate) fn client_tools(req: &Value) -> Value {
+    let mut tools = req.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let mut loaded = HashSet::new();
+    if req["tool_choice"]["type"] == "tool" {
+        if let Some(name) = req["tool_choice"]["name"].as_str() { loaded.insert(name); }
+    }
+    for block in req["messages"].as_array().into_iter().flatten().flat_map(|m| m["content"].as_array().into_iter().flatten()) {
+        if block["type"] == "tool_addition" {
+            let tool = &block["tool"];
+            if tool["type"] == "tool_definition" {
+                let definition = &tool["definition"];
+                if let Some(name) = definition["name"].as_str().filter(|s| !s.is_empty()) {
+                    loaded.insert(name);
+                    if let Some(list) = tools.as_array_mut() {
+                        if let Some(previous) = list.iter_mut().find(|t| t["name"] == name) { *previous = definition.clone(); }
+                        else { list.push(definition.clone()); }
+                    }
+                }
+            } else if tool["type"] == "tool_reference" {
+                if let Some(name) = tool["name"].as_str() { loaded.insert(name); }
+            }
+        } else if block["type"] == "tool_result" {
+            for reference in block["content"].as_array().into_iter().flatten().filter(|v| v["type"] == "tool_reference") {
+                if let Some(name) = reference["tool_name"].as_str().or_else(|| reference["name"].as_str()) { loaded.insert(name); }
+            }
+        }
+    }
+    if let Some(list) = tools.as_array_mut() {
+        list.retain(|tool| tool["defer_loading"] != true || tool["name"].as_str().is_some_and(|name| loaded.contains(name)));
+    }
+    tools
+}
+
+pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
+    match block["type"].as_str()? {
+        "text" => block["text"].as_str().map(String::from),
+        "tool_reference" => block["tool_name"].as_str().or_else(|| block["name"].as_str()).map(|name| format!("Tool {name} is available.")),
+        _ => None,
+    }
+}
+
 fn function_response(b: &Value, names: &HashMap<String, String>, fam: &str) -> Value {
     let id = b["tool_use_id"].as_str().unwrap_or("");
     let (mut text, mut images) = (Vec::new(), Vec::new());
     for c in blocks(&b["content"]) {
         match c["type"].as_str() {
-            Some("text") => text.extend(c["text"].as_str().map(String::from)),
             Some("image") => images.extend(media(&c)),
-            _ => {}
+            _ => text.extend(tool_result_text(&c)),
         }
     }
     let out = if !text.is_empty() { text.join("\n") } else if !images.is_empty() { "(see attached image)".into() } else { String::new() };
@@ -1268,7 +1476,7 @@ fn system_parts(req: &Value) -> Vec<Value> {
 
 /// Client tools as Cloud Code `functionDeclarations`. Server tools (web search…) have no input_schema and are skipped.
 fn declarations(req: &Value) -> Vec<Value> {
-    req["tools"]
+    client_tools(req)
         .as_array()
         .into_iter()
         .flatten()
@@ -1556,6 +1764,7 @@ fn clean(v: &Value, root: &Value, depth: u32) -> (Value, bool) {
 
 // ---------------------------------------------------------------- Cloud Code SSE → Anthropic
 
+#[derive(Debug)]
 enum Stop {
     /// Nothing reached Claude Code yet: try again (optionally blocking the account for that many seconds).
     Retry(Failure, Option<u64>),
@@ -1886,6 +2095,145 @@ impl<'a> Tx<'a> {
         self.send("message_stop", json!({ "type": "message_stop" }))
     }
 
+    fn heartbeat(&mut self) -> Result<(), Stop> {
+        self.begin()?;
+        self.send("ping", json!({"type":"ping"}))
+    }
+
+    /// OpenAI-compatible Chat Completions SSE stream -> Anthropic events.
+    fn run_openai_chat(&mut self, reader: Box<dyn BufRead + Send>, provider: &str) -> Result<(), Stop> {
+        let mut in_think = false;
+        let mut current_tool_idx: Option<u64> = None;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("{provider} stream broke: {e}"), retry_after: None }, Some(0))),
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with(':') || trimmed.strip_prefix("event:").is_some_and(|event| event.trim() == "ping") {
+                self.heartbeat()?;
+                continue;
+            }
+            let Some(d) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let data = d.trim();
+            if data == "[DONE]" {
+                self.done = true;
+                break;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if v["ccat_ping"] == true || v["type"] == "ping" {
+                self.heartbeat()?;
+                continue;
+            }
+            if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+                let msg = err["message"].as_str().unwrap_or("Upstream chat stream error");
+                return Err(self.fail(Failure { status: 500, message: format!("{provider}: {msg}"), retry_after: None }, None));
+            }
+            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+                let comp = u["completion_tokens"].as_u64().unwrap_or(0);
+                self.usage = (prompt, 0, comp);
+            }
+            let Some(choice) = v["choices"].as_array().and_then(|c| c.first()) else {
+                continue;
+            };
+            let delta = &choice["delta"];
+
+            // 1. Thinking / reasoning delta (DeepSeek-R1 / Qwen native field)
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                self.delta("thinking", reasoning)?;
+            }
+
+            // 2. Text content (with inline <think>...</think> tag handling)
+            if let Some(content) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                let mut rem = content;
+                while !rem.is_empty() {
+                    if !in_think {
+                        if let Some(start) = rem.find("<think>") {
+                            let before = &rem[..start];
+                            if !before.is_empty() {
+                                self.text(before)?;
+                            }
+                            in_think = true;
+                            rem = &rem[start + 7..];
+                        } else {
+                            self.text(rem)?;
+                            break;
+                        }
+                    } else if let Some(end) = rem.find("</think>") {
+                        let thinking_part = &rem[..end];
+                        if !thinking_part.is_empty() {
+                            self.delta("thinking", thinking_part)?;
+                        }
+                        in_think = false;
+                        self.close()?;
+                        rem = &rem[end + 8..];
+                    } else {
+                        self.delta("thinking", rem)?;
+                        break;
+                    }
+                }
+            }
+
+            // 3. Tool calls
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tc in tool_calls {
+                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let tc_id = tc["id"].as_str().filter(|s| !s.is_empty());
+                    let func_name = tc["function"]["name"].as_str().filter(|s| !s.is_empty());
+                    let func_args = tc["function"]["arguments"].as_str().filter(|s| !s.is_empty());
+
+                    if current_tool_idx != Some(idx) {
+                        current_tool_idx = Some(idx);
+                        let id = tc_id.map(String::from).unwrap_or_else(|| format!("call_{}", antigravity::random_hex(12)));
+                        let name = func_name.unwrap_or("");
+                        self.call_start(&id, name)?;
+                    } else {
+                        if let Some(id) = tc_id {
+                            let last = self.blocks.len().saturating_sub(1);
+                            if self.open == Some("tool") && !self.blocks.is_empty() {
+                                self.blocks[last]["id"] = json!(id);
+                            }
+                        }
+                        if let Some(name) = func_name {
+                            let last = self.blocks.len().saturating_sub(1);
+                            if self.open == Some("tool") && !self.blocks.is_empty() {
+                                self.blocks[last]["name"] = json!(name);
+                            }
+                        }
+                    }
+                    if let Some(args) = func_args {
+                        self.call_args(args)?;
+                    }
+                }
+            }
+
+            // 4. Finish reason
+            if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.done = true;
+                self.stop_reason = match finish {
+                    "tool_calls" => "tool_use",
+                    "length" => "max_tokens",
+                    _ => "end_turn",
+                };
+            }
+        }
+
+        self.close()?;
+        self.begin()?;
+        let (usage, stop) = (self.usage_json(), self.stop_reason);
+        self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
+        self.send("message_stop", json!({ "type": "message_stop" }))
+    }
+
     /// Fails the request: retryable while nothing was sent, otherwise an SSE `error` event (overloaded → Claude Code retries).
     fn fail(&mut self, f: Failure, block: Option<u64>) -> Stop {
         if self.started && self.out.is_some() {
@@ -1987,11 +2335,15 @@ impl<'a> Tx<'a> {
             if !line.trim().is_empty() {
                 tail = line.chars().take(400).collect();
             }
+            if line.trim_start().starts_with(':') || line.strip_prefix("event:").is_some_and(|event| event.trim() == "ping") {
+                self.heartbeat()?;
+                continue;
+            }
             if let Some(d) = line.strip_prefix("data:") {
                 data.push_str(d.trim_start());
             } else if line.trim().is_empty() && !data.is_empty() {
                 let v: Value = serde_json::from_str(&std::mem::take(&mut data)).unwrap_or_default();
-                self.chunk(&v)?;
+                if v["type"] == "ping" { self.heartbeat()?; } else { self.chunk(&v)?; }
             }
         }
         if !data.is_empty() {
@@ -2042,6 +2394,66 @@ impl<'a> Tx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_keepalive_comments_reach_claude_before_content() {
+        for google in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            let sigs = Mutex::new(HashMap::new());
+            let tail = if google {
+                sse(&[json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}})])
+            } else { "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into() };
+            let reader = Box::new(io::Cursor::new(format!(": keep-alive\n\n{tail}").into_bytes()));
+            let mut tx = Tx::new("model", "asked", Some(&mut server), &sigs);
+            let result = if google { tx.run(reader) } else { tx.run_openai_chat(reader, "Upstream") };
+            assert!(result.is_ok());
+            drop(tx); drop(server);
+            let mut output = String::new();
+            client.read_to_string(&mut output).unwrap();
+            assert!(output.find("event: ping").expect("Upstream keep-alive must reach Claude") < output.find("content_block_delta").unwrap());
+        }
+    }
+
+    #[test]
+    fn tool_search_definitions_reach_each_translated_provider() {
+        let req = json!({"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}},{"name":"Unused","defer_loading":true,"input_schema":{"type":"object"}}],
+            "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"search_1","name":"ToolSearch","input":{"query":"select:Read"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"search_1","content":[{"type":"tool_reference","tool_name":"Read"}]}]},
+                {"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"Read","input_schema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}}}}]}]});
+        let original = req.clone();
+        let openai = response_tools(&req, false);
+        assert_eq!(openai.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        assert_eq!(openai[1]["parameters"]["properties"]["path"]["type"], "string");
+        let google = declarations(&req);
+        assert_eq!(google.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        let ollama = crate::ollama::chat_body(&req, "model", true);
+        assert_eq!(ollama["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        let outputs = response_input(&req, false);
+        assert!(outputs.iter().any(|t| t["type"] == "function_call_output" && t["output"].as_str().unwrap_or("").contains("Read")));
+        let names = HashMap::from([("search_1".to_string(), "ToolSearch".to_string())]);
+        assert!(function_response(&req["messages"][1]["content"][0], &names, "gemini")["functionResponse"]["response"]["output"].as_str().unwrap().contains("Read"));
+        assert!(ollama["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool" && m["content"].as_str().unwrap_or("").contains("Read")));
+        assert_eq!(req, original, "official forwarding keeps the original request");
+    }
+
+    #[test]
+    fn muse_native_heartbeat_precedes_content_with_valid_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let sigs = Mutex::new(HashMap::new());
+        let input = b"data: {\"ccat_ping\":true}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let mut tx = Tx::new("muse-chat", "asked", Some(&mut server), &sigs);
+        assert!(tx.run_openai_chat(Box::new(io::Cursor::new(input.to_vec())), "MuseAI").is_ok());
+        drop(tx); drop(server);
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        assert!(output.starts_with("HTTP/1.1 200 OK\r\n"));
+        let ping = output.find("event: ping").expect("Native heartbeat must reach client to detect disconnection");
+        assert!(ping < output.find("content_block_delta").unwrap());
+    }
 
     pub static FAKE_API: Mutex<Option<String>> = Mutex::new(None);
 
@@ -3177,7 +3589,7 @@ be brief" }, { "type": "text", "text": " " }],
     #[test]
     #[ignore = "uses your real Antigravity account from the ccat config"]
     fn live_counts_and_caching_match_google() {
-        let (cfg, _) = crate::load();
+        let cfg = crate::tests::live_config();
         let p = cfg.providers.iter().find(|p| p.antigravity && !p.accounts.is_empty()).expect("an Antigravity provider with an account in the ccat config");
         let proxy = start(p.accounts.clone(), Vec::new(), Vec::new(), Vec::new(), std::env::temp_dir()).unwrap();
         // Big enough (~5k tokens) for Gemini's implicit cache, which skips short prompts.
@@ -3319,5 +3731,172 @@ be brief" }, { "type": "text", "text": " " }],
         assert!(out.contains("Saved"), "MCP tool result should reach the model.\n{out}\n{:?}", seen.lock().unwrap());
         assert!(dir.join("out/cat.png").exists(), "image saved in the launch folder");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openai_chat_text_and_thinking_streams() {
+        let sigs = Mutex::new(HashMap::new());
+        let mut tx = Tx::new("llama3.2", "claude-sonnet-5-5", None, &sigs);
+        let sse = "\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"reasoning_content\":\"reason step 1\\n\"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"<think>reason step 2</think>Hello \"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"world!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":8}}\n\
+data: [DONE]\n\n";
+
+        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(sse.as_bytes()));
+        tx.run_openai_chat(reader, "Ollama").unwrap();
+        let msg = tx.message();
+        assert_eq!(msg["stop_reason"], "end_turn");
+        let content = msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "reason step 1\nreason step 2");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "Hello world!");
+        assert_eq!(tx.usage.0, 15);
+        assert_eq!(tx.usage.2, 8);
+    }
+
+    #[test]
+    fn openai_chat_tool_calls_stream() {
+        let sigs = Mutex::new(HashMap::new());
+        let mut tx = Tx::new("qwen2.5-coder:32b", "claude-sonnet-5-5", None, &sigs);
+        let sse = "\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_99\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\": \"}}]},\"finish_reason\":null}]}\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+data: [DONE]\n\n";
+
+        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(sse.as_bytes()));
+        tx.run_openai_chat(reader, "Ollama").unwrap();
+        let msg = tx.message();
+        assert_eq!(msg["stop_reason"], "tool_use");
+        let content = msg["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_99");
+        assert_eq!(content[0]["name"], "Bash");
+        assert_eq!(content[0]["input"], json!({ "command": "ls" }));
+    }
+
+    #[test]
+    fn ollama_proxy_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push(body);
+                let text = "\
+HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello from Ollama\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5}}\n\
+data: [DONE]\n\n";
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+
+        let routes = vec![Route {
+            tier: "sonnet",
+            names: vec!["claude-sonnet-5-5".into()],
+            upstream: Upstream::Ollama { url: url.clone(), key: String::new() },
+            model: "qwen2.5-coder:32b".into(),
+            fallbacks: Vec::new(),
+        }];
+        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
+        let req = json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Hello from Ollama"));
+        assert!(body.contains("message_stop"));
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent["model"], "qwen2.5-coder:32b");
+        assert_eq!(sent["options"]["num_ctx"], 65536, "Ollama num_ctx configured");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    #[ignore = "uses the real Claude CLI and signed-in Muse account"]
+    fn live_claude_code_muse_greeting_and_tool_search() {
+        let dir = std::env::temp_dir().join(format!("ccat-muse-cli-{}", antigravity::random_hex(8)));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}"#).unwrap();
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &[]), vec![route("haiku", &["claude-haiku-5-5"], Upstream::MuseAI { url: crate::museai::DEFAULT_URL.into(), key: String::new() }, "muse-chat")], dir.clone()).unwrap();
+        let mut settings = crate::claude_settings(&serde_json::Map::new(), &[("ANTHROPIC_BASE_URL", proxy.url.clone())]);
+        settings["env"]["ENABLE_TOOL_SEARCH"] = json!("true");
+        let mut cmd = std::process::Command::new("claude");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            if name.starts_with("CLAUDE") || name.starts_with("ANTHROPIC") { cmd.env_remove(key); }
+        }
+        let out = cmd.current_dir(&dir)
+            .args(["-p", "Call the client tool ToolSearch with arguments {\"query\":\"select:WebSearch\",\"max_results\":1}. For this first step reply ONLY with the JSON tool_calls object. After the client returns the actual tool result, reply with exactly CCAT_TOOL_SEARCH_OK. Do not perform a web search.", "--model", "claude-haiku-5-5", "--output-format", "json", "--no-session-persistence", "--setting-sources", "project", "--settings"])
+            .arg(settings.to_string()).args(["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"])
+            .env("ANTHROPIC_BASE_URL", &proxy.url).env("ANTHROPIC_CUSTOM_HEADERS", format!("x-ccat-token: {}", proxy.token))
+            .env("API_TIMEOUT_MS", "60000").output().expect("claude on PATH");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result: Value = serde_json::from_str(stdout.lines().rfind(|line| line.starts_with('{')).unwrap_or("{}")).unwrap();
+        assert!(out.status.success() && result["is_error"] == false, "Claude CLI failed: {stdout} {}", String::from_utf8_lossy(&out.stderr));
+        assert!(result["result"].as_str().unwrap_or("").contains("CCAT_TOOL_SEARCH_OK"), "Claude CLI must receive Muse's answer: {stdout}");
+        assert!(result["num_turns"].as_u64().unwrap_or(0) >= 2, "ToolSearch must complete a client-tool follow-up: {stdout}");
+    }
+
+    #[test]
+    fn muse_proxy_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push(body);
+                let text = "\
+HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello from MuseAI\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":6}}\n\
+data: [DONE]\n\n";
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+
+        let routes = vec![Route {
+            tier: "sonnet",
+            names: vec!["claude-sonnet-5-5".into()],
+            upstream: Upstream::MuseAI { url: url.clone(), key: String::new() },
+            model: "muse-chat".into(),
+            fallbacks: Vec::new(),
+        }];
+        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
+        let req = json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{ "role": "user", "content": "hello muse" }],
+            "stream": true
+        });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Hello from MuseAI"));
+        assert!(body.contains("message_stop"));
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent["model"], "muse-chat");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"], "hello muse");
     }
 }

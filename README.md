@@ -71,6 +71,8 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 | **Claude** (official)                      | Your normal Claude Code login. A tier left at Claude with Claude Code's pick changes nothing; all four there is plain `claude`.                                                                                     |
 | **Google Antigravity**                     | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs.            |
 | **ChatGPT**                                | Your ChatGPT Plus/Pro plan behind Claude Code: the GPT models Codex uses, signed in the way Codex signs in. See [ChatGPT](#chatgpt) and [ccat vs Codex](#ccat-vs-codex).                                         |
+| **Ollama**                                 | Run local models (Qwen, Llama, DeepSeek) through Ollama. ccat translates Anthropic Messages to Ollama's OpenAI Chat Completions API with 64k context and thinking/tool support. No API key needed.            |
+| **MuseAI**                                 | Sign in with your MuseAI account in Chrome (the **+** under **Settings → Providers → MuseAI**). ccat bridges Anthropic Messages to Meta's Hatch VM Gateway with session isolation and streaming tool support. |
 | **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. |
 
 Providers are connections: add, rename, turn off and delete them in **Settings → Providers** (or **Config** in the launcher), then pick `provider / model` for each tier in the launcher. With every tier on Claude and no fallback, ccat runs plain `claude`, straight to Anthropic; anything else goes through the local proxy, which is what lets a session switch models and fall back while it runs.
@@ -107,6 +109,31 @@ What Codex (the CLI / app) offers on a ChatGPT plan, and where ccat stands on ea
 | Mixing with Claude, Gemini, others |          ❌          |          ✅          | One tier on GPT, another on Claude or Antigravity, switchable while a session runs       |
 
 ✅ supported · ➖ covered differently by Claude Code · ❌ not supported
+
+## MuseAI Support Matrix
+
+MuseAI runs inside ccat using native Rust HTTPS, Noise WebSocket encryption and Protobuf transport to Meta's Hatch VM Gateway. No Python runtime or local gateway process is started. Existing `http://127.0.0.1:18615` configurations select this native transport; custom remote gateway URLs still work.
+
+### Capability Matrix
+
+| Capability | Priority | ccat Status | Technical Implementation & Notes |
+| :--- | :---: | :---: | :--- |
+| **Local tool call loop & multiturn** | P0 | ✅ Verified adapter loop | Prompt-based tool emulation, with declared names and argument schemas validated before returning calls to the client. Live native tool-call → client result → final answer verified; this is not upstream structured tool support. |
+| **Streaming & cancellation** | P0 | ➖ Buffered response | History polling returns the completed answer over SSE with heartbeats, not token streaming. Each request has an isolated session, cleaned up on completion or cancellation. Live reader-drop cancellation verified. |
+| **Quota display & tray dial** | P0 | ➖ Cached data | Reads existing `~/.config/muse-cli/usage.json`. The native gateway does not refresh that cache; displayed usage may be stale. |
+| **Model selection & tier routing** | P1 | ✅ Supported | Supported as a first-class built-in provider in `ccat` routing tiers with fallback support. Default model: `muse-chat`. |
+| **Image input (code screenshots)** | P1 | ➖ Planned | Vision payload mapping planned for compiler error and UI screenshot analysis. |
+| **Web search & citations** | P1 | ➖ Planned | Native search controls and source attribution planned for future updates. |
+| **Account auth & concurrency** | P1 | ✅ Supported | One-click browser sign-in via dedicated Chrome window (**+** in Providers); stores validated session in `~/.config/muse-cli/cookies.txt`. |
+| **Image & video generation** | Deferred | Out of scope | Low priority for core coding workflows; focused on coding agent loops. |
+
+### Technical Architecture
+- **Native gateway**: `src/museai/native.rs` owns HTTPS authentication and each Noise connection. Chat does not spawn Python or Chromium. Protocol attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
+- **GUI Management**: Providers view offers a one-click **+** sign-in action in Chrome with automatic account discovery, session validation, and model refresh.
+
+Unit-test builds store ccat configuration under a process-specific temporary directory, including launcher shutdown saves. They never save test profiles to the installed app's configuration. Live Muse checks are opt-in: `cargo test live_native_ -- --ignored --test-threads=1`. These checks use the existing Muse login, spend a few requests and delete their temporary remote sessions.
+
+Claude Code's `ENABLE_TOOL_SEARCH=true` loads tools on demand. ccat resolves discovered tool definitions for MuseAI, ChatGPT, Antigravity and Ollama, preserving their schemas and tool results. Official Claude requests are forwarded unchanged. Setting tool search to `false` loads every MCP definition upfront and can substantially increase context size.
 
 ## Install
 

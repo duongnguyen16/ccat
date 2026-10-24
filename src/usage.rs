@@ -33,7 +33,7 @@ fn reload_all() {
         crate::chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
     }
     let _ = crate::save(&cfg, &loaded);
-    refresh(true, true, true);
+    refresh(true, true, true, true, true);
 }
 /// How often the tray refreshes: the reference monitor's cadence, gentle on `/api/oauth/usage`'s rate limit.
 const POLL_SECS: u64 = 180;
@@ -55,6 +55,12 @@ pub struct Bar {
     /// One plan's share of a merged row ("Free", "Pro"): bars with the same label and a part sit side by side.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
+    /// When accounts reset at different times: percentage of total quota that resets at `resets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_pct: Option<u8>,
+    /// Provider-supplied reset text when no timestamp is available.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reset_label: String,
 }
 
 impl Bar {
@@ -118,6 +124,13 @@ pub struct Usage {
     pub chatgpt_on: bool,
     /// Google account email → its quota.
     pub antigravity: HashMap<String, Source>,
+    /// Ollama Cloud allowance / balance.
+    pub ollama: Source,
+    pub ollama_on: bool,
+    /// MuseAI plan allowance and extra tokens.
+    pub muse: Source,
+    pub muse_plan: String,
+    pub muse_on: bool,
 }
 
 /// The config, read only: the tray runs unseen, so it must never move a file it can't parse aside as `load` does.
@@ -252,7 +265,8 @@ fn utc_parts(t: u64) -> (u16, u16, u16) {
 }
 
 /// "Resets in 3h 30m (22:00)" within a day, "Resets on Fri, 10:00" within 6 days, "Resets on 30/10, 10:00" beyond.
-pub fn reset_text(resets: u64, now: u64) -> String {
+/// When accounts reset at different times, specifies the fraction freed: "{pct}% free in ...".
+pub fn reset_text(resets: u64, now: u64, pct: Option<u8>) -> String {
     if resets == 0 {
         return "Starts when used".into();
     }
@@ -261,14 +275,18 @@ pub fn reset_text(resets: u64, now: u64) -> String {
     }
     let left = resets - now;
     let (wd, h, m) = local(resets);
+    let (in_prefix, on_prefix) = match pct {
+        Some(p) => (format!("{p}% free in "), format!("{p}% free on ")),
+        None => ("Resets in ".into(), "Resets on ".into()),
+    };
     if left < 86_400 {
-        format!("Resets in {}h {}m ({h:02}:{m:02})", left / 3600, left % 3600 / 60)
+        format!("{in_prefix}{}h {}m ({h:02}:{m:02})", left / 3600, left % 3600 / 60)
     } else if left >= 6 * 86_400 {
         let (_, mo, d) = local_date(resets);
-        format!("Resets on {d:02}/{mo:02}, {h:02}:{m:02}")
+        format!("{on_prefix}{d:02}/{mo:02}, {h:02}:{m:02}")
     } else {
         let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][wd as usize % 7];
-        format!("Resets on {day}, {h:02}:{m:02}")
+        format!("{on_prefix}{day}, {h:02}:{m:02}")
     }
 }
 
@@ -286,7 +304,7 @@ fn claude_login() -> Option<Result<(String, String), String>> {
     Some(if expired { Err(format!("{plan}|Login expired: start Claude Code to refresh it.")) } else { Ok((token, plan)) })
 }
 
-fn dirs_home() -> PathBuf {
+pub(crate) fn dirs_home() -> PathBuf {
     PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap_or_default())
 }
 
@@ -435,6 +453,37 @@ fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (String, u64
     Err(last)
 }
 
+// ---------------------------------------------------------------- MuseAI
+
+fn parse_muse(v: &Value) -> (String, Vec<Bar>) {
+    let obs = v.get("observedState").or_else(|| v.get("sourceAnalysis").and_then(|s| s.get("observedState"))).unwrap_or(v);
+    let plan = obs["tier"].as_str().unwrap_or("Free plan").to_string();
+    let reset = obs["resetDisplayString"].as_str().unwrap_or("");
+    let reset = reset.strip_prefix("Weekly limit resets ").map(|s| format!("Resets {s}")).unwrap_or_else(|| reset.into());
+    (plan, vec![
+        Bar { label: "Weekly (7 day)".into(), used: obs["weeklyUsagePercent"].as_f64().unwrap_or(0.0), window: WEEK, reset_label: reset, ..Default::default() },
+        Bar { label: "Additional tokens".into(), used: obs["additionalTokensUsagePercent"].as_f64().unwrap_or(0.0), reset_label: obs["additionalTokensExpiration"].as_str().unwrap_or("").into(), ..Default::default() },
+    ])
+}
+
+/// Reads MuseAI quota and reset text from the existing local session cache.
+fn fetch_muse(_p: &crate::Provider) -> Result<(String, Vec<Bar>), String> {
+    // Read synced live usage from ~/.config/muse-cli/usage.json
+    let usage_path = dirs_home().join(".config").join("muse-cli").join("usage.json");
+    if let Ok(content) = fs::read_to_string(&usage_path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&content) {
+            return Ok(parse_muse(&v));
+        }
+    }
+
+    let cookie_file = dirs_home().join(".config").join("muse-cli").join("cookies.txt");
+    if !cookie_file.exists() {
+        return Err("No MuseAI account found. Use + in Settings → Providers to sign in.".into());
+    }
+
+    Err("Usage not yet synced. Sign in via + in Providers or run a query.".into())
+}
+
 // ---------------------------------------------------------------- Antigravity
 
 /// Bars from `retrieveUserQuotaSummary`: per group (Gemini, Claude & GPT), its 5-hour and weekly buckets.
@@ -487,20 +536,36 @@ pub fn ag_bars(sources: &[(&antigravity::Account, &Source)], group: &str) -> Vec
         }
         // (5-hour, weekly, plan rank) per account
         let each: Vec<_> = sources.iter().map(|(a, s)| (find(s, g, FIVE_HOURS), find(s, g, WEEK), antigravity::rank(&a.plan))).collect();
-        // The average use and the soonest reset.
+        // The average use, soonest reset, and percentage that resets if accounts differ.
         let avg = |bars: Vec<&Bar>| {
-            (!bars.is_empty()).then(|| (bars.iter().map(|b| b.used).sum::<f64>() / bars.len() as f64, bars.iter().map(|b| b.resets).filter(|r| *r > 0).min().unwrap_or(0)))
+            if bars.is_empty() {
+                return None;
+            }
+            let used = bars.iter().map(|b| b.used).sum::<f64>() / bars.len() as f64;
+            let active: Vec<u64> = bars.iter().map(|b| b.resets).filter(|r| *r > 0).collect();
+            let resets = active.iter().copied().min().unwrap_or(0);
+            let reset_pct = if resets > 0 && bars.len() > 1 {
+                let matching = bars.iter().filter(|b| b.resets > 0 && b.resets.saturating_sub(resets) <= 600).count();
+                if matching < bars.len() {
+                    Some(((matching as f64 / bars.len() as f64) * 100.0).round() as u8)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some((used, resets, reset_pct))
         };
-        if let Some((used, resets)) = avg(each.iter().filter(|e| !e.1.is_some_and(Bar::out)).filter_map(|e| e.0).collect()) {
-            out.push(Bar { label: label("Session (5hr)"), used, resets, window: FIVE_HOURS, part: String::new() });
+        if let Some((used, resets, reset_pct)) = avg(each.iter().filter(|e| !e.1.is_some_and(Bar::out)).filter_map(|e| e.0).collect()) {
+            out.push(Bar { label: label("Session (5hr)"), used, resets, window: FIVE_HOURS, part: String::new(), reset_pct, ..Default::default() });
         }
         let mut ranks: Vec<u8> = each.iter().filter(|e| e.1.is_some()).map(|e| e.2).collect();
         ranks.sort();
         ranks.dedup();
         for r in &ranks {
-            if let Some((used, resets)) = avg(each.iter().filter(|e| e.2 == *r).filter_map(|e| e.1).collect()) {
+            if let Some((used, resets, reset_pct)) = avg(each.iter().filter(|e| e.2 == *r).filter_map(|e| e.1).collect()) {
                 let part = if ranks.len() > 1 { ["Free", "Other", "Plus", "Pro", "Ultra"][*r as usize].to_string() } else { String::new() };
-                out.push(Bar { label: label("Weekly (7 day)"), used, resets, window: WEEK, part });
+                out.push(Bar { label: label("Weekly (7 day)"), used, resets, window: WEEK, part, reset_pct, ..Default::default() });
             }
         }
     }
@@ -528,13 +593,19 @@ fn tidy(bars: &[Bar], models: bool) -> Vec<Bar> {
 
 // ---------------------------------------------------------------- refresh
 
+/// Whether Ollama is configured with an API key and enabled in settings.
+pub fn ollama_active(cfg: &crate::Config) -> bool {
+    cfg.providers.iter().any(|p| p.ollama && !p.disabled && !p.key.trim().is_empty())
+}
+
 fn due(s: &Source, force: bool, now: u64) -> bool {
     now >= s.not_before && now.saturating_sub(s.fetched) >= if force { RELOAD_SECS } else { POLL_SECS }
 }
 
 /// Fetches whatever is due (`force` = a reload click: due after `RELOAD_SECS` instead of `POLL_SECS`; a 429's wait
+/// Fetches whatever is due (`force` = a reload click: due after `RELOAD_SECS` instead of `POLL_SECS`; a 429's wait
 /// always holds), then saves. Errors stay with their own source.
-pub fn refresh(force_claude: bool, force_ag: bool, force_gpt: bool) -> Usage {
+pub fn refresh(force_claude: bool, force_ag: bool, force_gpt: bool, force_ollama: bool, force_muse: bool) -> Usage {
     let cfg = read_config();
     let accounts: Vec<antigravity::Account> = cfg.providers.iter().filter(|p| p.antigravity).flat_map(|p| p.accounts.clone()).collect();
     let mut u = load_usage();
@@ -578,6 +649,32 @@ pub fn refresh(force_claude: bool, force_ag: bool, force_gpt: bool) -> Usage {
             Err(e) => s.error = e,
         }
     }
+    let ol_active = ollama_active(&cfg);
+    u.ollama_on = ol_active;
+    if !ol_active {
+        u.ollama = Source::default();
+    } else if let Some(ol) = cfg.providers.iter().find(|p| p.ollama && !p.disabled && !p.key.trim().is_empty()) {
+        if due(&u.ollama, force_ollama, t) {
+            u.ollama.fetched = t;
+            match crate::ollama::fetch_balance(&ol.url, &ol.key) {
+                Ok(bars) => (u.ollama.bars, u.ollama.error) = (bars, String::new()),
+                Err(e) => u.ollama.error = e,
+            }
+        }
+    }
+    let muse_configured = cfg.providers.iter().any(|p| p.muse);
+    u.muse_on = muse_configured;
+    if !muse_configured {
+        u.muse = Source::default();
+    } else if let Some(m) = cfg.providers.iter().find(|p| p.muse) {
+        if due(&u.muse, force_muse, t) {
+            u.muse.fetched = t;
+            match fetch_muse(m) {
+                Ok((plan, bars)) => (u.muse_plan, u.muse.bars, u.muse.error) = (plan, bars, String::new()),
+                Err(e) => u.muse.error = e,
+            }
+        }
+    }
     save_usage(&u);
     u
 }
@@ -597,16 +694,20 @@ pub enum Src {
     Claude,
     ChatGpt,
     Antigravity,
+    Ollama,
+    Muse,
 }
 
 impl Src {
-    const ALL: [Src; 3] = [Src::Claude, Src::ChatGpt, Src::Antigravity];
+    const ALL: [Src; 5] = [Src::Claude, Src::ChatGpt, Src::Antigravity, Src::Ollama, Src::Muse];
 
     fn name(self) -> &'static str {
         match self {
             Src::Claude => "Claude",
             Src::ChatGpt => "ChatGPT",
             Src::Antigravity => "Antigravity",
+            Src::Ollama => "Ollama",
+            Src::Muse => "MuseAI",
         }
     }
 }
@@ -628,14 +729,16 @@ fn ordered(saved: &[String]) -> Vec<Src> {
 }
 
 /// Which sources the applied tiers route to, primary or fallback (endpoints have no usage source).
-fn uses(cfg: &crate::Config) -> [bool; 3] {
-    let mut on = [false; 3];
+fn uses(cfg: &crate::Config) -> [bool; 5] {
+    let mut on = [false; 5];
     for r in &cfg.tiers {
         for name in std::iter::once(&r.provider).chain(r.fallbacks.iter().map(|f| &f.provider)) {
             match cfg.providers.iter().find(|p| p.name == *name) {
                 _ if name.is_empty() => on[0] = true,
                 Some(p) if p.chatgpt => on[1] = true,
                 Some(p) if p.antigravity => on[2] = true,
+                Some(p) if p.ollama => on[3] = true,
+                Some(p) if p.muse => on[4] = true,
                 _ => {}
             }
         }
@@ -645,7 +748,7 @@ fn uses(cfg: &crate::Config) -> [bool; 3] {
 
 /// The sources to show, in the saved order: those set up (`avail`, indexed like `Src::ALL`), narrowed to the
 /// profile's when following it, unless that would leave nothing.
-fn shown(cfg: &crate::Config, mode: crate::ViewMode, avail: [bool; 3]) -> Vec<Src> {
+fn shown(cfg: &crate::Config, mode: crate::ViewMode, avail: [bool; 5]) -> Vec<Src> {
     let mine = uses(cfg);
     let pick = |follow: bool| -> Vec<Src> { ordered(&cfg.source_order).into_iter().filter(|s| avail[*s as usize] && (!follow || mine[*s as usize])).collect() };
     let v = pick(mode == crate::ViewMode::Follow);
@@ -665,6 +768,8 @@ pub fn icon_dials(u: &Usage, shown: &[Src], ag: &[Bar]) -> Vec<Dial> {
         .map(|s| match s {
             Src::Claude => dial(&u.claude),
             Src::ChatGpt => dial(&u.chatgpt),
+            Src::Ollama => dial(&u.ollama),
+            Src::Muse => dial(&u.muse),
             // Antigravity: within a row the plan with the most room (any of them serves those models), across model
             // groups the fullest (each group is different models)
             Src::Antigravity => {
@@ -706,8 +811,8 @@ impl Arc {
     }
 }
 
-/// RGBA pixels of a `size`² tray icon, one part per dial (1–3), each a pie of its 5-hour use inside a ring arc of
-/// its weekly use. One: a full pie in a full ring, filling clockwise from the top. Two: a dial cut across the
+/// RGBA pixels of a `size`² tray icon, one part per dial (1–3), each a pie of its weekly use inside a ring arc of
+/// its 5-hour use. One: a full pie in a full ring, filling clockwise from the top. Two: a dial cut across the
 /// middle, the first above, the second below, both filling from the left. Three: 120° sectors, the first centred
 /// at 12 o'clock, then 4 and 8, each filling clockwise from its start edge. Blank bands separate the parts.
 /// Light taskbar → black ink; orange from 75%, red when used up.
@@ -762,18 +867,18 @@ pub fn icon_pixels(size: u32, dials: &[Dial], light_taskbar: bool, now: u64) -> 
             let (x, y) = (pxx as f32 + 0.5 - c, c - (py as f32 + 0.5));
             let (mut rgb, mut a) = (ink, 0.0f32);
             for (i, dial) in dials.iter().enumerate() {
-                let five = dial.five.as_ref();
-                let track = pie(x, y, starts[i], 1.0) * 80.0 / 255.0;
-                let fill = pie(x, y, starts[i], five.map_or(0.0, |b| b.used as f32 / 100.0));
-                if track + fill > 0.0 {
-                    rgb = if fill > 0.0 { tint(five) } else { ink };
-                    a = fill + (1.0 - fill) * track;
-                }
                 let week = dial.week.as_ref();
-                let track = arcs[i].cover(x, y, 1.0) * 80.0 / 255.0;
-                let fill = arcs[i].cover(x, y, week.map_or(0.0, |b| b.used as f32 / 100.0));
+                let track = pie(x, y, starts[i], 1.0) * 80.0 / 255.0;
+                let fill = pie(x, y, starts[i], week.map_or(0.0, |b| b.used as f32 / 100.0));
                 if track + fill > 0.0 {
                     rgb = if fill > 0.0 { tint(week) } else { ink };
+                    a = fill + (1.0 - fill) * track;
+                }
+                let five = dial.five.as_ref();
+                let track = arcs[i].cover(x, y, 1.0) * 80.0 / 255.0;
+                let fill = arcs[i].cover(x, y, five.map_or(0.0, |b| b.used as f32 / 100.0));
+                if track + fill > 0.0 {
+                    rgb = if fill > 0.0 { tint(five) } else { ink };
                     a = fill + (1.0 - fill) * track;
                 }
             }
@@ -800,6 +905,8 @@ pub fn tooltip(u: &Usage, shown: &[Src], ag: &[Bar]) -> String {
             Src::Claude => &u.claude,
             Src::ChatGpt => &u.chatgpt,
             Src::Antigravity => &ag_src,
+            Src::Ollama => &u.ollama,
+            Src::Muse => &u.muse,
         };
         lines.push(if src.error.is_empty() { format!("{} {}", s.name(), short(&src.bars)) } else { format!("{}: see window", s.name()) });
     }
@@ -1001,7 +1108,7 @@ pub fn run_tray() {
 
     // Fetching happens off the message loop, so the tray stays responsive; results arrive through usage.json.
     std::thread::spawn(|| loop {
-        refresh(false, false, false);
+        refresh(false, false, false, false, false);
         std::thread::sleep(Duration::from_secs(15));
     });
 
@@ -1009,7 +1116,7 @@ pub fn run_tray() {
         let cfg = read_config();
         let accounts: Vec<antigravity::Account> = cfg.providers.iter().filter(|p| p.antigravity).flat_map(|p| p.accounts.clone()).collect();
         let ag = ag_view(u, &accounts, &cfg.usage_view, &cfg.ag_group);
-        let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on, !ag.is_empty()]);
+        let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on, !ag.is_empty(), ollama_active(&cfg), u.muse_on]);
         let size = win::icon_size();
         let icon = Icon::from_rgba(icon_pixels(size, &icon_dials(u, &src, &ag), win::light_taskbar(), now()), size, size).ok();
         (icon, tooltip(u, &src, &ag))
@@ -1249,6 +1356,17 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
     if u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty()) {
         out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
     }
+    if ollama_active(cfg) && (!u.ollama.bars.is_empty() || !u.ollama.error.is_empty()) {
+        out.push(Section { src: Src::Ollama, title: "Ollama", which: 3, bars: u.ollama.bars.clone(), errors: [u.ollama.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.ollama.error.is_empty() });
+    }
+    if u.muse_on && (!u.muse.bars.is_empty() || !u.muse.error.is_empty()) {
+        let mut bars = u.muse.bars.clone();
+        for bar in &mut bars {
+            bar.part.clear();
+            if bar.label.starts_with("Tokens (") { bar.label = "Additional tokens".into(); }
+        }
+        out.push(Section { src: Src::Muse, title: "MuseAI", which: 4, bars, errors: [u.muse.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.muse.error.is_empty() });
+    }
     if !accounts.is_empty() {
         let mine = accounts.iter().filter(|a| cfg.usage_view.is_empty() || a.email == cfg.usage_view);
         let errors = mine.clone().filter_map(|a| u.antigravity.get(&a.email).filter(|s| !s.error.is_empty()).map(|s| format!("{}: {}", alias(&a.email), s.error))).collect();
@@ -1318,14 +1436,14 @@ fn rows(bars: &[Bar]) -> Vec<&[Bar]> {
 
 /// One row: its label, then its bars side by side (one bar: the whole width, its use beside the label; several: a
 /// line under each with its plan and use), each with its reset below.
-fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool) {
+fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool, reset_with_percent: bool) {
     let p = crate::pal(ui);
     let ink = if stale { p.muted } else { p.fg };
     let split = !bars[0].part.is_empty();
     ui.add_space(6.0);
     row(ui, LABEL_H, |ui| {
         ui.label(egui::RichText::new(&bars[0].label).size(13.0).color(ink));
-        if !split {
+        if !split && !reset_with_percent {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{:.0}%", bars[0].used)).size(13.0).color(ink)));
         }
     });
@@ -1368,7 +1486,7 @@ fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool) {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)));
             if !right.is_empty() {
                 child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(right).size(size).color(color));
+                    ui.label(egui::RichText::new(right).size(size).color(ink));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(egui::Label::new(egui::RichText::new(&left).size(size).color(color)).truncate()));
                 });
             } else {
@@ -1380,8 +1498,15 @@ fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool) {
         line(ui, PART_H, &|b: &Bar| (b.part.clone(), format!("{:.0}%", b.used)), 12.0, ink);
     }
     // Narrow columns drop the "Resets" and the clock time: "on Wed, 00:09", "in 3h 0m".
-    let reset = |b: &Bar| if split { reset_text(b.resets, now).replacen("Resets ", "", 1).split(" (").next().unwrap_or("").to_string() } else { reset_text(b.resets, now) };
-    line(ui, RESET_H, &|b: &Bar| (reset(b), String::new()), 11.5, p.subtle);
+    let reset = |b: &Bar| {
+        let text = if !b.reset_label.is_empty() { b.reset_label.clone() } else { reset_text(b.resets, now, b.reset_pct) };
+        if split {
+            text.replacen("Resets ", "", 1).split(" (").next().unwrap_or("").to_string()
+        } else {
+            text
+        }
+    };
+    line(ui, RESET_H, &|b: &Bar| (reset(b), if reset_with_percent { format!("{:.0}%", b.used) } else { String::new() }), 11.5, p.subtle);
 }
 
 // ---------------------------------------------------------------- analytics
@@ -1403,11 +1528,32 @@ fn tokens_path() -> PathBuf {
     crate::config_path().with_file_name("tokens.jsonl")
 }
 
-/// "claude-opus-5-5" → "Claude Opus 5.5", "gpt-6-astra" → "GPT 6 Astra", "gemini-3.8-flash-tiered" → "Gemini 3.8 Flash Tiered".
+fn is_variant_tag(w: &str) -> bool {
+    matches!(w.to_ascii_lowercase().as_str(), "tiered" | "thinking" | "high" | "medium" | "low" | "free")
+}
+
+fn clean_model_name(mut m: &str) -> &str {
+    let m_trim = m.trim().strip_prefix("anthropic/").unwrap_or(m.trim());
+    m = m_trim;
+    loop {
+        let prev = m;
+        for s in [":free", "-free", "-tiered", "-thinking", "-high", "-medium", "-low"] {
+            if let Some(rest) = m.strip_suffix(s) {
+                m = rest;
+            }
+        }
+        if m == prev {
+            break;
+        }
+    }
+    m
+}
+
+/// "claude-opus-5-5" → "Claude Opus 5.5", "gpt-6-astra" → "GPT 6 Astra", "gemini-3.8-flash-tiered" → "Gemini 3.8 Flash".
 pub fn pretty_model(m: &str) -> String {
-    let m = m.trim().strip_prefix("anthropic/").unwrap_or(m.trim());
+    let m = clean_model_name(m);
     if let Some(rest) = m.strip_prefix("claude-") {
-        let parts: Vec<&str> = rest.split('-').collect();
+        let parts: Vec<&str> = rest.split('-').filter(|p| !is_variant_tag(p)).collect();
         let mut res = vec!["Claude".to_string()];
         if parts.first().is_some_and(|p| p.chars().all(|c| c.is_ascii_digit())) {
             let mut ver = Vec::new();
@@ -1455,7 +1601,7 @@ pub fn pretty_model(m: &str) -> String {
         return res.join(" ");
     }
     if let Some(rest) = m.strip_prefix("gpt-") {
-        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty() && !is_variant_tag(p)).collect();
         let mut res = vec!["GPT".to_string()];
         for p in parts {
             if p.starts_with(|c: char| c.is_ascii_digit()) && p.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -1469,7 +1615,7 @@ pub fn pretty_model(m: &str) -> String {
         return res.join(" ");
     }
     if let Some(rest) = m.strip_prefix("gemini-") {
-        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty() && !is_variant_tag(p)).collect();
         let mut res = vec!["Gemini".to_string()];
         for p in parts {
             if p.starts_with(|c: char| c.is_ascii_digit()) && p.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -1481,7 +1627,7 @@ pub fn pretty_model(m: &str) -> String {
         return res.join(" ");
     }
     if let Some(rest) = m.strip_prefix("deepseek-") {
-        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty() && !is_variant_tag(p)).collect();
         let mut res = vec!["DeepSeek".to_string()];
         for p in parts {
             res.push(capitalize_word(p));
@@ -1489,7 +1635,7 @@ pub fn pretty_model(m: &str) -> String {
         return res.join(" ");
     }
     if m.starts_with('o') && m.len() >= 2 && m.as_bytes()[1].is_ascii_digit() {
-        let parts: Vec<&str> = m.split('-').filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = m.split('-').filter(|p| !p.is_empty() && !is_variant_tag(p)).collect();
         let mut res = vec![parts[0].to_uppercase()];
         for p in &parts[1..] {
             res.push(capitalize_word(p));
@@ -1666,28 +1812,83 @@ fn range_span(r: u8, now: u64) -> (u64, u64, usize) {
     }
 }
 
-/// One finished request: (unix time, model, provider, tokens in and out).
-type Call = (u64, String, String, u64);
+/// Model pricing from models.dev: model_id -> [input, output, cache_read, cache_write] in USD per 1M tokens.
+pub type Pricing = HashMap<String, [f64; 4]>;
+
+pub fn pricing_path() -> PathBuf {
+    crate::config_path().with_file_name("pricing.json")
+}
+
+pub fn load_pricing() -> Pricing {
+    fs::read_to_string(pricing_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn fallback_rates(m: &str) -> [f64; 4] {
+    let lower = m.to_ascii_lowercase();
+    if lower.contains("opus") {
+        [15.0, 75.0, 1.5, 18.75]
+    } else if lower.contains("haiku") {
+        [0.80, 4.0, 0.08, 1.0]
+    } else if lower.contains("sonnet") || lower.contains("fable") {
+        [3.0, 15.0, 0.30, 3.75]
+    } else if lower.contains("flash") {
+        [0.15, 0.60, 0.0375, 0.15]
+    } else if lower.contains("gemini") && lower.contains("pro") {
+        [1.25, 5.0, 0.3125, 1.25]
+    } else if lower.contains("gpt-5") || lower.contains("gpt-6") || lower.contains("gpt-4o") {
+        [2.5, 10.0, 1.25, 2.5]
+    } else {
+        [1.0, 3.0, 0.25, 1.0]
+    }
+}
+
+pub fn model_cost(pricing: &Pricing, model: &str, inp: u64, out: u64, cr: u64, cw: u64) -> f64 {
+    let clean = model.trim().strip_suffix("-tiered").or_else(|| model.strip_suffix("-thinking")).unwrap_or(model);
+    let r = pricing.get(clean).copied().or_else(|| pricing.get(model).copied()).unwrap_or_else(|| fallback_rates(clean));
+    (inp as f64 * r[0] + out as f64 * r[1] + cr as f64 * r[2] + cw as f64 * r[3]) / 1_000_000.0
+}
+
+pub fn fmt_cost(v: f64) -> String {
+    if v >= 100.0 {
+        format!("${v:.0}")
+    } else if v >= 10.0 {
+        format!("${v:.1}")
+    } else if v >= 0.05 {
+        format!("${v:.2}")
+    } else if v >= 0.005 {
+        format!("${v:.3}")
+    } else if v > 0.0 {
+        format!("${v:.4}")
+    } else {
+        "$0.00".to_string()
+    }
+}
+
+/// One finished request: (unix time, model, provider, tokens in and out, cost in USD).
+type Call = (u64, String, String, u64, f64);
 
 /// The proxy's requests since `since`, oldest first.
-fn load_calls(text: &str, since: u64) -> Vec<Call> {
+fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
     let mut calls: Vec<Call> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter_map(|v| {
             let t = v["t"].as_u64().filter(|t| *t >= since)?;
             let n = |k: &str| v[k].as_u64().unwrap_or(0);
-            let tokens = n("input") + n("cache_read") + n("cache_write") + n("output");
-            Some((t, pretty_model(v["model"].as_str().unwrap_or("?")), v["provider"].as_str().unwrap_or("?").to_string(), tokens))
+            let (inp, out, cr, cw) = (n("input"), n("output"), n("cache_read"), n("cache_write"));
+            let tokens = inp + cr + cw + out;
+            let m_raw = v["model"].as_str().unwrap_or("?");
+            let cost = model_cost(pricing, m_raw, inp, out, cr, cw);
+            Some((t, pretty_model(m_raw), v["provider"].as_str().unwrap_or("?").to_string(), tokens, cost))
         })
         .collect();
     calls.sort_by_key(|c| c.0);
     calls
 }
 
-/// Per key ("Total", or each model, or each provider: `by` 0, 1, 2), its calls or tokens per bucket of `span`, running
+/// Per key ("Total", or each model, or each provider: `by` 0, 1, 2), its tokens, calls, or cost per bucket of `span`, running
 /// totals if `cumulative`. Keys biggest first.
-fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, tokens: bool, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
+fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
     let (start, w, n) = span;
     let key = |c: &Call| match by {
         1 => c.1.clone(),
@@ -1697,7 +1898,11 @@ fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, tokens: bool, cu
     let mut keys: Vec<(String, f64)> = Vec::new();
     let mut cells: Vec<(usize, String, f64)> = Vec::new();
     for c in calls.iter().filter(|c| c.0 >= start && c.0 < start + w * n as u64) {
-        let (k, v) = (key(c), if tokens { c.3 as f64 } else { 1.0 });
+        let (k, v) = (key(c), match metric {
+            1 => 1.0,
+            2 => c.4,
+            _ => c.3 as f64,
+        });
         match keys.iter_mut().find(|x| x.0 == k) {
             Some(x) => x.1 += v,
             None => keys.push((k.clone(), v)),
@@ -1724,26 +1929,34 @@ fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, tokens: bool, cu
 
 /// One translucent area and line per key, each from zero so they overlap, up to now; Recently slides left with the clock. The scale eases to new heights,
 /// and a key with a request finished in the last minute pulses at its edge and reads "running".
-fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool, cumulative: bool) {
+fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, cumulative: bool) {
     let p = crate::pal(ui);
     let exact = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let now = exact as u64;
     let span @ (start, w, n) = range_span(range, now);
-    let (names, series) = live_series(calls, span, by, tokens, cumulative);
+    let (names, series) = live_series(calls, span, by, metric, cumulative);
     let cur = (now.saturating_sub(start) / w).min(n as u64 - 1) as usize;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 170.0), egui::Sense::hover());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(38.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
     // Each key from zero, overlapping: the scale is the highest single one.
-    let max = series.iter().flat_map(|s| &s[..=cur]).cloned().fold(0.0, f64::max).max(if tokens { 1000.0 } else { 4.0 });
+    let max = series.iter().flat_map(|s| &s[..=cur]).cloned().fold(0.0, f64::max).max(match metric {
+        1 => 4.0,
+        2 => 0.05,
+        _ => 1000.0,
+    });
     // A round step: 1, 2 or 5 × 10^n, about four lines high.
     let raw = max / 4.0;
     let mag = 10f64.powf(raw.log10().floor());
     let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(raw);
     let target = (max / step).ceil() * step;
-    let top = ui.ctx().animate_value_with_time(egui::Id::new(("live-top", range, by, tokens, cumulative)), target as f32, 0.35).max(1.0) as f64;
+    let top = ui.ctx().animate_value_with_time(egui::Id::new(("live-top", range, by, metric, cumulative)), target as f32, 0.35).max(if metric == 2 { 0.005 } else { 1.0 }) as f64;
     let pt = ui.painter_at(rect);
     let y_of = |v: f64| plot.bottom() - (v / top).min(1.05) as f32 * plot.height();
-    let fmt = |v: f64| if tokens { fmt_tokens(v) } else { format!("{v:.0}") };
+    let fmt = |v: f64| match metric {
+        0 => fmt_tokens(v),
+        1 => format!("{v:.0}"),
+        _ => fmt_cost(v),
+    };
     let mut v = 0.0;
     while v <= top + step * 0.01 {
         let y = y_of(v);
@@ -1839,7 +2052,10 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, tokens: bool
         });
     }
     ui.add_space(6.0);
-    let unit = if tokens { "" } else { " calls" };
+    let unit = match metric {
+        1 => " calls",
+        _ => "",
+    };
     for (i, name) in names.iter().enumerate() {
         let total = if cumulative { series[i][cur] } else { series[i].iter().sum() };
         row(ui, 20.0, |ui| {
@@ -1887,25 +2103,49 @@ enum Tab {
 }
 
 /// A row of options in a sunken track, the chosen one raised. Returns whether the choice changed.
-fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+pub(super) fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+    segmented_layout(ui, cur, items, false)
+}
+
+pub(super) fn segmented_full_width<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+    segmented_layout(ui, cur, items, true)
+}
+
+fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)], full_width: bool) -> bool {
+    if items.is_empty() {
+        return false;
+    }
     let p = crate::pal(ui);
     let font = egui::FontId::proportional(11.5);
-    let galleys: Vec<_> = items.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.fg)).collect();
-    let pad = 9.0;
-    let w: f32 = galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 4.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::hover());
+    let pad = if full_width { 6.0 } else { 9.0 };
+    let cell = (ui.available_width() - 4.0) / items.len() as f32;
+    let multiline = items.iter().any(|(_, t)| t.contains('\n'));
+    let natural: Vec<_> = items.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.fg).size().x).collect();
+    let scale = ((ui.available_width() - 4.0) / natural.iter().map(|w| w + 18.0).sum::<f32>()).min(1.0);
+    let galleys: Vec<_> = items.iter().zip(natural).map(|((_, t), width)| {
+        let width = if full_width { (cell - 2.0 * pad).max(1.0) } else if multiline { ((width + 18.0) * scale - 18.0).max(1.0) } else { f32::INFINITY };
+        let mut job = egui::text::LayoutJob::simple(t.to_string(), font.clone(), p.fg, width);
+        job.halign = egui::Align::Center;
+        job.wrap.max_rows = 2;
+        ui.painter().layout_job(job)
+    }).collect();
+    let w = if full_width { ui.available_width() } else { galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 4.0 };
+    let h = galleys.iter().map(|g| g.size().y + 8.0).fold(24.0, f32::max);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     ui.painter().rect_filled(rect, 6.0, p.sunken);
     let mut x = rect.left() + 2.0;
     let mut changed = false;
-    for ((v, _), g) in items.iter().zip(galleys) {
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), egui::vec2(g.size().x + 2.0 * pad, rect.height() - 4.0));
+    for ((v, text), g) in items.iter().zip(galleys) {
+        let width = if full_width { cell } else { g.size().x + 2.0 * pad };
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), egui::vec2(width, rect.height() - 4.0));
         let resp = ui.interact(seg, ui.id().with(("seg", x as i32)), egui::Sense::click());
         let on = *cur == *v;
-        if on {
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, *text));
+        if on || resp.has_focus() {
             ui.painter().rect_filled(seg, 5.0, p.hover);
         }
         let color = if on || resp.hovered() { p.fg } else { p.muted };
-        ui.painter().galley_with_override_text_color(seg.center() - g.size() / 2.0, g, color);
+        ui.painter().galley_with_override_text_color(seg.center() - g.rect.center().to_vec2(), g, color);
         if resp.clicked() && !on {
             *cur = *v;
             changed = true;
@@ -1949,7 +2189,7 @@ fn label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// The bottom of Settings: which usage sources the Usage tab and the tray dial show, and in what order.
-fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
+pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
     use crate::ViewMode::{All, Follow};
     let p = crate::pal(ui);
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -2017,7 +2257,7 @@ struct Popup {
     usage: Usage,
     stamp: Option<std::time::SystemTime>,
     claude: bool,
-    busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; 3],
+    busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; Src::ALL.len()],
     anchor: (f32, f32, f32),
     focused_once: bool,
     /// The window's fade-in is off (done on the first frame, before eframe shows it).
@@ -2031,8 +2271,8 @@ struct Popup {
     /// What running sessions report (see `live`), read at most once a second; the height of the notes it gives.
     live: Option<(std::time::Instant, HashMap<String, crate::live::Tier>)>,
     notes_h: f32,
-    /// Analytics → Live: the requests read and the file stamp they were read at.
-    calls: Option<(Vec<Call>, Option<std::time::SystemTime>)>,
+    /// Analytics → Live: the requests read and the file stamp they were read at, plus pricing stamp.
+    calls: Option<(Vec<Call>, Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
     stats: Option<(Stats, bool, Option<std::time::SystemTime>)>,
     more: bool,
     /// Content height measured last frame, for the tabs whose height isn't known up front.
@@ -2042,15 +2282,15 @@ struct Popup {
 }
 
 impl Popup {
-    /// A refresh in the background; `which` 0 = Claude, 1 = Antigravity, 2 = ChatGPT, 3 = whatever is due (on opening).
+    /// A refresh in the background; `which` < Src::ALL.len() = specific source, or Src::ALL.len() for all due on opening.
     fn reload(&self, which: usize, ctx: &egui::Context) {
-        let flag = (which < 3).then(|| self.busy[which].clone());
+        let flag = (which < Src::ALL.len()).then(|| self.busy[which].clone());
         if flag.as_ref().is_some_and(|f| f.swap(true, std::sync::atomic::Ordering::SeqCst)) {
             return;
         }
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            refresh(which == 0, which == 1, which == 2);
+            refresh(which == 0, which == 1, which == 2, which == 3, which == 4);
             if let Some(f) = flag {
                 f.store(false, std::sync::atomic::Ordering::SeqCst);
             }
@@ -2087,8 +2327,11 @@ impl Popup {
             .iter()
             .map(|s| match s.which {
                 0 => self.usage.claude.fetched,
+                1 => accounts.iter().filter_map(|a| self.usage.antigravity.get(&a.email)).map(|x| x.fetched).max().unwrap_or(0),
                 2 => self.usage.chatgpt.fetched,
-                _ => accounts.iter().filter_map(|a| self.usage.antigravity.get(&a.email)).map(|x| x.fetched).max().unwrap_or(0),
+                3 => self.usage.ollama.fetched,
+                4 => self.usage.muse.fetched,
+                _ => 0,
             })
             .collect();
         for (n, s) in blocks.iter().enumerate() {
@@ -2121,8 +2364,14 @@ impl Popup {
                         *reload = Some(s.which);
                     }
                     if s.which != 1 {
-                        let plan = if s.which == 0 { &self.usage.plan } else { &self.usage.chatgpt_plan };
-                        ui.label(egui::RichText::new(plan).monospace().size(11.5).color(p.muted));
+                        let plan = match s.which {
+                            0 => &self.usage.plan,
+                            2 => &self.usage.chatgpt_plan,
+                            _ => "",
+                        };
+                        if !plan.is_empty() {
+                            ui.label(egui::RichText::new(plan).monospace().size(11.5).color(p.muted));
+                        }
                     } else {
                         let before = self.cfg.usage_view.clone();
                         let view = &mut self.cfg.usage_view;
@@ -2170,7 +2419,7 @@ impl Popup {
                 row(ui, ERROR_H, |ui| ui.add(egui::Label::new(egui::RichText::new(e.replace(['\n', '\r'], " ")).size(12.0).color(p.danger)).truncate()).on_hover_text(e));
             }
             for r in rows(&s.bars) {
-                bar_row(ui, r, now, s.stale);
+                bar_row(ui, r, now, s.stale, s.src == Src::Muse);
             }
         }
         if blocks.is_empty() {
@@ -2270,17 +2519,19 @@ impl Popup {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::switch(ui, &mut c.live_cumulative, ""));
                     });
                 });
-                segmented(ui, &mut c.live_calls, &[(false, "Tokens"), (true, "Calls")]);
+                segmented(ui, &mut c.live_metric, &[(0, "Tokens"), (1, "Calls"), (2, "Cost")]);
             });
         });
         ui.add_space(8.0);
         let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
-        if self.calls.as_ref().is_none_or(|(_, s)| *s != stamp) {
+        let p_stamp = fs::metadata(pricing_path()).and_then(|m| m.modified()).ok();
+        if self.calls.as_ref().is_none_or(|(_, s, ps)| *s != stamp || *ps != p_stamp) {
             let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-            self.calls = Some((load_calls(&text, now().saturating_sub(8 * 86_400)), stamp));
+            let pricing = load_pricing();
+            self.calls = Some((load_calls(&text, now().saturating_sub(8 * 86_400), &pricing), stamp, p_stamp));
         }
         let c = &self.cfg;
-        live_chart(ui, &self.calls.as_ref().unwrap().0, range as u8, c.live_by, !c.live_calls, c.live_cumulative);
+        live_chart(ui, &self.calls.as_ref().unwrap().0, range as u8, c.live_by, c.live_metric, c.live_cumulative);
         // It moves: about 30 frames a second while it is shown.
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
@@ -2373,7 +2624,7 @@ impl eframe::App for Popup {
         }
 
         let mut reload = None;
-        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, c.fail_on_limit, [c.analytics_view, c.live_range, c.live_by], c.live_calls, c.live_cumulative));
+        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, c.fail_on_limit, [c.analytics_view, c.live_range, c.live_by], c.live_metric, c.live_cumulative));
         let before = snapshot(&self.cfg);
         self.providers.poll(&mut self.cfg);
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
@@ -2479,7 +2730,7 @@ pub fn run_popup(click: (f64, f64)) {
                 measured: h,
                 icon: None,
             };
-            app.reload(3, &cc.egui_ctx);
+            app.reload(Src::ALL.len(), &cc.egui_ctx);
             Ok(Box::new(app))
         }),
     );
@@ -2488,6 +2739,20 @@ pub fn run_popup(click: (f64, f64)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn muse_usage_preserves_reset_text_without_plan_or_balance_rows() {
+        let observed = serde_json::json!({"tier":"Free plan","weeklyUsagePercent":1.0,"resetDisplayString":"Weekly limit resets on Oct 28","additionalTokensBalance":"1B tokens left","additionalTokensUsagePercent":0.0,"additionalTokensExpiration":"Never expires"});
+        for value in [observed.clone(), serde_json::json!({"observedState":observed}), serde_json::json!({"sourceAnalysis":{"observedState":observed}})] {
+            let (plan, bars) = parse_muse(&value);
+            assert_eq!(plan, "Free plan");
+            assert!(bars.iter().all(|bar| bar.part.is_empty()));
+            assert_eq!(bars[0].used, 1.0);
+            assert_eq!(bars[0].reset_label, "Resets on Oct 28");
+            assert_eq!(bars[1].label, "Additional tokens");
+            assert_eq!(bars[1].reset_label, "Never expires");
+        }
+    }
     use serde_json::json;
 
     #[test]
@@ -2499,6 +2764,32 @@ mod tests {
         assert_eq!(img.pixels, [egui::Color32::WHITE, egui::Color32::TRANSPARENT].repeat(2), "no junk bleeds from the transparent side");
         let half = shrink(&[255, 255, 255, 255, 0, 0, 0, 0], 2, 1, 1);
         assert_eq!(half.pixels[0], egui::Color32::from_rgba_premultiplied(128, 128, 128, 128));
+    }
+
+    #[test]
+    fn folder_segments_fill_the_row_and_select_each_third() {
+        let ctx = egui::Context::default();
+        let items = [(0, "Current location\n/project"), (1, "Previous workspace\n/previous"), (2, "Custom")];
+        let mut selected = 0;
+        let mut rect = egui::Rect::NOTHING;
+        let mut draw = |input| {
+            let mut output = ctx.run_ui(input, |ui| {
+                ui.set_width(372.0);
+                rect = ui.scope(|ui| { segmented_full_width(ui, &mut selected, &items); }).response.rect;
+                assert!((rect.width() - 372.0).abs() < 0.1, "the track must keep both margins");
+            });
+            output.textures_delta.clear();
+            (rect, selected)
+        };
+        let (rect, _) = draw(egui::RawInput::default());
+        for i in [1, 2, 0] {
+            let pos = egui::pos2(rect.left() + rect.width() * (i as f32 + 0.5) / 3.0, rect.center().y);
+            let (_, selected) = draw(egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }, egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+                ..Default::default()
+            });
+            assert_eq!(selected, i, "each equal-width third selects its own option");
+        }
     }
 
     #[test]
@@ -2514,11 +2805,20 @@ mod tests {
     #[test]
     fn reset_text_switches_to_a_weekday_after_a_day() {
         let now = 1_792_400_000;
-        assert!(reset_text(now + 3 * 3600 + 30 * 60, now).starts_with("Resets in 3h 30m ("));
-        assert!(reset_text(now + 3 * 86_400, now).starts_with("Resets on "));
-        assert!(reset_text(now + 7 * 86_400, now).contains("/"));
-        assert_eq!(reset_text(0, now), "Starts when used");
+        assert!(reset_text(now + 3 * 3600 + 30 * 60, now, None).starts_with("Resets in 3h 30m ("));
+        assert!(reset_text(now + 3 * 86_400, now, None).starts_with("Resets on "));
+        assert!(reset_text(now + 7 * 86_400, now, None).contains("/"));
+        assert_eq!(reset_text(0, now, None), "Starts when used");
         assert_eq!(utc_parts(0), (4, 0, 0), "1970-01-01 was a Thursday");
+    }
+
+    #[test]
+    fn reset_text_shows_fraction_when_accounts_differ() {
+        let now = 1_792_400_000;
+        assert!(reset_text(now + 3 * 3600 + 30 * 60, now, Some(25)).starts_with("25% free in 3h 30m ("));
+        assert!(reset_text(now + 3 * 86_400, now, Some(25)).starts_with("25% free on "));
+        assert!(reset_text(now + 7 * 86_400, now, Some(25)).contains("25% free on "));
+        assert!(reset_text(now + 7 * 86_400, now, Some(25)).contains("/"));
     }
 
     #[test]
@@ -2612,6 +2912,173 @@ mod tests {
     }
 
     #[test]
+    fn test_ollama_usage_visibility_predicate() {
+        let make_cfg = |provider: Option<crate::Provider>| crate::Config {
+            usage_view_mode: crate::ViewMode::All,
+            tray_mode: crate::ViewMode::All,
+            providers: provider.into_iter().collect(),
+            ..Default::default()
+        };
+        let stale_u = Usage {
+            ollama_on: true,
+            ollama: Source {
+                bars: vec![Bar { label: "Monthly".into(), used: 10.0, window: 0, ..Default::default() }],
+                error: "some error".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 1. Enabled with valid key -> visible in sections and tray availability
+        let cfg_enabled = make_cfg(Some(crate::Provider {
+            name: "Ollama".into(),
+            ollama: true,
+            key: "valid-key-123".into(),
+            disabled: false,
+            ..Default::default()
+        }));
+        assert!(ollama_active(&cfg_enabled));
+        let s_enabled = sections(&cfg_enabled, &stale_u, false);
+        assert!(s_enabled.iter().any(|s| s.src == Src::Ollama), "enabled key should show Ollama");
+        let tray_avail_enabled = shown(&cfg_enabled, cfg_enabled.tray_mode, [false, false, false, ollama_active(&cfg_enabled), false]);
+        assert!(tray_avail_enabled.contains(&Src::Ollama));
+
+        // 2. Disabled provider with non-empty key and stale cache -> hidden
+        let cfg_disabled = make_cfg(Some(crate::Provider {
+            name: "Ollama".into(),
+            ollama: true,
+            key: "valid-key-123".into(),
+            disabled: true,
+            ..Default::default()
+        }));
+        assert!(!ollama_active(&cfg_disabled));
+        let s_disabled = sections(&cfg_disabled, &stale_u, false);
+        assert!(!s_disabled.iter().any(|s| s.src == Src::Ollama), "disabled provider must hide Ollama even with stale cache");
+        let tray_avail_disabled = shown(&cfg_disabled, cfg_disabled.tray_mode, [false, false, false, ollama_active(&cfg_disabled), false]);
+        assert!(!tray_avail_disabled.contains(&Src::Ollama));
+
+        // 3. Enabled but empty or whitespace key with stale cache -> hidden
+        let cfg_empty_key = make_cfg(Some(crate::Provider {
+            name: "Ollama".into(),
+            ollama: true,
+            key: "   ".into(),
+            disabled: false,
+            ..Default::default()
+        }));
+        assert!(!ollama_active(&cfg_empty_key));
+        let s_empty_key = sections(&cfg_empty_key, &stale_u, false);
+        assert!(!s_empty_key.iter().any(|s| s.src == Src::Ollama), "empty/whitespace key must hide Ollama even with stale cache");
+
+        // 4. Absent Ollama provider -> hidden
+        let cfg_absent = make_cfg(None);
+        assert!(!ollama_active(&cfg_absent));
+        let s_absent = sections(&cfg_absent, &stale_u, false);
+        assert!(!s_absent.iter().any(|s| s.src == Src::Ollama), "absent provider must hide Ollama");
+    }
+
+    #[test]
+    fn test_popup_usage_tab_renders_muse_and_ollama() {
+        let cfg = crate::Config {
+            usage_view_mode: crate::ViewMode::All,
+            providers: vec![
+                crate::Provider { name: "MuseAI".into(), muse: true, ..Default::default() },
+                crate::Provider { name: "Ollama".into(), ollama: true, key: "k".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let u = Usage {
+            chatgpt_plan: "ChatGPT Pro".into(),
+            muse_on: true,
+            muse_plan: "Pro plan".into(),
+            muse: Source {
+                bars: vec![
+                    Bar { label: "Weekly (7 day)".into(), used: 15.0, window: WEEK, part: "Pro plan".into(), reset_label: "Resets on Oct 28".into(), ..Default::default() },
+                    Bar { label: "Tokens (1B tokens left)".into(), part: "Extra".into(), reset_label: "Never expires".into(), ..Default::default() },
+                ],
+                fetched: 12345,
+                ..Default::default()
+            },
+            ollama_on: true,
+            ollama: Source {
+                bars: vec![Bar { label: "Monthly".into(), used: 5.0, window: 0, ..Default::default() }],
+                fetched: 67890,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let blocks = sections(&cfg, &u, false);
+        assert!(blocks.iter().any(|b| b.src == Src::Muse));
+        assert!(blocks.iter().any(|b| b.src == Src::Ollama));
+
+        let mut app = Popup {
+            cfg,
+            loaded: serde_json::Value::Null,
+            usage: u,
+            stamp: None,
+            claude: false,
+            busy: Default::default(),
+            anchor: (0.0, 0.0, 0.0),
+            focused_once: false,
+            styled: false,
+            tab: Tab::Usage,
+            sub: Sub::Models,
+            editor: Default::default(),
+            providers: Default::default(),
+            by_model: false,
+            live: None,
+            notes_h: 0.0,
+            calls: None,
+            stats: None,
+            more: false,
+            measured: 300.0,
+            icon: None,
+        };
+
+        let mut reload = None;
+        let ctx = egui::Context::default();
+        crate::setup(&ctx);
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            app.usage_tab(ui, &blocks, &mut reload);
+        });
+
+        // Extract emitted Text galley strings from actual egui render output
+        let mut text_rows = Vec::new();
+        fn extract_from_shape(shape: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos.y)),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        extract_from_shape(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &out.shapes {
+            extract_from_shape(&clipped.shape, &mut text_rows);
+        }
+        out.textures_delta.clear();
+        let text_found: Vec<&str> = text_rows.iter().map(|(text, _)| text.as_str()).collect();
+
+        assert!(!text_found.iter().any(|t| t.contains("Pro plan")), "Muse plan labels must not be rendered: {text_found:?}");
+        assert!(text_found.iter().any(|t| t.contains("Resets on Oct 28")), "Muse must retain its reset date: {text_found:?}");
+        assert!(text_found.contains(&"Additional tokens"));
+        assert!(!text_found.iter().any(|t| *t == "Extra" || t.contains("1B tokens left")));
+        let y = |text: &str| text_rows.iter().find(|(t, _)| t == text).unwrap().1;
+        assert!((y("Resets on Oct 28") - y("15%")).abs() < 1.0, "reset date and percentage must share a row");
+        assert!((y("Never expires") - y("0%")).abs() < 1.0);
+        assert!(!text_found.iter().any(|t| t.contains("ChatGPT Pro")), "Rendered text must NOT map Muse to chatgpt_plan, found: {text_found:?}");
+        assert!(text_found.iter().any(|t| t.contains("MuseAI")), "Rendered text must contain MuseAI title");
+        assert!(text_found.iter().any(|t| t.contains("Ollama")), "Rendered text must contain Ollama title");
+
+        // Verify that app's busy array has capacity for all Src::ALL (no out-of-bounds)
+        assert_eq!(app.busy.len(), Src::ALL.len());
+        assert_eq!(app.usage.muse_plan, "Pro plan");
+        assert_eq!(app.usage.muse.fetched, 12345);
+        assert_eq!(app.usage.ollama.fetched, 67890);
+    }
+
+    #[test]
     fn dial_puts_claude_on_top_and_takes_the_whole_icon_alone() {
         let u = Usage { claude: Source { bars: parse_claude(&json!({ "limits": [
             { "kind": "session", "percent": 39, "resets_at": null }, { "kind": "weekly_all", "percent": 35, "resets_at": null } ] })), ..Default::default() }, ..Default::default() };
@@ -2642,6 +3109,9 @@ mod tests {
         let gemini = ag_bars(&all, "Gemini");
         let got: Vec<(&str, &str, f64, u64)> = gemini.iter().map(|b| (b.label.as_str(), b.part.as_str(), (b.used * 100.0).round() / 100.0, b.resets)).collect();
         assert_eq!(got, [("Session (5hr)", "", 75.5, 4 * h), ("Weekly (7 day)", "Free", 80.0, 100 * h), ("Weekly (7 day)", "Pro", 85.98, 74 * h)], "pa's week reads 100%, so its 5 hours don't count; each plan averaged, its soonest reset");
+        assert_eq!(gemini[0].reset_pct, None, "only one account has an active session: no fraction");
+        assert_eq!(gemini[1].reset_pct, Some(50), "1 of 2 free accounts resets first: 50% free");
+        assert_eq!(gemini[2].reset_pct, Some(50), "1 of 2 pro accounts resets first: 50% free");
         let claude = ag_bars(&all, "Claude");
         assert!(claude.iter().all(|b| b.window == WEEK), "every Claude week used up: no session bar");
         let both = ag_bars(&all, "");
@@ -2663,17 +3133,23 @@ mod tests {
     fn live_counts_per_bucket_by_key_and_runs_totals() {
         let line = |t: u64, m: &str, prov: &str, n: u64| json!({ "t": t, "model": m, "provider": prov, "input": n, "output": 1 }).to_string();
         let text = [line(100, "claude-opus-5-5", "Claude", 9), line(130, "claude-opus-5-5", "Claude", 9), line(170, "gpt-6.1-sol", "ChatGPT", 99), line(3_000, "claude-opus-5-5", "Antigravity", 9)].join("\n");
-        let calls = load_calls(&text, 120);
+        let pricing = Pricing::default();
+        let calls = load_calls(&text, 120, &pricing);
         assert_eq!(calls.len(), 3, "older than `since` is left out");
         let span = (60, 60, 60); // minutes 1 to 60
-        let (names, s) = live_series(&calls, span, 1, false, false);
+        let (names, s) = live_series(&calls, span, 1, 1, false);
         assert_eq!(names, ["Claude Opus 5.5", "GPT 6.1 Sol"], "most first");
         assert_eq!((s[0][1], s[1][1], s[0][49]), (1.0, 1.0, 1.0));
-        let (names, s) = live_series(&calls, span, 0, true, false);
+        let (names, s) = live_series(&calls, span, 0, 0, false);
         assert_eq!((names.len(), s[0][1], s[0][49]), (1, 110.0, 10.0), "total tokens, in and out");
-        let (names, c) = live_series(&calls, span, 2, false, true);
+        let (names, c) = live_series(&calls, span, 2, 1, true);
         assert_eq!(names, ["Antigravity", "ChatGPT", "Claude"]);
         assert_eq!((c[2][0], c[2][1], c[2][59], c[0][48], c[0][49]), (0.0, 1.0, 1.0, 0.0, 1.0), "cumulative: only ever rises");
+        let (_names, cost) = live_series(&calls, span, 0, 2, false);
+        assert!(cost[0][1] > 0.0, "cost is computed from model rates");
+        assert_eq!(fmt_cost(0.0), "$0.00");
+        assert_eq!(fmt_cost(1.5), "$1.50");
+        assert_eq!(fmt_cost(120.0), "$120");
     }
 
     #[test]
@@ -2717,7 +3193,7 @@ mod tests {
         let bar = |used, window| Some(Bar { label: "x".into(), used, resets: 0, window, ..Default::default() });
         let dial = |five, week| Dial { five: bar(five, FIVE_HOURS), week: bar(week, WEEK) };
         let size = 32;
-        let px = icon_pixels(size, &[dial(30.0, 50.0), dial(20.0, 100.0)], false, 0);
+        let px = icon_pixels(size, &[dial(50.0, 30.0), dial(100.0, 20.0)], false, 0);
         let alpha = |x: u32, y: u32| px[((y * size + x) * 4 + 3) as usize];
         // On each arc's centre line: just past its left end, the top (12 o'clock), just short of its right end.
         let r = 15.5 - (32.0 * 0.13) / 2.0;
@@ -2726,11 +3202,11 @@ mod tests {
             ((16.0 + r * a.cos()) as u32, (16.0 - r * a.sin()) as u32)
         };
         let (l, top, rt) = (at(150.0), at(90.0), at(30.0));
-        assert_eq!(alpha(l.0, l.1), 255, "50% weekly: the left end is filled");
+        assert_eq!(alpha(l.0, l.1), 255, "50% 5hr: the left end is filled");
         assert_eq!(alpha(rt.0, rt.1), 80, "…the right end is still track");
         assert!(alpha(top.0, top.1) >= 80);
         let b = at(-30.0);
-        assert_eq!(alpha(b.0, b.1), 255, "100% weekly: the bottom arc is full");
+        assert_eq!(alpha(b.0, b.1), 255, "100% 5hr: the bottom arc is full");
         assert_eq!((alpha(0, 16), alpha(31, 16), alpha(0, 15), alpha(31, 15)), (0, 0, 0, 0), "a blank band across the middle");
         // The pies, halfway out: 30% of the top half from the left, 20% of the bottom one.
         let pie_at = |deg: f32| {
@@ -2738,9 +3214,9 @@ mod tests {
             ((16.0 + 6.0 * a.cos()) as u32, (16.0 - 6.0 * a.sin()) as u32)
         };
         let (a, b) = (pie_at(160.0), pie_at(60.0));
-        assert_eq!((alpha(a.0, a.1), alpha(b.0, b.1)), (255, 80), "top pie: filled near the left, track further round");
+        assert_eq!((alpha(a.0, a.1), alpha(b.0, b.1)), (255, 80), "top pie (weekly): filled near the left, track further round");
         let (a, b) = (pie_at(-155.0), pie_at(-90.0));
-        assert_eq!((alpha(a.0, a.1), alpha(b.0, b.1)), (255, 80), "bottom pie the same way");
+        assert_eq!((alpha(a.0, a.1), alpha(b.0, b.1)), (255, 80), "bottom pie (weekly) the same way");
         assert_eq!(tooltip(&Usage::default(), &[], &[]), "ccat usage");
     }
 
@@ -2770,8 +3246,8 @@ mod tests {
     #[test]
     fn sources_follow_saved_order_and_the_profile() {
         let names = |v: Vec<Src>| v.iter().map(|s| s.name()).collect::<Vec<_>>();
-        assert_eq!(names(ordered(&["Antigravity".into(), "bogus".into(), "Claude".into()])), ["Antigravity", "Claude", "ChatGPT"]);
-        assert_eq!(names(ordered(&[])), ["Claude", "ChatGPT", "Antigravity"]);
+        assert_eq!(names(ordered(&["Antigravity".into(), "bogus".into(), "Claude".into()])), ["Antigravity", "Claude", "ChatGPT", "Ollama", "MuseAI"]);
+        assert_eq!(names(ordered(&[])), ["Claude", "ChatGPT", "Antigravity", "Ollama", "MuseAI"]);
         let gpt = crate::Provider { name: "ChatGPT".into(), chatgpt: true, ..Default::default() };
         let ag = crate::Provider { name: "Antigravity".into(), antigravity: true, ..Default::default() };
         let mut cfg = crate::Config { providers: vec![gpt, ag], ..Default::default() };
@@ -2780,11 +3256,11 @@ mod tests {
         cfg.tiers[1].fallbacks = vec![crate::Fallback { provider: "Antigravity".into(), model: String::new() }];
         cfg.tiers[2].provider = "some-endpoint".into();
         cfg.tiers[3].provider = "some-endpoint".into();
-        assert_eq!(uses(&cfg), [false, true, true], "primaries and fallbacks count; endpoints and unused official don't");
-        let all = [true; 3];
-        assert_eq!(names(shown(&cfg, crate::ViewMode::All, all)), ["Claude", "ChatGPT", "Antigravity"]);
+        assert_eq!(uses(&cfg), [false, true, true, false, false], "primaries and fallbacks count; endpoints and unused official don't");
+        let all = [true; 5];
+        assert_eq!(names(shown(&cfg, crate::ViewMode::All, all)), ["Claude", "ChatGPT", "Antigravity", "Ollama", "MuseAI"]);
         assert_eq!(names(shown(&cfg, crate::ViewMode::Follow, all)), ["ChatGPT", "Antigravity"]);
-        assert_eq!(names(shown(&cfg, crate::ViewMode::Follow, [true, false, false])), ["Claude"], "nothing left: back to all");
+        assert_eq!(names(shown(&cfg, crate::ViewMode::Follow, [true, false, false, false, false])), ["Claude"], "nothing left: back to all");
         cfg.tiers[3].provider = String::new();
         assert_eq!(names(shown(&cfg, crate::ViewMode::Follow, all)), ["Claude", "ChatGPT", "Antigravity"], "official Claude counts");
     }
@@ -2792,7 +3268,12 @@ mod tests {
     #[test]
     fn analytics_counts_per_day_and_formats_like_the_console() {
         assert_eq!((fmt_tokens(950.0), fmt_tokens(405_600.0), fmt_tokens(21_900_000.0), fmt_tokens(1.6e9), fmt_tokens(4e9)), ("950".into(), "405.6k".into(), "21.9M".into(), "1.6B".into(), "4B".into()));
-        assert_eq!((pretty_model("claude-opus-5-5"), pretty_model("claude-haiku-4-5-20251001"), pretty_model("gpt-6-astra"), pretty_model("gemini-3.8-flash-tiered")), ("Claude Opus 5.5".into(), "Claude Haiku 4.5".into(), "GPT 6 Astra".into(), "Gemini 3.8 Flash Tiered".into()));
+        assert_eq!((pretty_model("claude-opus-5-5"), pretty_model("claude-haiku-4-5-20251001"), pretty_model("gpt-6-astra"), pretty_model("gemini-3.8-flash-tiered")), ("Claude Opus 5.5".into(), "Claude Haiku 4.5".into(), "GPT 6 Astra".into(), "Gemini 3.8 Flash".into()));
+        assert_eq!(pretty_model("claude-opus-4-6-thinking"), "Claude Opus 4.6");
+        assert_eq!(pretty_model("claude-3-7-sonnet-thinking"), "Claude 3.7 Sonnet");
+        assert_eq!(pretty_model("gpt-5-high"), "GPT 5");
+        assert_eq!(pretty_model("deepseek-r1-free"), "DeepSeek R1");
+        assert_eq!(pretty_model("deepseek-r1:free"), "DeepSeek R1");
         assert_eq!(civil_from_days(civil_days(2026, 10, 4)), (2026, 10, 4));
         assert_eq!(day_label(civil_days(2026, 10, 4)), "Oct 4");
         let t = 1_792_400_000u64;

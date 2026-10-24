@@ -3,7 +3,7 @@
 //! came from, and tier edits are written to both. The logic takes the folder as a parameter so it can be tested.
 
 use crate::{pal, Config, Route};
-use eframe::egui::{self, vec2, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, TextEdit};
+use eframe::egui::{self, vec2, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, TextEdit, ViewportCommand};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -268,6 +268,10 @@ impl Bar {
                     self.menu = !self.menu;
                 }
                 anchor = rect;
+                let rest = ui.available_rect_before_wrap();
+                if ui.interact(rest, ui.id().with("bar-drag"), Sense::drag()).drag_started() {
+                    ui.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
             });
         });
 
