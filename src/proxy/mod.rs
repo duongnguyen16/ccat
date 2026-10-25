@@ -56,6 +56,11 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// Google accounts signed in while the session runs join its Antigravity pool (see `Pool::add`).
+    pub fn add_accounts(&self, accounts: &[Account]) {
+        self.ctx.pool.add(accounts);
+    }
+
     /// Fresh usage (the tray's `usage.json`): an account it shows with quota again, fetched after its block was set,
     /// goes back into rotation now rather than when the block's guess runs out. So a tier returns to its first
     /// route as soon as that resets, and held requests try again at once.
