@@ -43,13 +43,12 @@ pub struct ProvidersEditor {
     pub(crate) gpt_err: String,
     pub(crate) muse_login: Option<LoginJob<crate::museai::Account>>,
     pub(crate) muse_err: String,
-    /// Whether each ChatGPT account (by key) must sign in again, and when that was last looked up: the answer is in a
-    /// file, so it is read every few seconds, not every frame.
-    gpt_state: HashMap<String, (Instant, bool)>,
+    /// Whether each ChatGPT account (by key) must sign in again and whether the Codex backend refused its token (see
+    /// `chatgpt::legacy_refused`), and when that was last looked up: the answer is in a file, so it is read every few
+    /// seconds, not every frame.
+    gpt_state: HashMap<String, (Instant, bool, bool)>,
     /// Accounts being looked up again (Antigravity by email: its plan; ChatGPT by key), and the answer to come.
     pub(crate) checking: HashMap<String, mpsc::Receiver<Result<String, String>>>,
-    /// When the ChatGPT page last re-read Codex CLI's login.
-    pub(crate) codex_at: Option<Instant>,
 }
 
 /// What an endpoint's page asks for; `ProvidersEditor::apply` carries it out.
@@ -83,11 +82,12 @@ fn start_fetch(ctx: &egui::Context, p: &Provider) -> Result<mpsc::Receiver<Fetch
         return Ok(rx);
     }
     if p.chatgpt {
-        let key = p.chatgpt_accounts.iter().find(|a| a.usable()).map(|a| a.key.clone()).ok_or("Sign in with ChatGPT first (and turn the account on).")?;
+        let legacy = p.gpt_legacy();
+        let key = p.chatgpt_accounts.iter().find(|a| a.usable() && a.runs(legacy)).map(|a| a.key.clone()).ok_or("Sign in with ChatGPT first (and turn the account on).")?;
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(chatgpt::list_models(&key).map(|m| (m.iter().map(|x| x.slug.clone()).collect(), m)));
+            let _ = tx.send(chatgpt::list_models(&key, legacy).map(|m| (m.iter().map(|x| x.slug.clone()).collect(), m)));
             ctx.request_repaint();
         });
         return Ok(rx);
@@ -240,14 +240,14 @@ impl ProvidersEditor {
         self.login.is_some() || self.gpt_login.is_some() || self.muse_login.is_some()
     }
 
-    /// Whether the ChatGPT account must sign in again (looked up at most every 3 seconds).
-    pub(crate) fn gpt_needs(&mut self, key: &str) -> bool {
-        let fresh = self.gpt_state.get(key).filter(|(at, _)| at.elapsed() < Duration::from_secs(3));
+    /// (must sign in again, Codex backend refused its token) of a ChatGPT account, looked up at most every 3 seconds.
+    pub(crate) fn gpt_needs(&mut self, key: &str) -> (bool, bool) {
+        let fresh = self.gpt_state.get(key).filter(|(at, ..)| at.elapsed() < Duration::from_secs(3));
         match fresh {
-            Some((_, v)) => *v,
+            Some((_, a, b)) => (*a, *b),
             None => {
-                let v = chatgpt::needs_signin(key);
-                self.gpt_state.insert(key.to_string(), (Instant::now(), v));
+                let v = (chatgpt::needs_signin(key), chatgpt::legacy_refused(key));
+                self.gpt_state.insert(key.to_string(), (Instant::now(), v.0, v.1));
                 v
             }
         }
@@ -304,7 +304,21 @@ impl ProvidersEditor {
                 (Ok((models, meta)), Some(p)) => {
                     p.models = models;
                     if p.chatgpt {
-                        p.chatgpt_models = meta;
+                        // What the answer leaves out (the official `/models` may carry no names or levels) stays as the last fetch knew it.
+                        let old = std::mem::replace(&mut p.chatgpt_models, meta);
+                        for m in &mut p.chatgpt_models {
+                            if let Some(o) = old.iter().find(|o| o.slug == m.slug) {
+                                if m.name.is_empty() {
+                                    m.name = o.name.clone();
+                                }
+                                if m.default_effort.is_empty() {
+                                    m.default_effort = o.default_effort.clone();
+                                }
+                                if m.efforts.is_empty() {
+                                    m.efforts = o.efforts.clone();
+                                }
+                            }
+                        }
                     }
                     self.fetch_errs.remove(&name);
                 }
@@ -333,7 +347,9 @@ impl ProvidersEditor {
             match r {
                 Ok(acc) => {
                     if let Some(p) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
-                        // Signing in again refreshes that account (and keeps its switch) instead of duplicating it.
+                        // Signing in again refreshes that account (and keeps its switch) instead of duplicating it; a leftover
+                        // Codex CLI import is replaced by any new sign-in.
+                        p.chatgpt_accounts.retain(|a| !a.cli());
                         match p.chatgpt_accounts.iter_mut().find(|a| a.key == acc.key) {
                             Some(a) => *a = chatgpt::ChatgptAccount { disabled: a.disabled, ..acc },
                             None => p.chatgpt_accounts.push(acc),

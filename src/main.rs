@@ -261,7 +261,8 @@ fn load() -> (Config, serde_json::Value) {
 
 /// The config a file's JSON stands for: older shapes migrated, the built-in providers in place.
 fn from_raw(raw: serde_json::Value) -> Config {
-    let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_default();
+    // An unreadable file falls back to a fresh config, whose compaction window is the usual one (a derived `Default` says 0 = off).
+    let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_else(|_| Config { compact_window: default_compact_window(), ..Default::default() });
     if raw.get("live_metric").is_none() && raw.get("live_calls").and_then(|v| v.as_bool()).unwrap_or(false) {
         cfg.live_metric = 1;
     }
@@ -283,9 +284,9 @@ fn from_raw(raw: serde_json::Value) -> Config {
     builtin_chatgpt(&mut cfg);
     builtin_ollama(&mut cfg);
     builtin_muse(&mut cfg);
-    // Codex CLI's login is the ChatGPT account ccat shares (see `chatgpt::CODEX_CLI`).
+    // The ChatGPT mode, once decided (see `Provider::gpt_legacy`), is kept: later changes of accounts cannot flip it.
     if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
-        chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
+        g.chatgpt_legacy = Some(g.gpt_legacy());
     }
     cfg
 }
@@ -1058,7 +1059,7 @@ impl App {
                 _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every Google account turned off.", p.name), true)),
                 _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{}” needs a signed-in ChatGPT account.", p.name), true)),
                 _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every account turned off.", p.name), true)),
-                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable()) => Some((format!("“{}”: no account has plan usage granted; sign in again.", p.name), true)),
+                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings.", p.name), true)),
                 _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
                 // A local Ollama needs no key; Ollama Cloud's is only required by the server.
                 _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{}” needs a URL.", p.name), true)),
@@ -1692,7 +1693,7 @@ fn target(provider: &str, model: &str, providers: &[Provider], claude_models: &[
         _ if p.disabled || model.is_empty() => None,
         _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => None,
         _ if p.antigravity => Some((proxy::Upstream::Antigravity, model)),
-        _ if p.chatgpt => p.chatgpt_accounts.iter().any(|a| a.usable()).then_some((proxy::Upstream::ChatGPT, model)),
+        _ if p.chatgpt => p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())).then_some((proxy::Upstream::ChatGPT, model)),
         _ if p.ollama => Some((proxy::Upstream::Ollama { url: p.url.clone(), key: p.key.clone() }, model)),
         _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).is_none().then_some((proxy::Upstream::MuseAI { url: p.url.clone(), key: p.key.clone() }, model)),
         _ if p.url.trim().is_empty() || p.key.trim().is_empty() => None,
@@ -1751,6 +1752,7 @@ fn follow_config(px: &proxy::Proxy) {
             let gpt = cfg.providers.iter().find(|p| p.chatgpt);
             *chatgpt.write().unwrap() = gpt.map(|p| p.chatgpt_accounts.clone()).unwrap_or_default();
             *chatgpt_models.write().unwrap() = gpt.map(|p| p.chatgpt_models.clone()).unwrap_or_default();
+            px.set_chatgpt_legacy(gpt.is_some_and(|p| p.gpt_legacy()));
             fail_on_limit.store(cfg.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
             no_paid_fallback.store(cfg.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
             compress_tool_results.store(cfg.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
@@ -1814,6 +1816,7 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
             match proxy::start(accounts, gpt_accounts, gpt_models, routes, PathBuf::from(folder)) {
                 Ok(px) => {
                     *px.disabled.write().unwrap() = off_accounts(&l.providers);
+                    px.set_chatgpt_legacy(gpt.is_some_and(|p| p.gpt_legacy()));
                     px.fail_on_limit.store(l.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
                     px.no_paid_fallback.store(l.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
                     px.compress_tool_results.store(l.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
@@ -2145,6 +2148,35 @@ mod tests {
         builtin_chatgpt(&mut fresh);
         assert_eq!(fresh.providers.iter().map(|p| (p.name.as_str(), p.chatgpt)).collect::<Vec<_>>(), [(AG_NAME, false), (GPT_NAME, true)]);
         assert!(check_rename(&fresh.providers, 0, "chatgpt").is_err(), "the name is reserved");
+    }
+
+    #[test]
+    fn chatgpt_mode_is_official_unless_a_codex_login_can_run_on_legacy() {
+        let mode = |raw: serde_json::Value| from_raw(raw).providers.iter().find(|p| p.chatgpt).map(|p| (p.gpt_legacy(), p.chatgpt_legacy));
+        // A fresh config, and one with only a Sign in with ChatGPT account: Official.
+        assert_eq!(mode(serde_json::json!({})), Some((false, Some(false))));
+        let own = serde_json::json!({ "providers": [{ "name": "ChatGPT", "chatgpt": true, "chatgpt_accounts": [{ "key": "k", "granted": true }] }] });
+        assert_eq!(mode(own), Some((false, Some(false))));
+        // Saved before the modes existed with a Codex-client sign-in, which only the Codex backend takes: Legacy.
+        let old = serde_json::json!({ "providers": [{ "name": "ChatGPT", "chatgpt": true, "chatgpt_accounts": [{ "key": "k", "granted": true, "route": "codex" }] }] });
+        assert_eq!(mode(old), Some((true, Some(true))));
+        // Only leftover Codex CLI imports (no token, can run nowhere): Official, like a new config.
+        let import = serde_json::json!({ "providers": [{ "name": "ChatGPT", "chatgpt": true, "chatgpt_accounts": [{ "key": "codex-cli", "granted": true, "route": "codex-cli" }] }] });
+        assert_eq!(mode(import), Some((false, Some(false))));
+        // Once chosen, the choice stays, whatever the accounts say, and survives a save.
+        let chosen = serde_json::json!({ "providers": [{ "name": "ChatGPT", "chatgpt": true, "chatgpt_legacy": false, "chatgpt_accounts": [{ "key": "k", "route": "codex-cli" }] }] });
+        assert_eq!(mode(chosen), Some((false, Some(false))));
+        let back: Config = serde_json::from_value(serde_json::to_value(from_raw(serde_json::json!({ "providers": [{ "name": "ChatGPT", "chatgpt": true, "chatgpt_accounts": [{ "key": "k", "route": "codex" }] }] }))).unwrap()).unwrap();
+        assert_eq!(back.providers.iter().find(|p| p.chatgpt).map(|p| p.chatgpt_legacy), Some(Some(true)));
+    }
+
+    #[test]
+    fn a_fresh_config_compacts_at_the_usual_window() {
+        assert_eq!(from_raw(serde_json::json!({})).compact_window, 200_000, "no file");
+        assert_eq!(from_raw(serde_json::Value::Null).compact_window, 200_000, "an unreadable file");
+        assert_eq!(from_raw(serde_json::json!({ "providers": 5 })).compact_window, 200_000, "a file that doesn't parse");
+        assert_eq!(from_raw(serde_json::json!({ "compact_window": 0 })).compact_window, 0, "off, when the user turned it off");
+        assert_eq!(from_raw(serde_json::json!({ "compact_window": 272_000 })).compact_window, 272_000);
     }
 
     #[test]

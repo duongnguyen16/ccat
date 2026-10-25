@@ -61,6 +61,11 @@ impl Proxy {
         self.ctx.pool.add(accounts);
     }
 
+    /// Switches the ChatGPT provider between Official (`false`) and Codex (Legacy) mode while the session runs.
+    pub fn set_chatgpt_legacy(&self, on: bool) {
+        self.ctx.gpt.set_legacy(on);
+    }
+
     /// Fresh usage (the tray's `usage.json`): an account it shows with quota again, fetched after its block was set,
     /// goes back into rotation now rather than when the block's guess runs out. So a tier returns to its first
     /// route as soon as that resets, and held requests try again at once.
@@ -1583,7 +1588,7 @@ Content-Length: {}
         let input = &seen.lock().unwrap()[1].1["input"];
         assert_eq!(input[0], json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }));
         assert_eq!(input[1], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "reading" }] }));
-        assert_eq!(input[2], json!({ "type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}" }));
+        assert_eq!(input[2], json!({ "type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}", "namespace": "claude_code" }), "official: the call names its namespace");
         assert_eq!(input[3], json!({ "type": "function_call_output", "call_id": "call_1", "output": "contents" }));
     }
 
@@ -1734,7 +1739,9 @@ Content-Length: {}
         assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(sent["reasoning"], json!({ "effort": "low", "summary": "auto" }), "a 2000-token budget");
         assert_eq!(sent["tool_choice"], "required");
-        assert_eq!(sent["tools"], json!([{ "type": "function", "name": "Shot", "description": "d", "parameters": { "type": "object", "properties": {} }, "strict": false }, { "type": "web_search" }]));
+        let shot = json!({ "type": "function", "name": "Shot", "description": "d", "parameters": { "type": "object", "properties": {} }, "strict": false });
+        assert_eq!(sent["tools"], json!([{ "type": "namespace", "name": "claude_code", "description": "Claude Code tools", "tools": [shot] }, { "type": "web_search" }]), "official: function tools only inside a namespace");
+        assert_eq!(sent["input"][1]["namespace"], "claude_code", "and the replayed call names it");
         assert_eq!(sent["input"][0]["content"][1], json!({ "type": "input_image", "image_url": "data:image/png;base64,QUJD" }));
         assert_eq!(sent["input"][2], json!({ "type": "function_call_output", "call_id": "t1", "output": "(see attached image)" }));
         assert_eq!(sent["input"][3], json!({ "type": "message", "role": "user", "content": [{ "type": "input_image", "image_url": "data:image/png;base64,REVG" }] }), "tool-result images ride in a user message");
@@ -1743,12 +1750,8 @@ Content-Length: {}
     }
 
     #[test]
-    fn chatgpt_tools_are_namespaced_after_one_refusal() {
-        let (url, seen) = fake_responses(|_, body, _| {
-            if body["tools"][0]["type"] == "function" {
-                let e = json!({ "error": { "code": "subscription_sharing_unsupported_capability", "message": "tools not supported", "param": "tools" } });
-                return (400, e.to_string());
-            }
+    fn official_tools_are_namespaced_from_the_first_request() {
+        let (url, seen) = fake_responses(|_, _, _| {
             let item = json!({ "type": "function_call", "id": "fc", "call_id": "c1", "name": "claude_code.Read", "arguments": "{}" });
             (200, rsse(&[json!({ "type": "response.output_item.added", "item": item }), json!({ "type": "response.output_item.done", "item": item }), completed(1, 0, 1)]))
         });
@@ -1761,24 +1764,42 @@ Content-Length: {}
         assert_eq!(msg["content"][0]["name"], "Read", "the namespace prefix is stripped");
         {
             let seen = seen.lock().unwrap();
-            assert_eq!(seen.len(), 2, "one retry");
-            assert_eq!(seen[1].1["tools"], json!([{ "type": "namespace", "name": "claude_code", "description": "Claude Code tools", "tools": seen[0].1["tools"] }]));
+            assert_eq!(seen.len(), 1, "no refusal, no retry");
+            assert_eq!(seen[0].1["tools"][0]["type"], "namespace");
+            assert_eq!(seen[0].1["tools"][0]["tools"][0]["name"], "Read");
         }
-        // Remembered: the next request is wrapped at once.
-        post(&proxy, &proxy.token, &req);
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[2].1["tools"][0]["type"], "namespace");
 
-        // What the official route refused is not the Codex route's business.
+        // Legacy (Codex) takes them bare, and always sends the cache key; what Official dropped is not its business.
         let pool = chatgpt::Pool::new(Vec::new(), Vec::new());
-        pool.wrap.store(true, Ordering::Relaxed);
         pool.no_cache_key.store(true, Ordering::Relaxed);
         let hints = Hints { session: "s".into() };
         let official = responses_body(&req, "m", None, &hints, &pool, false);
-        let codex = responses_body(&req, "m", None, &hints, &pool, true);
+        let legacy = responses_body(&req, "m", None, &hints, &pool, true);
         assert_eq!((official["tools"][0]["type"].as_str(), official.get("prompt_cache_key").is_none()), (Some("namespace"), true));
-        assert_eq!((codex["tools"][0]["type"].as_str(), codex["prompt_cache_key"].as_str()), (Some("function"), Some("s")));
+        assert_eq!((legacy["tools"][0]["type"].as_str(), legacy["prompt_cache_key"].as_str()), (Some("function"), Some("s")));
+    }
+
+    #[test]
+    fn a_forced_tool_on_the_official_route_narrows_the_namespace_instead_of_naming_it() {
+        let mut req = gpt_req(false);
+        req["tools"] = json!([
+            { "name": "Read", "description": "d", "input_schema": { "type": "object" } },
+            { "name": "Write", "description": "d", "input_schema": { "type": "object" } },
+            { "type": "web_search_20250305", "name": "web_search" }]);
+        let pool = chatgpt::Pool::new(Vec::new(), Vec::new());
+        let hints = Hints { session: "s".into() };
+        let names = |b: &Value| b["tools"][0]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        req["tool_choice"] = json!({ "type": "tool", "name": "Write" });
+        let official = responses_body(&req, "m", None, &hints, &pool, false);
+        assert_eq!((official["tool_choice"].as_str(), names(&official), official["tools"].as_array().unwrap().len()), (Some("required"), vec!["Write".to_string()], 1), "only the forced tool is offered, so `required` forces it");
+        let legacy = responses_body(&req, "m", None, &hints, &pool, true);
+        assert_eq!((legacy["tool_choice"].clone(), legacy["tools"].as_array().unwrap().len()), (json!({ "type": "function", "name": "Write" }), 3), "Codex takes the plain form");
+        // A name that is not among the tools: nothing is narrowed.
+        req["tool_choice"] = json!({ "type": "tool", "name": "Nope" });
+        let odd = responses_body(&req, "m", None, &hints, &pool, false);
+        assert_eq!((odd["tool_choice"].as_str(), names(&odd)), (Some("required"), vec!["Read".to_string(), "Write".to_string()]));
+        req["tool_choice"] = json!({ "type": "auto" });
+        assert_eq!(responses_body(&req, "m", None, &hints, &pool, false)["tool_choice"], "auto");
     }
 
     #[test]
@@ -1812,43 +1833,119 @@ Content-Length: {}
         assert!(seen[n - 1].1.get("prompt_cache_key").is_none() && seen[n].1.get("prompt_cache_key").is_none());
     }
 
-    /// The Codex route against a fake backend: its own path, headers, and body shaping.
-    #[test]
-    fn codex_route_shapes_url_headers_and_body() {
+    /// What a fake backend saw: (path, headers, decoded body); `zstd` bodies are decompressed first.
+    type Captured = Arc<Mutex<Vec<(String, Vec<(String, String)>, Value)>>>;
+
+    fn capture_server() -> (String, Captured) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let seen: Arc<Mutex<Vec<(String, Vec<(String, String)>, Value)>>> = Arc::default();
+        let seen: Captured = Arc::default();
         let log = seen.clone();
         std::thread::spawn(move || {
             for mut s in listener.incoming().flatten() {
                 let req = read_request(&s).unwrap();
-                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let zstd = req.header("content-encoding") == Some("zstd");
+                let raw = if zstd { ::zstd::decode_all(&req.body[..]).unwrap() } else { req.body.clone() };
+                let body: Value = serde_json::from_slice(&raw).unwrap();
                 log.lock().unwrap().push((req.path.clone(), req.headers.clone(), body));
                 let text = gpt_text(&["codex says hi"]);
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
             }
         });
+        (url, seen)
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    /// Both routes against a fake backend: their own path, headers, and body shaping.
+    #[test]
+    fn each_mode_shapes_url_headers_and_body() {
+        // Legacy: the Codex backend. An account name starting "cx" is a Codex-client sign-in, which names its workspace.
+        let (url, seen) = capture_server();
         let proxy = gpt_proxy(&url, &["cx1"], Vec::new());
         let mut req = gpt_req(false);
         req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object" } }]);
         let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-7")], &req);
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("codex says hi"));
+        {
+            let seen = seen.lock().unwrap();
+            let (path, headers, sent) = &seen[0];
+            assert_eq!(path, "/codex/responses");
+            let h = |k: &str| header(headers, k);
+            assert_eq!(h("authorization"), Some("Bearer cx1"));
+            assert_eq!(h("chatgpt-account-id"), Some("acct-cx1"), "the workspace id from the token");
+            assert_eq!((h("originator"), h("openai-beta")), (Some("ccat"), Some("responses=experimental")));
+            assert_eq!((h("session-id"), h("thread-id"), h("x-client-request-id")), (Some("sess-7"), Some("sess-7"), Some("sess-7")), "cache affinity, hyphenated as current Codex sends it");
+            assert!(h("session_id").is_none() && h("conversation_id").is_none(), "the old underscore names are gone");
+            assert_eq!(h("x-codex-routing-hint"), Some("model=gpt-test"));
+            assert!(h("version").is_some() && h("user-agent").is_some_and(|u| u.starts_with("ccat/")) && h("content-encoding").is_none());
+            assert_eq!((&sent["store"], &sent["stream"], &sent["prompt_cache_key"], &sent["parallel_tool_calls"]), (&json!(false), &json!(true), &json!("sess-7"), &json!(true)));
+            assert!(sent.get("service_tier").is_none() && sent.get("max_output_tokens").is_none() && sent.get("temperature").is_none());
+            assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(sent["reasoning"]["summary"], "auto");
+            assert_eq!((sent["tools"][0]["type"].as_str(), sent["tools"][0]["name"].as_str()), (Some("function"), Some("Read")), "bare function tools");
+        }
+
+        // Official: api.openai.com's /responses, the bare Bearer token, namespaced tools, none of the refused fields.
+        let (url, seen) = capture_server();
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-8")], &req);
+        assert_eq!(status, 200, "{body}");
         let seen = seen.lock().unwrap();
         let (path, headers, sent) = &seen[0];
-        assert_eq!(path, "/codex/responses");
-        let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(h("authorization"), Some("Bearer cx1"));
-        assert_eq!(h("chatgpt-account-id"), Some("acct-cx1"), "the workspace id from the token");
-        assert_eq!((h("originator"), h("openai-beta")), (Some("ccat"), Some("responses=experimental")));
-        assert_eq!((h("session_id"), h("conversation_id"), h("x-client-request-id")), (Some("sess-7"), Some("sess-7"), Some("sess-7")));
-        assert_eq!(h("x-codex-routing-hint"), Some("model=gpt-test"));
-        assert!(h("version").is_some() && h("user-agent").is_some_and(|u| u.starts_with("ccat/")));
-        assert_eq!((&sent["store"], &sent["stream"], &sent["prompt_cache_key"], &sent["parallel_tool_calls"]), (&json!(false), &json!(true), &json!("sess-7"), &json!(true)));
-        assert!(sent.get("service_tier").is_none() && sent.get("max_output_tokens").is_none() && sent.get("temperature").is_none());
-        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
-        assert_eq!(sent["reasoning"]["summary"], "auto");
-        assert_eq!(sent["tools"][0]["name"], "Read");
+        assert_eq!(path, "/responses");
+        let h = |k: &str| header(headers, k);
+        assert_eq!(h("authorization"), Some("Bearer good"));
+        assert!(h("chatgpt-account-id").is_none() && h("originator").is_none() && h("openai-beta").is_none() && h("x-codex-routing-hint").is_none(), "no Codex headers");
+        assert_eq!((h("session-id"), h("thread-id"), h("x-client-request-id")), (Some("sess-8"), Some("sess-8"), Some("sess-8")), "cache affinity on this route too");
+        assert!(h("session_id").is_none() && h("conversation_id").is_none());
+        assert_eq!((&sent["store"], &sent["stream"], &sent["prompt_cache_key"]), (&json!(false), &json!(true), &json!("sess-8")));
+        assert_eq!(sent["tools"][0]["type"], "namespace");
+        for refused in ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id"] {
+            assert!(sent.get(refused).is_none(), "{refused} is refused by the official route");
+        }
+        assert!(sent.get("parallel_tool_calls").is_none() && h("content-encoding").is_none());
+    }
+
+    #[test]
+    fn legacy_bodies_over_256_kib_go_out_zstd_compressed() {
+        let (url, seen) = capture_server();
+        let proxy = gpt_proxy(&url, &["cx1"], Vec::new());
+        let mut req = gpt_req(false);
+        req["messages"] = json!([{ "role": "user", "content": "lorem ipsum ".repeat(40_000) }]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let seen = seen.lock().unwrap();
+        let (_, _, sent) = &seen[0];
+        assert!(sent["input"][0]["content"][0]["text"].as_str().unwrap().len() > 400_000, "the server decoded the whole body");
+        assert_eq!(header(&seen[0].1, "content-encoding"), Some("zstd"));
+    }
+
+    #[test]
+    fn a_too_long_prompt_reaches_claude_code_as_a_400_without_touching_the_accounts() {
+        for in_stream in [true, false] {
+            let (url, seen) = fake_responses(move |_, _, _| {
+                if in_stream {
+                    (200, rsse(&[json!({ "type": "response.created" }), failed("context_length_exceeded")]))
+                } else {
+                    (400, json!({ "error": { "code": "context_length_exceeded", "message": "too much" } }).to_string())
+                }
+            });
+            let proxy = gpt_proxy(&url, &["a", "b"], Vec::new());
+            let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+            assert_eq!(status, 400, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{body}");
+            assert!(v["error"]["message"].as_str().unwrap().starts_with("prompt is too long: "), "{body}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "no second account for a conversation that is too long");
+            // And the account is not blocked: the next request goes to the same one again.
+            post(&proxy, &proxy.token, &gpt_req(false));
+            let who: Vec<String> = seen.lock().unwrap().iter().map(|(w, _)| w.clone()).collect();
+            assert_eq!(who, ["a", "a"]);
+        }
     }
 
     #[test]

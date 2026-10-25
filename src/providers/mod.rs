@@ -47,6 +47,9 @@ pub(crate) struct Provider {
     /// Served through the local proxy from the ChatGPT plan (`chatgpt_accounts`; their tokens live in files, see `chatgpt`).
     pub(crate) chatgpt: bool,
     pub(crate) chatgpt_accounts: Vec<chatgpt::ChatgptAccount>,
+    /// ChatGPT mode: `Some(true)` = Codex (Legacy) (`chatgpt.com/backend-api/codex`), `Some(false)` = Official
+    /// (`api.openai.com`). `None` (a config from before the modes) is decided by `gpt_legacy`.
+    pub(crate) chatgpt_legacy: Option<bool>,
     /// What the last model fetch learned of each ChatGPT model; `models` holds just the slugs.
     pub(crate) chatgpt_models: Vec<chatgpt::ChatgptModel>,
     /// Served through the local proxy from local Ollama instance (`/api/chat`).
@@ -60,6 +63,13 @@ pub(crate) struct Provider {
 }
 
 impl Provider {
+    /// Whether ChatGPT runs in Codex (Legacy) mode. Unset: Legacy only when an account that can run there exists (a
+    /// Codex-client sign-in); a Codex CLI import left by an older ccat has no token, so it does not count, and a new
+    /// config is Official.
+    pub(crate) fn gpt_legacy(&self) -> bool {
+        self.chatgpt_legacy.unwrap_or_else(|| self.chatgpt_accounts.iter().any(|a| a.own_codex()))
+    }
+
     /// Which provider this record is, from its flags (none set: an Anthropic-compatible endpoint).
     pub(crate) fn kind(&self) -> Kind {
         if self.antigravity {

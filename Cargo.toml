@@ -16,6 +16,7 @@ prost = "0.13"
 jsonschema = { version = "0.60.1", default-features = false }
 snow = "0.9"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+zstd = { version = "0.13.3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26", default-features = false }
