@@ -99,6 +99,10 @@ struct Config {
     /// Routed requests to third-party models get their command output (Bash/PowerShell results) cleaned (ANSI,
     /// progress redraws, repeated lines); file contents and never Claude. Off by default.
     compress_tool_results: bool,
+    /// Auto-compact size (tokens) asked of Claude Code when a tier shows a non-Claude model under a Claude name, whose
+    /// Claude window (often 1M) it would otherwise use. 0 = leave it to Claude Code.
+    #[serde(default = "default_compact_window")]
+    compact_window: u64,
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
     show_fable: bool,
@@ -113,6 +117,8 @@ struct Config {
     live_by: u8,
     live_cumulative: bool,
 }
+
+fn default_compact_window() -> u64 { 200_000 }
 
 /// Show every set-up usage source, or only those the applied profile routes to.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Debug)]
@@ -178,6 +184,7 @@ struct Launch {
     fail_on_limit: bool,
     no_paid_fallback: bool,
     compress_tool_results: bool,
+    compact_window: u64,
 }
 
 /// Whether a launch goes through ccat's local proxy: anything but every tier on Claude with no fallback. Plain
@@ -1081,7 +1088,7 @@ impl App {
         self.cfg.recents.insert(0, self.folder.clone());
         self.cfg.recents.truncate(12);
         let (tiers, providers, claude_models) = (self.cfg.tiers.clone(), self.cfg.providers.clone(), self.cfg.claude_models.clone());
-        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback, compress_tool_results: self.cfg.compress_tool_results });
+        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback, compress_tool_results: self.cfg.compress_tool_results, compact_window: self.cfg.compact_window });
         ui.send_viewport_cmd(ViewportCommand::Close);
     }
 
@@ -1760,6 +1767,12 @@ fn follow_config(px: &proxy::Proxy) {
     });
 }
 
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` for a routed launch showing a non-Claude model under a Claude name (a non-empty
+/// `overrides`): Claude Code would size that session by the Claude model's window. `user_set`: the user's own env has it.
+fn compact_window(window: u64, routed: bool, overrides: &serde_json::Map<String, serde_json::Value>, user_set: bool) -> Option<String> {
+    (routed && window > 0 && !overrides.is_empty() && !user_set).then(|| window.clamp(100_000, 1_000_000).to_string())
+}
+
 fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
     let routed = routed(&l.tiers);
     let (names, overrides) = tier_names(&l.tiers, routed);
@@ -1768,6 +1781,9 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
 
     let mut env: Vec<(&'static str, String)> = TIERS.iter().zip(&names).filter(|(_, n)| !n.is_empty()).map(|((_, _, var), n)| (*var, n.clone())).collect();
     let mut mcp_config = None;
+    if let Some(w) = compact_window(l.compact_window, routed, &overrides, std::env::var_os("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_some()) {
+        env.push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW", w));
+    }
     if routed {
         let stripped = |n: &str| n.split('[').next().unwrap_or("").trim().to_string();
         let mut routes: Vec<proxy::Route> = (0..TIERS.len())
@@ -1835,6 +1851,9 @@ fn claude_settings(overrides: &serde_json::Map<String, serde_json::Value>, env: 
     // Claude settings can override inherited env; a routed launch owns this non-secret endpoint.
     if let Some((_, url)) = env.iter().find(|(key, _)| *key == "ANTHROPIC_BASE_URL") {
         settings["env"] = serde_json::json!({"ANTHROPIC_BASE_URL": url});
+        if let Some((k, w)) = env.iter().find(|(key, _)| *key == "CLAUDE_CODE_AUTO_COMPACT_WINDOW") {
+            settings["env"][*k] = w.clone().into();
+        }
     }
     settings
 }
@@ -1918,6 +1937,21 @@ mod tests {
         assert!(!settings.to_string().contains("private-"));
         assert_eq!(settings["env"].as_object().unwrap().len(), 1);
         assert!(claude_settings(&serde_json::Map::new(), &[]).as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compact_window_only_for_a_routed_launch_that_spoofs_a_claude_name() {
+        let spoofed = tier_names(&[Route::default(), route("OR", "gpt-6.1-sol", "claude-opus-5-5"), Route::default(), Route::default()], true).1;
+        let plain = tier_names(&Default::default(), false).1;
+        assert_eq!(compact_window(272_000, true, &spoofed, false).as_deref(), Some("272000"));
+        assert_eq!(compact_window(272_000, false, &plain, false), None, "plain claude stays untouched");
+        assert_eq!(compact_window(272_000, true, &plain, false), None, "routed but nothing shown under a Claude name");
+        assert_eq!(compact_window(0, true, &spoofed, false), None, "0 = off");
+        assert_eq!(compact_window(272_000, true, &spoofed, true), None, "the user's own env wins");
+        assert_eq!(compact_window(5, true, &spoofed, false).as_deref(), Some("100000"));
+        assert_eq!(compact_window(u64::MAX, true, &spoofed, false).as_deref(), Some("1000000"));
+        let env = [("ANTHROPIC_BASE_URL", "http://127.0.0.1:1".to_string()), ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "272000".into())];
+        assert_eq!(claude_settings(&spoofed, &env)["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "272000");
     }
 
     /// Held by the tests that write the test config (a launcher saves on drop; the Settings tests save too).
@@ -2423,7 +2457,7 @@ mod tests {
     fn live_mixed_tiers() {
         let cfg = live_config();
         let tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
-        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false };
+        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0 };
         let dir = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &dir).unwrap();
         assert!(p.routed && !p.env.iter().any(|(k, _)| *k == "ANTHROPIC_AUTH_TOKEN"), "official tiers keep the Claude login");
@@ -2470,7 +2504,7 @@ mod tests {
         let mut cfg = live_config();
         cfg.tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         save(&cfg, &serde_json::Value::Null).unwrap();
-        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false };
+        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0 };
         let work = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &work).unwrap();
         let ask = || {

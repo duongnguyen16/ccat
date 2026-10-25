@@ -304,6 +304,24 @@ impl Settings {
         setting(ui, "Never fall back to a paid API key", "A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT, MuseAI) and Ollama stay eligible. Routed sessions only.", |ui| {
             switch(ui, &mut self.cfg.no_paid_fallback, "");
         });
+        let mut compact = self.cfg.compact_window > 0;
+        setting(ui, "Compact earlier on non-Claude models", "A tier shown to Claude Code under a Claude name gets that model's context window, often 1M, so sessions grow huge and slow before compacting. ccat asks Claude Code to compact at this size instead. Applies to the next launch; the whole session uses it.", |ui| {
+            switch(ui, &mut compact, "");
+            if compact {
+                egui::ComboBox::from_id_salt("compact-window")
+                    .selected_text(format!("{}k", self.cfg.compact_window / 1000))
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for k in [128, 200, 272, 400] {
+                            ui.selectable_value(&mut self.cfg.compact_window, k * 1000, format!("{k}k"));
+                        }
+                    });
+            }
+        });
+        // ponytail: a saved size outside the four choices (hand-edited) shows as is until another is picked.
+        if compact != (self.cfg.compact_window > 0) {
+            self.cfg.compact_window = if compact { 200_000 } else { 0 };
+        }
         paragraph(ui, "Circuit breaker", "A provider that fails 3 times in a row with a 5xx error or a timeout is skipped for 30 seconds, so a request goes straight to the tier's next route instead of waiting on a provider that is down. One request then tries it again. If every route is skipped, they are all tried anyway.");
     }
 
