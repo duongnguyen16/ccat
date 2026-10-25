@@ -4,6 +4,7 @@
 
 mod antigravity;
 mod chatgpt;
+mod common;
 mod live;
 mod mcp;
 pub(crate) mod museai;
@@ -1867,11 +1868,11 @@ fn follow_config(px: &proxy::Proxy) {
             fail_on_limit.store(cfg.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
             for (old, new) in routes.read().unwrap().iter().zip(&next) {
                 if (&old.upstream, &old.model, &old.fallbacks) != (&new.upstream, &new.model, &new.fallbacks) {
-                    antigravity::log(&format!("{} now runs {} on {:?}", old.tier, new.model, new.upstream)); // Debug names the provider, never its key
+                    common::log(&format!("{} now runs {} on {:?}", old.tier, new.model, new.upstream)); // Debug names the provider, never its key
                 }
             }
             if !bad.is_empty() {
-                antigravity::log(&format!("settings changed, but {} can't be served as set; kept as they were", bad.join(", ")));
+                common::log(&format!("settings changed, but {} can't be served as set; kept as they were", bad.join(", ")));
             }
             *routes.write().unwrap() = next;
         }
@@ -1971,7 +1972,7 @@ fn run_claude(l: Launch, cwd: &str) {
         }
     }
     if routed {
-        eprintln!("       proxy log: {}", antigravity::log_path().display());
+        eprintln!("       proxy log: {}", common::log_path().display());
     }
     if uses_ag {
         eprintln!("       Antigravity extras: WebSearch → Google Search, MCP tool mcp__antigravity__generate_image");

@@ -2,7 +2,7 @@
 //! Protocol: translates Anthropic Messages API -> Ollama `/v1/chat/completions`, streaming SSE chunks,
 //! quota/balance tracking via `/api/balance`, and web search via `/api/web_search`.
 
-use crate::antigravity::Failure;
+use crate::common::Failure;
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader},
@@ -319,7 +319,7 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
                             let content_str = if let Some(s) = b["content"].as_str() {
                                 s.to_string()
                             } else if let Some(arr) = b["content"].as_array() {
-                                arr.iter().filter_map(crate::proxy::tool_result_text).collect::<Vec<_>>().join("")
+                                arr.iter().filter_map(crate::proxy::sse::tool_result_text).collect::<Vec<_>>().join("")
                             } else {
                                 b["content"].to_string()
                             };
@@ -390,7 +390,7 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
     }
 
     // 3. Tools
-    if let Some(tools_arr) = crate::proxy::client_tools(body).as_array() {
+    if let Some(tools_arr) = crate::proxy::sse::client_tools(body).as_array() {
         let mut functions = Vec::new();
         for t in tools_arr {
             let name = t["name"].as_str().unwrap_or("");

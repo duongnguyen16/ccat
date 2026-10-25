@@ -5,14 +5,20 @@
 //! Binds 127.0.0.1 on a random port. Routes that spend ccat's accounts or keys need the per-launch token;
 //! official routes only ever carry the caller's own credentials, so they don't.
 
-use crate::antigravity::{self, family, Account, Failure, Pool};
+mod http;
+pub(crate) mod sse;
+
+use crate::antigravity::{self, family, Account, Pool};
+use crate::common::{self, Failure};
 use crate::chatgpt::{self, ChatgptAccount, ChatgptModel};
+use http::{anthropic_api, forward, read_request, record, respond, respond_error, upstream_body, Req};
+use sse::{blocks, client_tools, tag, tool_result_text, untag, Stop, Tx};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
@@ -22,7 +28,6 @@ use std::{
     time::Duration,
 };
 
-const MAX_BODY: usize = 64 << 20;
 /// System-prompt lines Cloud Code refuses with a fake quota 429 ("Resource has been exhausted"): Claude Code's
 /// per-request billing header and the Agent SDK identity line. Neither carries anything a model needs.
 const FILTERED_SYSTEM_LINES: [&str; 2] = ["x-anthropic-billing-header:", "You are a Claude agent, built on Anthropic's Claude Agent SDK."];
@@ -131,18 +136,6 @@ impl Drop for Held<'_> {
     }
 }
 
-/// The official API: requests go there with the login Claude Code itself sends.
-const ANTHROPIC_API: &str = "https://api.anthropic.com";
-
-/// The official API, or in tests a fake one.
-fn anthropic_api() -> String {
-    #[cfg(test)]
-    if let Some(u) = tests::FAKE_API.lock().unwrap().clone() {
-        return u;
-    }
-    ANTHROPIC_API.into()
-}
-
 #[derive(Clone, PartialEq)]
 pub enum Upstream {
     Official,
@@ -211,28 +204,6 @@ struct Ctx {
     plan_backs: Mutex<[u64; 2]>,
 }
 
-/// Tokens one image costs. ponytail: a flat middle-of-the-road figure (Gemini 3 default resolution ≈1120, a
-/// ~1000px Claude image ≈1300); size images properly if `/context` ever needs to be exact for screenshots.
-const IMAGE_TOKENS: u64 = 1100;
-/// Before the first real response: the classic bytes/4.
-const DEFAULT_RATIO: f64 = 0.25;
-
-/// Text bytes and image count of an Anthropic request: base64 media (`data`) would swamp a bytes-per-token ratio.
-fn weigh(v: &Value) -> (u64, u64) {
-    match v {
-        Value::Object(m) => m.iter().fold((0, 0), |(b, i), (k, v)| match (k.as_str(), v) {
-            ("data", Value::String(_)) => (b, i + 1),
-            _ => {
-                let (vb, vi) = weigh(v);
-                (b + k.len() as u64 + vb, i + vi)
-            }
-        }),
-        Value::Array(a) => a.iter().map(weigh).fold((0, 0), |(b, i), (vb, vi)| (b + vb, i + vi)),
-        Value::String(s) => (s.len() as u64, 0),
-        other => (other.to_string().len() as u64, 0),
-    }
-}
-
 impl Ctx {
     /// When route `u`'s plan should be back by its usage bars, if that is still ahead; else 0.
     fn plan_back(&self, u: &Upstream, now: u64) -> u64 {
@@ -271,24 +242,6 @@ impl Ctx {
             None => routes.first().map_or((Upstream::Antigravity, asked.to_string(), "", Vec::new()), |r| (r.upstream.clone(), r.model.clone(), r.tier, r.fallbacks.clone())),
         }
     }
-
-    /// Remembers how a real request of `fam` tokenized; a moving average so one odd turn doesn't swing it.
-    fn learn(&self, fam: &'static str, req: &Value, prompt_tokens: u64) {
-        let (bytes, images) = weigh(req);
-        if bytes == 0 || prompt_tokens == 0 {
-            return;
-        }
-        let r = prompt_tokens.saturating_sub(images * IMAGE_TOKENS) as f64 / bytes as f64;
-        let mut g = self.ratio.lock().unwrap();
-        let next = g.get(fam).map_or(r, |old| old * 0.7 + r * 0.3);
-        g.insert(fam, next);
-    }
-
-    fn estimate(&self, fam: &str, req: &Value) -> u64 {
-        let (bytes, images) = weigh(req);
-        let r = self.ratio.lock().unwrap().get(fam).copied().unwrap_or(DEFAULT_RATIO);
-        (bytes as f64 * r).round() as u64 + images * IMAGE_TOKENS
-    }
 }
 
 /// `accounts` serve the Antigravity routes, `chatgpt` the ChatGPT ones; `routes` say where each tier goes (see `Ctx::resolve`).
@@ -302,13 +255,13 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
     let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
-    let token = antigravity::random_hex(24);
+    let token = common::random_hex(24);
     let ctx = Arc::new(Ctx {
         pool,
         gpt,
         token: token.clone(),
-        agent_id: antigravity::uuid(),
-        trajectory: antigravity::uuid(),
+        agent_id: common::uuid(),
+        trajectory: common::uuid(),
         step: AtomicU64::new(0),
         sigs: Mutex::new(HashMap::new()),
         routes: routes.clone(),
@@ -338,97 +291,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
     Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, ctx: handle })
 }
 
-// ---------------------------------------------------------------- HTTP
-
-struct Req {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Req {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-}
-
-fn bad(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn read_request(s: &TcpStream) -> io::Result<Req> {
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line)?;
-    let mut it = line.split_whitespace();
-    let (method, path) = (it.next().ok_or_else(|| bad("empty request"))?.to_string(), it.next().unwrap_or("/").to_string());
-    let mut headers = Vec::new();
-    loop {
-        line.clear();
-        if r.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-        }
-    }
-    let mut req = Req { method, path, headers, body: Vec::new() };
-    if req.header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
-        loop {
-            line.clear();
-            r.read_line(&mut line)?;
-            let n = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16).map_err(|_| bad("bad chunk size"))?;
-            if n == 0 {
-                break;
-            }
-            if req.body.len() + n > MAX_BODY {
-                return Err(bad("body too large"));
-            }
-            let at = req.body.len();
-            req.body.resize(at + n, 0);
-            r.read_exact(&mut req.body[at..])?;
-            line.clear();
-            r.read_line(&mut line)?;
-        }
-    } else if let Some(n) = req.header("content-length") {
-        let n: usize = n.parse().map_err(|_| bad("bad content-length"))?;
-        if n > MAX_BODY {
-            return Err(bad("body too large"));
-        }
-        req.body.resize(n, 0);
-        r.read_exact(&mut req.body)?;
-    }
-    Ok(req)
-}
-
-fn respond(s: &mut TcpStream, status: u16, body: &Value, extra: &str) {
-    let body = body.to_string();
-    let _ = write!(
-        s,
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
-        if status == 200 { "OK" } else { "Error" },
-        body.len()
-    );
-}
-
-fn error_kind(status: u16) -> &'static str {
-    match status {
-        400 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        503 | 529 => "overloaded_error",
-        _ => "api_error",
-    }
-}
-
-fn respond_error(s: &mut TcpStream, f: &Failure) {
-    let extra = f.retry_after.map(|r| format!("Retry-After: {r}\r\n")).unwrap_or_default();
-    respond(s, f.status, &json!({ "type": "error", "error": { "type": error_kind(f.status), "message": f.message } }), &extra);
-}
+// ---------------------------------------------------------------- request dispatch
 
 fn serve(mut s: TcpStream, ctx: &Ctx) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
@@ -454,7 +317,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             let asked = body["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
             let counted = path == "/v1/messages";
             if counted {
-                antigravity::log(&json!({"event":"api_request","model":asked,"request_bytes":req.body.len(),"declared_tools":body["tools"].as_array().map_or(0, Vec::len)}).to_string());
+                common::log(&json!({"event":"api_request","model":asked,"request_bytes":req.body.len(),"declared_tools":body["tools"].as_array().map_or(0, Vec::len)}).to_string());
             }
 
             // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
@@ -475,7 +338,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                 for (n, (u, m)) in tries.iter().enumerate() {
                     let last = n + 1 == tries.len();
                     if n > 0 {
-                        antigravity::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+                        common::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
                     }
                     let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
                     match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, may_fail) {
@@ -489,7 +352,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                             return;
                         }
                         Err(f) => {
-                            antigravity::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message));
+                            common::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message));
                             fails.push(f);
                         }
                     }
@@ -507,7 +370,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                 let soon = 15u64 << passes.min(4);
                 passes += 1;
                 let wait = backs.iter().map(|b| if *b > now { b - now } else { soon }).min().unwrap_or(soon).clamp(15, 300);
-                antigravity::log(&format!("{asked} [{tier}]: every route is at its usage limit; holding the request, next try in {wait}s"));
+                common::log(&format!("{asked} [{tier}]: every route is at its usage limit; holding the request, next try in {wait}s"));
                 // Tell the usage window what this tier waits for, and when each route should be back.
                 if !tier.is_empty() {
                     let waiting = tries.iter().zip(&backs).map(|((u, m), b)| (hop(u, m), *b)).collect();
@@ -522,7 +385,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                     }
                 }
                 if !still_waiting(&s, wait, &ctx.wake) {
-                    antigravity::log(&format!("{asked} [{tier}]: Claude Code stopped waiting; request dropped"));
+                    common::log(&format!("{asked} [{tier}]: Claude Code stopped waiting; request dropped"));
                     return;
                 }
             }
@@ -543,7 +406,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
         _ if bearer.is_some_and(|b| b != ctx.token) => drop(forward(&mut s, &ctx.http, &req, &anthropic_api(), None, req.body.clone(), None, Fail::Never)),
         _ if !authed => denied(&mut s),
         _ => {
-            antigravity::log(&format!("404 {} {} (Claude Code asked for something the proxy doesn't serve)", req.method, req.path));
+            common::log(&format!("404 {} {} (Claude Code asked for something the proxy doesn't serve)", req.method, req.path));
             respond_error(&mut s, &Failure { status: 404, message: format!("ccat proxy has no {} {}", req.method, req.path), retry_after: None })
         }
     }
@@ -634,165 +497,7 @@ impl Fail {
     }
 }
 
-/// The request body for an official or endpoint route: the tier's real model, and no thinking blocks another
-/// provider signed (Antigravity's `ag:` and ChatGPT's `oa:` tags, or none at all): Anthropic rejects a signature it didn't make.
-/// When neither applies the original bytes go on untouched, so the request is exactly what Claude Code sent (key order,
-/// number formatting, escapes); only a rewrite re-serializes `body` (which keeps its key order).
-/// ponytail: an assistant turn that was nothing but such thinking would be left empty; Claude Code always follows
-/// thinking with text or a tool call, so it hasn't come up.
-fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
-    if body.is_null() {
-        return Vec::new();
-    }
-    let keeps = |b: &Value| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:"));
-    let blocks = || body["messages"].as_array().into_iter().flatten().filter_map(|m| m["content"].as_array()).flatten();
-    if body["model"] == model && blocks().all(keeps) {
-        return raw.to_vec();
-    }
-    let mut body = body.clone();
-    body["model"] = json!(model);
-    for m in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
-        if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {
-            blocks.retain(keeps);
-        }
-    }
-    body.to_string().into_bytes()
-}
-
-/// Token usage read off an answer as it passes through: SSE `message_start` / `message_delta` events, or a plain
-/// JSON message. The highest value seen per field wins (`output_tokens` grows through the stream).
-#[derive(Default)]
-struct Meter {
-    sse: bool,
-    tail: Vec<u8>,
-    usage: Map<String, Value>,
-}
-
-impl Meter {
-    fn feed(&mut self, bytes: &[u8]) {
-        if !self.sse {
-            // A whole JSON message; past a few MB it isn't one worth counting.
-            if self.tail.len() < 8 << 20 {
-                self.tail.extend_from_slice(bytes);
-            }
-            return;
-        }
-        self.tail.extend_from_slice(bytes);
-        while let Some(i) = self.tail.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.tail.drain(..=i).collect();
-            if let Some(v) = line.strip_prefix(b"data: ").filter(|d| d.windows(7).any(|w| w == b"\"usage\"")).and_then(|d| serde_json::from_slice::<Value>(d).ok()) {
-                self.take(&v);
-            }
-        }
-    }
-
-    fn take(&mut self, v: &Value) {
-        let u = if v["message"]["usage"].is_object() { &v["message"]["usage"] } else { &v["usage"] };
-        for (k, n) in u.as_object().into_iter().flatten().filter(|(_, n)| n.is_u64()) {
-            if self.usage.get(k).and_then(Value::as_u64) < n.as_u64() {
-                self.usage.insert(k.clone(), n.clone());
-            }
-        }
-    }
-
-    fn finish(mut self) -> Value {
-        if !self.sse {
-            if let Ok(v) = serde_json::from_slice::<Value>(&self.tail) {
-                self.take(&v);
-            }
-        }
-        Value::Object(self.usage)
-    }
-}
-
-/// One line per answered request in `tokens.jsonl` next to the config: when, which tier and provider, which model,
-/// and the tokens. Only routed launches pass through the proxy, so only they are counted. (Kept for future builds.)
-fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
-    let n = |k: &str| usage[k].as_u64().unwrap_or(0);
-    if cfg!(test) || n("input_tokens") + n("output_tokens") + n("cache_read_input_tokens") == 0 {
-        return;
-    }
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let line = json!({ "t": t, "tier": tier, "provider": provider, "model": model, "input": n("input_tokens"), "output": n("output_tokens"),
-                       "cache_read": n("cache_read_input_tokens"), "cache_write": n("cache_creation_input_tokens") });
-    let path = antigravity::log_path().with_file_name("tokens.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(format!("{line}\n").as_bytes()); // one write per line: several sessions can append at once
-    }
-}
-
-/// Official and endpoint routes: the request goes on unchanged except for `body` (and the endpoint's own key),
-/// and the answer, SSE included, streams back as it arrives, rate-limit headers and all. With `meter` (tier,
-/// provider, model) the answer's token usage goes to the token log.
-#[allow(clippy::too_many_arguments)]
-fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: Fail) -> Result<(), Failure> {
-    let mut b = ureq::http::Request::builder().method(req.method.as_str()).uri(format!("{base}{}", req.path));
-    for (k, v) in &req.headers {
-        let hop = matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding" | "accept-encoding" | "x-ccat-token");
-        if hop || (key.is_some() && matches!(k.as_str(), "authorization" | "x-api-key")) {
-            continue;
-        }
-        // An endpoint gets its key, not Claude Code's login, so the login's beta flag goes too.
-        let v = match key {
-            Some(_) if k == "anthropic-beta" => v.split(',').map(str::trim).filter(|f| !f.starts_with("oauth-")).collect::<Vec<_>>().join(","),
-            _ => v.clone(),
-        };
-        if !v.is_empty() {
-            b = b.header(k.as_str(), v);
-        }
-    }
-    if let Some(key) = key {
-        b = b.header("x-api-key", key).header("authorization", format!("Bearer {key}"));
-    }
-    let sent = if body.is_empty() { b.body(()).map(|r| agent.run(r)) } else { b.body(body).map(|r| agent.run(r)) };
-    let fail = |s: &mut TcpStream, f: Failure| if may_fail.takes(f.status) { Err(f) } else { Ok(respond_error(s, &f)) };
-    let mut res = match sent {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return fail(s, Failure { status: 502, message: format!("ccat proxy → {base}: {e}"), retry_after: None }),
-        Err(e) => return fail(s, Failure { status: 400, message: format!("ccat proxy: {e}"), retry_after: None }),
-    };
-    let status = res.status();
-    if may_fail.takes(status.as_u16()) {
-        let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
-        if status.as_u16() == 429 {
-            // Which limit it was: Anthropic says so in headers only.
-            let said: Vec<String> = res.headers().iter().filter(|(k, _)| k.as_str() == "retry-after" || k.as_str().contains("ratelimit")).map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or(""))).collect();
-            antigravity::log(&format!("{base} answered 429: {}", said.join(" ")));
-        }
-        let text = res.body_mut().with_config().limit(64 << 10).read_to_string().unwrap_or_default();
-        let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or(text);
-        return Err(Failure { status: status.as_u16(), message, retry_after });
-    }
-    let mut head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or("Status"));
-    for (k, v) in res.headers() {
-        if !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection" | "content-encoding") {
-            head.push_str(&format!("{k}: {}\r\n", v.to_str().unwrap_or("")));
-        }
-    }
-    let bodyless = req.method == "HEAD" || matches!(status.as_u16(), 204 | 304);
-    head.push_str(if bodyless { "Connection: close\r\n\r\n" } else { "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" });
-    if s.write_all(head.as_bytes()).is_err() || bodyless {
-        return Ok(());
-    }
-    let sse = res.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("event-stream"));
-    let mut tokens = (meter.is_some() && status.as_u16() == 200).then(|| Meter { sse, ..Default::default() });
-    let mut reader = res.into_body().into_reader();
-    let mut buf = vec![0u8; 16 << 10];
-    while let Ok(n @ 1..) = reader.read(&mut buf) {
-        let chunk = s.write_all(format!("{n:x}\r\n").as_bytes()).and_then(|_| s.write_all(&buf[..n])).and_then(|_| s.write_all(b"\r\n"));
-        if chunk.is_err() {
-            return Ok(()); // Claude Code hung up
-        }
-        if let Some(m) = tokens.as_mut() {
-            m.feed(&buf[..n]);
-        }
-    }
-    let _ = s.write_all(b"0\r\n\r\n");
-    if let (Some(m), Some((tier, provider, model))) = (tokens, meter) {
-        record(tier, provider, model, &m.finish());
-    }
-    Ok(())
-}
+// ---------------------------------------------------------------- Antigravity: routing (web search, token counts, request loop)
 
 /// The `web_search_*` server tool, when it is the request's only tool — Claude Code's WebSearch sub-request.
 /// ponytail: mixed with client tools it is still dropped; Google grounding and function calls don't combine reliably.
@@ -827,7 +532,7 @@ fn google_count(ctx: &Ctx, req: &Value, model: &str) -> Option<u64> {
     match ctx.pool.post("/v1internal:countTokens", &json!({ "request": { "model": format!("models/{model}"), "contents": parts } })) {
         Ok(v) => v["totalTokens"].as_u64(),
         Err(f) => {
-            antigravity::log(&format!("countTokens failed ({} {}); using the calibrated estimate", f.status, f.message));
+            common::log(&format!("countTokens failed ({} {}); using the calibrated estimate", f.status, f.message));
             None
         }
     }
@@ -872,7 +577,7 @@ fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, model: Strin
                 let kind = if web_search(req).is_some() { " [web search]" } else { "" };
                 // A client error won't heal on a retry.
                 let fatal = (400..500).contains(&f.status) && f.status != 429;
-                antigravity::log(&format!("{model}{kind}: {} after {} {}", if fatal { "giving up" } else { "retrying" }, f.status, f.message));
+                common::log(&format!("{model}{kind}: {} after {} {}", if fatal { "giving up" } else { "retrying" }, f.status, f.message));
                 if let Some(secs) = block {
                     ctx.pool.block(i, family(&model), secs);
                 }
@@ -1126,7 +831,7 @@ fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked
                 }
             }
         };
-        antigravity::log(&format!("{model} via {}: {} {}", acc.email, failure.status, failure.message));
+        common::log(&format!("{model} via {}: {} {}", acc.email, failure.status, failure.message));
         // An optional field the plan route doesn't take: drop it for the rest of this process and try again.
         let has_fns = payload["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "function"));
         let flag = match refused.as_str() {
@@ -1154,6 +859,8 @@ fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked
         None => Ok(()),
     }
 }
+
+// ---------------------------------------------------------------- Ollama / MuseAI: Anthropic → OpenAI Chat Completions
 
 /// An Ollama route: the request goes to Ollama's local OpenAI-compatible endpoint.
 #[allow(clippy::too_many_arguments)]
@@ -1216,7 +923,7 @@ fn ollama_messages(
     let reader = match crate::ollama::open(url, key_opt, &payload) {
         Ok(r) => r,
         Err(f) => {
-            antigravity::log(&format!("{model} via Ollama ({url}): {} {}", f.status, f.message));
+            common::log(&format!("{model} via Ollama ({url}): {} {}", f.status, f.message));
             if may_fail.takes(f.status) {
                 return Err(f);
             }
@@ -1271,7 +978,7 @@ fn muse_messages(
     let reader = match crate::museai::open(url, key_opt, &payload) {
         Ok(r) => r,
         Err(f) => {
-            antigravity::log(&format!("{model} via MuseAI ({url}): {} {}", f.status, f.message));
+            common::log(&format!("{model} via MuseAI ({url}): {} {}", f.status, f.message));
             if may_fail.takes(f.status) {
                 return Err(f);
             }
@@ -1304,72 +1011,9 @@ fn muse_messages(
 
 // ---------------------------------------------------------------- Anthropic → Cloud Code
 
-/// Signatures handed to Claude Code are tagged with the model family that made them, so a resumed session
-/// on another model (or Anthropic's own signatures) never reaches Google as a "corrupted" signature.
-fn tag(fam: &str, sig: &str) -> String {
-    format!("ag:{fam}:{sig}")
-}
-
-fn untag<'a>(sig: Option<&'a str>, fam: &str) -> Option<&'a str> {
-    let s = sig?.strip_prefix("ag:")?.strip_prefix(fam)?.strip_prefix(':')?;
-    let base64 = !s.is_empty() && s.len() % 4 == 0 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
-    base64.then_some(s)
-}
-
-/// Anthropic content: a string or a block array.
-fn blocks(content: &Value) -> Vec<Value> {
-    match content {
-        Value::String(t) => vec![json!({ "type": "text", "text": t })],
-        Value::Array(a) => a.clone(),
-        _ => vec![],
-    }
-}
-
 fn media(b: &Value) -> Option<Value> {
     let src = &b["source"];
     (src["type"] == "base64").then(|| json!({ "inlineData": { "mimeType": src["media_type"], "data": src["data"] } }))
-}
-
-/// Resolve Claude's on-demand tool declarations once for every translated provider.
-pub(crate) fn client_tools(req: &Value) -> Value {
-    let mut tools = req.get("tools").cloned().unwrap_or_else(|| json!([]));
-    let mut loaded = HashSet::new();
-    if req["tool_choice"]["type"] == "tool" {
-        if let Some(name) = req["tool_choice"]["name"].as_str() { loaded.insert(name); }
-    }
-    for block in req["messages"].as_array().into_iter().flatten().flat_map(|m| m["content"].as_array().into_iter().flatten()) {
-        if block["type"] == "tool_addition" {
-            let tool = &block["tool"];
-            if tool["type"] == "tool_definition" {
-                let definition = &tool["definition"];
-                if let Some(name) = definition["name"].as_str().filter(|s| !s.is_empty()) {
-                    loaded.insert(name);
-                    if let Some(list) = tools.as_array_mut() {
-                        if let Some(previous) = list.iter_mut().find(|t| t["name"] == name) { *previous = definition.clone(); }
-                        else { list.push(definition.clone()); }
-                    }
-                }
-            } else if tool["type"] == "tool_reference" {
-                if let Some(name) = tool["name"].as_str() { loaded.insert(name); }
-            }
-        } else if block["type"] == "tool_result" {
-            for reference in block["content"].as_array().into_iter().flatten().filter(|v| v["type"] == "tool_reference") {
-                if let Some(name) = reference["tool_name"].as_str().or_else(|| reference["name"].as_str()) { loaded.insert(name); }
-            }
-        }
-    }
-    if let Some(list) = tools.as_array_mut() {
-        list.retain(|tool| tool["defer_loading"] != true || tool["name"].as_str().is_some_and(|name| loaded.contains(name)));
-    }
-    tools
-}
-
-pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
-    match block["type"].as_str()? {
-        "text" => block["text"].as_str().map(String::from),
-        "tool_reference" => block["tool_name"].as_str().or_else(|| block["name"].as_str()).map(|name| format!("Tool {name} is available.")),
-        _ => None,
-    }
 }
 
 fn function_response(b: &Value, names: &HashMap<String, String>, fam: &str) -> Value {
@@ -1770,164 +1414,10 @@ fn clean(v: &Value, root: &Value, depth: u32) -> (Value, bool) {
     (Value::Object(out), nullable)
 }
 
-// ---------------------------------------------------------------- Cloud Code SSE → Anthropic
-
-#[derive(Debug)]
-enum Stop {
-    /// Nothing reached Claude Code yet: try again (optionally blocking the account for that many seconds).
-    Retry(Failure, Option<u64>),
-    /// The client hung up, or the error already went out as an SSE `error` event.
-    Gone,
-}
-
-struct Tx<'a> {
-    out: Option<&'a mut TcpStream>,
-    sigs: &'a Mutex<HashMap<String, String>>,
-    model: String,
-    fam: &'static str,
-    id: String,
-    /// Some content was produced (and, when streaming, sent).
-    started: bool,
-    blocks: Vec<Value>,
-    open: Option<&'static str>,
-    /// Signature for the open thinking block (already tagged: `ag:…` or `oa:…`), emitted as `signature_delta` when it closes.
-    sig: String,
-    /// Leading whitespace held back so an empty answer can still be retried.
-    pending: String,
-    usage: (u64, u64, u64),
-    finish: Option<String>,
-    finish_note: String,
-    stop_reason: &'static str,
-    /// Google Search grounding: the queries run and the pages cited, (url, title), replayed as Anthropic web-search blocks.
-    queries: Vec<String>,
-    links: Vec<(String, String)>,
-    // ---- ChatGPT (Responses API) only
-    /// Arguments streamed so far into the open function call.
-    args: String,
-    /// `response.completed` / `response.incomplete` arrived.
-    done: bool,
-    max_tokens: bool,
-    /// Tools go out in a namespace, so a returned call name may carry its prefix.
-    wrap: bool,
-    /// What an `unsupported_capability` failure named (`error.param`): the caller may retry without it.
-    param: String,
-}
+// ---------------------------------------------------------------- Provider-specific `Tx` stream translation (the shared writer is in `sse`)
 
 impl<'a> Tx<'a> {
-    /// `model` is what runs; replies name `shown`, the model Claude Code asked for.
-    fn new(model: &str, shown: &str, out: Option<&'a mut TcpStream>, sigs: &'a Mutex<HashMap<String, String>>) -> Self {
-        Tx {
-            out,
-            sigs,
-            model: shown.to_string(),
-            fam: family(model),
-            id: format!("msg_{}", antigravity::random_hex(12)),
-            started: false,
-            blocks: Vec::new(),
-            open: None,
-            sig: String::new(),
-            pending: String::new(),
-            usage: (0, 0, 0),
-            finish: None,
-            finish_note: String::new(),
-            stop_reason: "end_turn",
-            queries: Vec::new(),
-            links: Vec::new(),
-            args: String::new(),
-            done: false,
-            max_tokens: false,
-            wrap: false,
-            param: String::new(),
-        }
-    }
-
-    fn usage_json(&self) -> Value {
-        let (prompt, cached, output) = self.usage;
-        let mut u = json!({ "input_tokens": prompt - cached, "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0, "output_tokens": output });
-        if !self.queries.is_empty() {
-            u["server_tool_use"] = json!({ "web_search_requests": self.queries.len() });
-        }
-        u
-    }
-
-    fn send(&mut self, name: &str, data: Value) -> Result<(), Stop> {
-        let Some(s) = self.out.as_deref_mut() else { return Ok(()) };
-        write!(s, "event: {name}\ndata: {data}\n\n").and_then(|_| s.flush()).map_err(|_| Stop::Gone)
-    }
-
-    fn begin(&mut self) -> Result<(), Stop> {
-        if self.started {
-            return Ok(());
-        }
-        self.started = true;
-        if let Some(s) = self.out.as_deref_mut() {
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").map_err(|_| Stop::Gone)?;
-        }
-        let message = json!({
-            "id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": [],
-            "stop_reason": null, "stop_sequence": null, "usage": self.usage_json(),
-        });
-        self.send("message_start", json!({ "type": "message_start", "message": message }))
-    }
-
-    fn close(&mut self) -> Result<(), Stop> {
-        let Some(kind) = self.open.take() else { return Ok(()) };
-        let index = self.blocks.len() - 1;
-        if kind == "tool" {
-            let args = std::mem::take(&mut self.args);
-            self.blocks[index]["input"] = serde_json::from_str(&args).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
-        }
-        if kind == "thinking" && !self.sig.is_empty() {
-            let sig = std::mem::take(&mut self.sig);
-            self.blocks[index]["signature"] = json!(sig);
-            self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "signature_delta", "signature": sig } }))?;
-        }
-        self.send("content_block_stop", json!({ "type": "content_block_stop", "index": index }))
-    }
-
-    /// Opens a `text` or `thinking` block unless one of that kind is open.
-    fn open_block(&mut self, kind: &'static str) -> Result<(), Stop> {
-        if self.open != Some(kind) {
-            self.close()?;
-            self.begin()?;
-            let block = if kind == "text" { json!({ "type": "text", "text": "" }) } else { json!({ "type": "thinking", "thinking": "", "signature": "" }) };
-            self.send("content_block_start", json!({ "type": "content_block_start", "index": self.blocks.len(), "content_block": block }))?;
-            self.blocks.push(block);
-            self.open = Some(kind);
-        }
-        Ok(())
-    }
-
-    fn delta(&mut self, kind: &'static str, text: &str) -> Result<(), Stop> {
-        self.open_block(kind)?;
-        let index = self.blocks.len() - 1;
-        let block = &mut self.blocks[index][kind];
-        *block = json!(format!("{}{text}", block.as_str().unwrap_or("")));
-        let delta = if kind == "text" { json!({ "type": "text_delta", "text": text }) } else { json!({ "type": "thinking_delta", "thinking": text }) };
-        self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": delta }))
-    }
-
-    fn text(&mut self, text: &str) -> Result<(), Stop> {
-        if !self.started && text.trim().is_empty() {
-            self.pending.push_str(text);
-            return Ok(());
-        }
-        let text = format!("{}{text}", std::mem::take(&mut self.pending));
-        self.delta("text", &text)
-    }
-
-    /// A `tool_use` (or `server_tool_use`) block, sent whole: Cloud Code hands over function calls complete.
-    fn tool(&mut self, kind: &str, id: String, name: &str, args: Value) -> Result<(), Stop> {
-        self.close()?;
-        self.begin()?;
-        let index = self.blocks.len();
-        self.send("content_block_start", json!({ "type": "content_block_start", "index": index, "content_block": { "type": kind, "id": id, "name": name, "input": {} } }))?;
-        self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": args.to_string() } }))?;
-        self.send("content_block_stop", json!({ "type": "content_block_stop", "index": index }))?;
-        self.blocks.push(json!({ "type": kind, "id": id, "name": name, "input": args }));
-        Ok(())
-    }
-
+    // ---- Antigravity (Cloud Code)
     /// Grounding comes back as metadata, not as a tool call; Claude Code's WebSearch reads it from these two blocks.
     /// ponytail: one search block for all queries, with the cited pages; links are Google's redirect URLs, not resolved.
     fn search_results(&mut self) -> Result<(), Stop> {
@@ -1937,7 +1427,7 @@ impl<'a> Tx<'a> {
         if self.queries.is_empty() {
             self.queries.push(String::new());
         }
-        let id = format!("srvtoolu_{}", antigravity::random_hex(12));
+        let id = format!("srvtoolu_{}", common::random_hex(12));
         self.tool("server_tool_use", id.clone(), "web_search", json!({ "query": self.queries.join("; ") }))?;
         let results: Vec<Value> = self
             .links
@@ -1954,27 +1444,6 @@ impl<'a> Tx<'a> {
 
     // ---- ChatGPT: Responses API events → Anthropic. Nothing is written until the first output event, so a failure
     // before it is still a retry (account rotation, the tier's fallbacks).
-
-    /// A function call opens a `tool_use` block; its arguments stream into it.
-    fn call_start(&mut self, id: &str, name: &str) -> Result<(), Stop> {
-        self.close()?;
-        self.begin()?;
-        let index = self.blocks.len();
-        let block = json!({ "type": "tool_use", "id": id, "name": name, "input": {} });
-        self.send("content_block_start", json!({ "type": "content_block_start", "index": index, "content_block": block }))?;
-        self.blocks.push(block);
-        (self.open, self.args) = (Some("tool"), String::new());
-        Ok(())
-    }
-
-    fn call_args(&mut self, part: &str) -> Result<(), Stop> {
-        if self.open != Some("tool") || part.is_empty() {
-            return Ok(());
-        }
-        self.args.push_str(part);
-        let index = self.blocks.len() - 1;
-        self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": part } }))
-    }
 
     /// The model may hand back a name still carrying the namespace its tools were sent in.
     fn call_name(&self, name: &str) -> String {
@@ -2037,7 +1506,7 @@ impl<'a> Tx<'a> {
         match s("type") {
             "response.output_item.added" if v["item"]["type"] == "function_call" => {
                 let i = &v["item"];
-                let id = i["call_id"].as_str().or(i["id"].as_str()).filter(|x| !x.is_empty()).map_or_else(|| format!("toolu_{}", antigravity::random_hex(12)), String::from);
+                let id = i["call_id"].as_str().or(i["id"].as_str()).filter(|x| !x.is_empty()).map_or_else(|| format!("toolu_{}", common::random_hex(12)), String::from);
                 self.call_start(&id, &self.call_name(i["name"].as_str().unwrap_or("")))
             }
             "response.output_text.delta" => self.text(s("delta")),
@@ -2103,161 +1572,6 @@ impl<'a> Tx<'a> {
         self.send("message_stop", json!({ "type": "message_stop" }))
     }
 
-    fn heartbeat(&mut self) -> Result<(), Stop> {
-        self.begin()?;
-        self.send("ping", json!({"type":"ping"}))
-    }
-
-    /// OpenAI-compatible Chat Completions SSE stream -> Anthropic events.
-    fn run_openai_chat(&mut self, reader: Box<dyn BufRead + Send>, provider: &str) -> Result<(), Stop> {
-        let mut in_think = false;
-        let mut current_tool_idx: Option<u64> = None;
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("{provider} stream broke: {e}"), retry_after: None }, Some(0))),
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with(':') || trimmed.strip_prefix("event:").is_some_and(|event| event.trim() == "ping") {
-                self.heartbeat()?;
-                continue;
-            }
-            let Some(d) = trimmed.strip_prefix("data:") else {
-                continue;
-            };
-            let data = d.trim();
-            if data == "[DONE]" {
-                self.done = true;
-                break;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            if v["ccat_ping"] == true || v["type"] == "ping" {
-                self.heartbeat()?;
-                continue;
-            }
-            if let Some(err) = v.get("error").filter(|e| e.is_object()) {
-                let msg = err["message"].as_str().unwrap_or("Upstream chat stream error");
-                return Err(self.fail(Failure { status: 500, message: format!("{provider}: {msg}"), retry_after: None }, None));
-            }
-            if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-                let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-                let comp = u["completion_tokens"].as_u64().unwrap_or(0);
-                self.usage = (prompt, 0, comp);
-            }
-            let Some(choice) = v["choices"].as_array().and_then(|c| c.first()) else {
-                continue;
-            };
-            let delta = &choice["delta"];
-
-            // 1. Thinking / reasoning delta (DeepSeek-R1 / Qwen native field)
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                self.delta("thinking", reasoning)?;
-            }
-
-            // 2. Text content (with inline <think>...</think> tag handling)
-            if let Some(content) = delta.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                let mut rem = content;
-                while !rem.is_empty() {
-                    if !in_think {
-                        if let Some(start) = rem.find("<think>") {
-                            let before = &rem[..start];
-                            if !before.is_empty() {
-                                self.text(before)?;
-                            }
-                            in_think = true;
-                            rem = &rem[start + 7..];
-                        } else {
-                            self.text(rem)?;
-                            break;
-                        }
-                    } else if let Some(end) = rem.find("</think>") {
-                        let thinking_part = &rem[..end];
-                        if !thinking_part.is_empty() {
-                            self.delta("thinking", thinking_part)?;
-                        }
-                        in_think = false;
-                        self.close()?;
-                        rem = &rem[end + 8..];
-                    } else {
-                        self.delta("thinking", rem)?;
-                        break;
-                    }
-                }
-            }
-
-            // 3. Tool calls
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for tc in tool_calls {
-                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                    let tc_id = tc["id"].as_str().filter(|s| !s.is_empty());
-                    let func_name = tc["function"]["name"].as_str().filter(|s| !s.is_empty());
-                    let func_args = tc["function"]["arguments"].as_str().filter(|s| !s.is_empty());
-
-                    if current_tool_idx != Some(idx) {
-                        current_tool_idx = Some(idx);
-                        let id = tc_id.map(String::from).unwrap_or_else(|| format!("call_{}", antigravity::random_hex(12)));
-                        let name = func_name.unwrap_or("");
-                        self.call_start(&id, name)?;
-                    } else {
-                        if let Some(id) = tc_id {
-                            let last = self.blocks.len().saturating_sub(1);
-                            if self.open == Some("tool") && !self.blocks.is_empty() {
-                                self.blocks[last]["id"] = json!(id);
-                            }
-                        }
-                        if let Some(name) = func_name {
-                            let last = self.blocks.len().saturating_sub(1);
-                            if self.open == Some("tool") && !self.blocks.is_empty() {
-                                self.blocks[last]["name"] = json!(name);
-                            }
-                        }
-                    }
-                    if let Some(args) = func_args {
-                        self.call_args(args)?;
-                    }
-                }
-            }
-
-            // 4. Finish reason
-            if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
-                self.done = true;
-                self.stop_reason = match finish {
-                    "tool_calls" => "tool_use",
-                    "length" => "max_tokens",
-                    _ => "end_turn",
-                };
-            }
-        }
-
-        self.close()?;
-        self.begin()?;
-        let (usage, stop) = (self.usage_json(), self.stop_reason);
-        self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
-        self.send("message_stop", json!({ "type": "message_stop" }))
-    }
-
-    /// Fails the request: retryable while nothing was sent, otherwise an SSE `error` event (overloaded → Claude Code retries).
-    fn fail(&mut self, f: Failure, block: Option<u64>) -> Stop {
-        if self.started && self.out.is_some() {
-            // Overloaded makes Claude Code retry; a client error must not, or it retries a dead request for ever.
-            let kind = match f.status {
-                429 => "rate_limit_error",
-                400..=499 => error_kind(f.status),
-                _ => "overloaded_error",
-            };
-            let _ = self.send("error", json!({ "type": "error", "error": { "type": kind, "message": f.message } }));
-            antigravity::log(&format!("{}: failed mid-stream: {}", self.model, f.message));
-            return Stop::Gone;
-        }
-        Stop::Retry(f, block)
-    }
-
     fn chunk(&mut self, v: &Value) -> Result<(), Stop> {
         if let Some(e) = v.get("error").filter(|e| e.is_object()) {
             let code = e["code"].as_u64().unwrap_or(500) as u16;
@@ -2287,7 +1601,7 @@ impl<'a> Tx<'a> {
             let sig = part["thoughtSignature"].as_str().filter(|s| !s.is_empty());
             if let Some(fc) = part.get("functionCall") {
                 let given = fc["id"].as_str().filter(|id| !id.is_empty() && !self.blocks.iter().any(|b| b["id"] == *id));
-                let id = given.map_or_else(|| format!("toolu_{}", antigravity::random_hex(12)), String::from);
+                let id = given.map_or_else(|| format!("toolu_{}", common::random_hex(12)), String::from);
                 if let Some(sig) = sig {
                     self.sigs.lock().unwrap().insert(id.clone(), tag(self.fam, sig));
                 }
@@ -2390,18 +1704,13 @@ impl<'a> Tx<'a> {
         self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
         self.send("message_stop", json!({ "type": "message_stop" }))
     }
-
-    fn message(&self) -> Value {
-        json!({
-            "id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": self.blocks,
-            "stop_reason": self.stop_reason, "stop_sequence": null, "usage": self.usage_json(),
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::sse::{weigh, DEFAULT_RATIO, IMAGE_TOKENS};
+    use std::io::Read;
 
     #[test]
     fn upstream_keepalive_comments_reach_claude_before_content() {
@@ -2533,14 +1842,6 @@ mod tests {
         assert_eq!(c["properties"]["link"]["enum"], json!(["https"]), "no empty enum members");
         assert_eq!(clean_schema(&json!({ "type": "string" })), json!({ "type": "object", "properties": {} }));
         assert_eq!(clean_schema(&json!({ "$ref": "#/$defs/a", "$defs": { "a": { "$ref": "#/$defs/a" } } }))["type"], "object", "self-ref terminates");
-    }
-
-    #[test]
-    fn signatures_only_replay_on_their_family() {
-        assert_eq!(untag(Some("ag:claude:QUJD"), "claude"), Some("QUJD"));
-        assert_eq!(untag(Some("ag:claude:QUJD"), "gemini"), None);
-        assert_eq!(untag(Some("EqQBCkgIBh"), "claude"), None, "Anthropic's own signature");
-        assert_eq!(untag(Some("ag:claude:not base64!"), "claude"), None);
     }
 
     #[test]
@@ -3013,26 +2314,6 @@ Content-Length: {}
     }
 
     #[test]
-    fn meter_reads_usage_from_streams_and_messages() {
-        let mut m = Meter { sse: true, ..Default::default() };
-        let stream = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":3000,\"output_tokens\":1}}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n"
-        );
-        // Split mid-line, as network reads are.
-        let (a, b) = stream.as_bytes().split_at(57);
-        m.feed(a);
-        m.feed(b);
-        let u = m.finish();
-        assert_eq!((u["input_tokens"].as_u64(), u["output_tokens"].as_u64(), u["cache_read_input_tokens"].as_u64()), (Some(12), Some(42), Some(3000)));
-
-        let mut m = Meter::default();
-        m.feed(br#"{"type":"message","usage":{"input_tokens":5,"output_tokens":7}}"#);
-        assert_eq!(m.finish()["output_tokens"], 7, "a non-streamed message");
-    }
-
-    #[test]
     fn all_blocked_is_a_429_with_retry_after() {
         let (url, _) = fake_upstream(reply());
         let proxy = serve_pool(Pool::fake(&url, &["quota"]), Vec::new(), PathBuf::new()).unwrap();
@@ -3191,7 +2472,7 @@ Content-Length: {}
     #[test]
     fn mcp_generates_and_saves_images() {
         let (url, _) = fake_upstream(reply());
-        let dir = std::env::temp_dir().join(format!("ccat-mcp-{}", antigravity::random_hex(4)));
+        let dir = std::env::temp_dir().join(format!("ccat-mcp-{}", common::random_hex(4)));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("in.png"), b"png").unwrap();
         let proxy = serve_pool(Pool::fake(&url, &["image"]), Vec::new(), dir.clone()).unwrap();
@@ -3774,7 +3055,7 @@ Content-Length: {}
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("ccat-e2e-{}", antigravity::random_hex(4)));
+        let dir = std::env::temp_dir().join(format!("ccat-e2e-{}", common::random_hex(4)));
         std::fs::create_dir_all(&dir).unwrap();
         // As ccat launches it: a Claude name for the main model, everything else falling back to it.
         let aliases = ag("claude-sonnet-4-6", "gemini-3.1-pro-low");
@@ -3815,52 +3096,6 @@ Content-Length: {}
         assert!(out.contains("Saved"), "MCP tool result should reach the model.\n{out}\n{:?}", seen.lock().unwrap());
         assert!(dir.join("out/cat.png").exists(), "image saved in the launch folder");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn openai_chat_text_and_thinking_streams() {
-        let sigs = Mutex::new(HashMap::new());
-        let mut tx = Tx::new("llama3.2", "claude-sonnet-5-5", None, &sigs);
-        let sse = "\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"reasoning_content\":\"reason step 1\\n\"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"<think>reason step 2</think>Hello \"},\"finish_reason\":null}]}\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"world!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":8}}\n\
-data: [DONE]\n\n";
-
-        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(sse.as_bytes()));
-        tx.run_openai_chat(reader, "Ollama").unwrap();
-        let msg = tx.message();
-        assert_eq!(msg["stop_reason"], "end_turn");
-        let content = msg["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "thinking");
-        assert_eq!(content[0]["thinking"], "reason step 1\nreason step 2");
-        assert_eq!(content[1]["type"], "text");
-        assert_eq!(content[1]["text"], "Hello world!");
-        assert_eq!(tx.usage.0, 15);
-        assert_eq!(tx.usage.2, 8);
-    }
-
-    #[test]
-    fn openai_chat_tool_calls_stream() {
-        let sigs = Mutex::new(HashMap::new());
-        let mut tx = Tx::new("qwen2.5-coder:32b", "claude-sonnet-5-5", None, &sigs);
-        let sse = "\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_99\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\": \"}}]},\"finish_reason\":null}]}\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
-data: [DONE]\n\n";
-
-        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(sse.as_bytes()));
-        tx.run_openai_chat(reader, "Ollama").unwrap();
-        let msg = tx.message();
-        assert_eq!(msg["stop_reason"], "tool_use");
-        let content = msg["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "tool_use");
-        assert_eq!(content[0]["id"], "call_99");
-        assert_eq!(content[0]["name"], "Bash");
-        assert_eq!(content[0]["input"], json!({ "command": "ls" }));
     }
 
     #[test]
@@ -3913,7 +3148,7 @@ data: [DONE]\n\n";
     #[test]
     #[ignore = "uses the real Claude CLI and signed-in Muse account"]
     fn live_claude_code_muse_greeting_and_tool_search() {
-        let dir = std::env::temp_dir().join(format!("ccat-muse-cli-{}", antigravity::random_hex(8)));
+        let dir = std::env::temp_dir().join(format!("ccat-muse-cli-{}", common::random_hex(8)));
         std::fs::create_dir(&dir).unwrap();
         std::fs::create_dir(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(".claude/settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}"#).unwrap();

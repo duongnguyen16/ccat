@@ -2,7 +2,8 @@
 //! has no built-in tool for — today image generation/editing with Gemini's image model (Antigravity's `generate_image`).
 //! ccat registers it with Claude Code as the `antigravity` server, so the tool shows up as `mcp__antigravity__generate_image`.
 
-use crate::antigravity::{self, Pool};
+use crate::antigravity::Pool;
+use crate::common;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use std::{
@@ -92,7 +93,7 @@ fn generate_image(pool: &Pool, folder: &Path, args: &Value) -> Result<Vec<Value>
         "model": IMAGE_MODEL,
         "userAgent": "antigravity",
         "requestType": "agent",
-        "requestId": format!("agent/{}", antigravity::uuid()),
+        "requestId": format!("agent/{}", common::uuid()),
         "request": { "contents": [{ "role": "user", "parts": parts }], "generationConfig": gen },
     });
     let (_, reader) = pool.stream(IMAGE_MODEL, &body, false).map_err(|f| f.message)?;
@@ -109,13 +110,13 @@ fn generate_image(pool: &Pool, folder: &Path, args: &Value) -> Result<Vec<Value>
     };
     let path = match args["path"].as_str().filter(|p| !p.trim().is_empty()) {
         Some(p) => resolve(folder, p).with_extension(ext),
-        None => folder.join("generated").join(format!("image-{}.{ext}", antigravity::random_hex(4))),
+        None => folder.join("generated").join(format!("image-{}.{ext}", common::random_hex(4))),
     };
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     }
     fs::write(&path, &bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-    antigravity::log(&format!("generate_image → {} ({} bytes)", path.display(), bytes.len()));
+    common::log(&format!("generate_image → {} ({} bytes)", path.display(), bytes.len()));
     let mut note = format!("Saved {} ({} KB, {mime}).", path.display(), bytes.len().div_ceil(1024));
     if !text.is_empty() {
         note.push_str(&format!("\nModel note: {text}"));

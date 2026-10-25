@@ -36,7 +36,7 @@ fn chrome() -> Option<PathBuf> {
 }
 fn start(url: &str) -> Result<Browser, String> {
     let exe = chrome().ok_or("Google Chrome not found; install Chrome or set CHROME_PATH")?;
-    let profile = super::ccat_data_dir().join(format!("muse-login-{}", crate::antigravity::random_hex(12)));
+    let profile = super::ccat_data_dir().join(format!("muse-login-{}", crate::common::random_hex(12)));
     fs::create_dir_all(profile.parent().ok_or("Invalid profile path")?).map_err(|e| e.to_string())?;
     fs::create_dir(&profile).map_err(|e| e.to_string())?;
     if let Err(e) = secure_directory(&profile) { let _ = fs::remove_dir(&profile); return Err(e); }
@@ -146,7 +146,7 @@ fn save(dir: &Path, document: &Value) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     secure_directory(dir)?;
     let target = dir.join("cookies.txt");
-    let temp = dir.join(format!("cookies-{}.tmp", crate::antigravity::random_hex(12)));
+    let temp = dir.join(format!("cookies-{}.tmp", crate::common::random_hex(12)));
     let result = (|| {
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -157,7 +157,7 @@ fn save(dir: &Path, document: &Value) -> Result<(), String> {
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
         if target.is_file() {
-            let backup = dir.join(format!("cookies-{}.bak", crate::antigravity::random_hex(12)));
+            let backup = dir.join(format!("cookies-{}.bak", crate::common::random_hex(12)));
             fs::copy(&target, &backup).map_err(|e| e.to_string())?;
             secure_file(&backup)?;
         }
@@ -193,7 +193,7 @@ mod tests {
     }
     #[test]
     fn credential_save_preserves_unrelated_files_and_previous_login() {
-        let dir = std::env::temp_dir().join(format!("ccat-native-login-{}", crate::antigravity::random_hex(12)));
+        let dir = std::env::temp_dir().join(format!("ccat-native-login-{}", crate::common::random_hex(12)));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("config.json"), "unrelated config").unwrap();
         fs::write(dir.join("cookies.txt"), "hatch_sess=old").unwrap();

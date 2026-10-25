@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::{net::{TcpStream, ToSocketAddrs}, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tungstenite::{client::IntoClientRequest, stream::MaybeTlsStream, protocol::WebSocketConfig, WebSocket, Message as WsMessage};
-use crate::antigravity::Failure;
+use crate::common::Failure;
 
 pub(super) const MAX_BODY: usize = 16 * 1024 * 1024;
 const CHUNK: usize = 60_000; // Leave room for protobuf metadata and the AES-GCM tag.
@@ -239,7 +239,7 @@ impl Gateway {
     pub fn open(&mut self, verb: &str, path: &str, body: Option<&Value>) -> Result<i64, Failure> {
         if self.cancel.load(Ordering::Relaxed) { return Err(fail(499, "MuseAI request cancelled")); }
         self.stream += 1;
-        let request = ApplicationRequest { verb: verb.into(), path: path.into(), headers: vec![Header { key: "content-type".into(), value: "application/json".into() }, Header { key: "x-request-id".into(), value: crate::antigravity::random_hex(16) }], body: body.map(|b| b.to_string().into_bytes()).unwrap_or_default(), end_body: true };
+        let request = ApplicationRequest { verb: verb.into(), path: path.into(), headers: vec![Header { key: "content-type".into(), value: "application/json".into() }, Header { key: "x-request-id".into(), value: crate::common::random_hex(16) }], body: body.map(|b| b.to_string().into_bytes()).unwrap_or_default(), end_body: true };
         let frame = ServiceFrame { stream_id: self.stream, kind: Some(FrameKind::Request(request)) };
         let envelope = ServiceRequest { service: 0, payload: frame.encode_to_vec() }.encode_to_vec();
         for packet in pack(&mut self.noise, &envelope)? {
@@ -473,7 +473,7 @@ mod tests {
         let path = format!("/chat/history?limit=10&session_id={}", encode_query(&sid));
         let outcome = (|| -> Result<(), Failure> {
             let baseline = gateway.request("GET", &path, None)?["chat_events"].as_array().map(|a| a.iter().filter_map(|e| e["seq"].as_i64()).max().unwrap_or(0)).unwrap_or(0);
-            gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Reply with exactly CCAT_NATIVE_OK. Do not use tools."}],"node_id":crate::antigravity::random_hex(8),"capabilities":{},"session_id":sid})))?;
+            gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Reply with exactly CCAT_NATIVE_OK. Do not use tools."}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":sid})))?;
             let deadline = Instant::now() + Duration::from_secs(120);
             while Instant::now() < deadline {
                 let history = gateway.request("GET", &path, None)?;
@@ -509,7 +509,7 @@ mod tests {
         let sid = started["session_id"].as_str().unwrap().to_string();
         let path = format!("/chat/history?limit=20&session_id={}", encode_query(&sid));
         let result = (|| -> Result<Vec<(String, usize)>, Failure> {
-            gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Write a short paragraph of about 100 words about a fictional garden."}],"node_id":crate::antigravity::random_hex(8),"capabilities":{},"session_id":sid})))?;
+            gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Write a short paragraph of about 100 words about a fictional garden."}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":sid})))?;
             let mut snapshots = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(120);
             while Instant::now() < deadline {

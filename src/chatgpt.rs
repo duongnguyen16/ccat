@@ -8,7 +8,7 @@
 //! across processes by a lock file. The UI process signs in and out; the proxy only reads.
 
 use crate::{
-    antigravity::{agent, log, Failure},
+    common::{agent, log, Failure},
     now,
 };
 use base64::{
@@ -792,7 +792,7 @@ impl Pool {
 impl Pool {
     /// Accounts whose access token is their name, in a scratch folder, pointed at a fake API.
     pub fn fake(base: &str, names: &[&str]) -> Pool {
-        let dir = std::env::temp_dir().join(format!("ccat-gpt-{}", crate::antigravity::random_hex(6)));
+        let dir = std::env::temp_dir().join(format!("ccat-gpt-{}", crate::common::random_hex(6)));
         let accounts = names
             .iter()
             .map(|n| {
@@ -835,7 +835,7 @@ mod tests {
     use serde_json::json;
 
     fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ccat-gpt-{tag}-{}", crate::antigravity::random_hex(4)));
+        let d = std::env::temp_dir().join(format!("ccat-gpt-{tag}-{}", crate::common::random_hex(4)));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

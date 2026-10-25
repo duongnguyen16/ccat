@@ -3,7 +3,7 @@
 mod native;
 mod login;
 
-use crate::antigravity::Failure;
+use crate::common::Failure;
 use native::{fail, Gateway};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -71,7 +71,7 @@ pub fn remove_account() -> Result<(), String> {
     let path = account_dir().join("cookies.txt");
     if path.exists() {
         // Do not destroy an older backup on repeated sign-out.
-        let backup = path.with_extension(format!("txt.bak.{}", crate::antigravity::random_hex(6)));
+        let backup = path.with_extension(format!("txt.bak.{}", crate::common::random_hex(6)));
         fs::rename(&path, &backup).map_err(|e| e.to_string())?;
         secure_file(&backup)?;
     }
@@ -101,7 +101,7 @@ pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<String>, Str
 /// Preserve all tool IDs and result blocks when rendering the text-oriented Muse API.
 pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
     let mut messages = Vec::new();
-    let mut tools = crate::proxy::client_tools(body);
+    let mut tools = crate::proxy::sse::client_tools(body);
     if !body["system"].is_null() {
         let text = if let Some(s) = body["system"].as_str() { s.to_string() } else {
             body["system"].as_array().into_iter().flatten().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n")
@@ -217,7 +217,7 @@ fn reply_delta(text: &str, tools: &Value) -> Result<Value, Failure> {
         let schema = tool_schema(function);
         let validator = jsonschema::options().offline().build(&schema).map_err(|_| fail(400, "Invalid tool schema"))?;
         if !args.is_object() || !validator.is_valid(args) { return Err(fail(502, "MuseAI returned tool arguments that do not match the schema")); }
-        output.push(json!({"index":index,"id":format!("call_{}",crate::antigravity::random_hex(12)),"type":"function","function":{"name":name,"arguments":args.to_string()}}));
+        output.push(json!({"index":index,"id":format!("call_{}",crate::common::random_hex(12)),"type":"function","function":{"name":name,"arguments":args.to_string()}}));
     }
     Ok(json!({"tool_calls":output}))
 }
@@ -245,7 +245,7 @@ struct Chat { gateway: Gateway, session: String }
 impl Drop for Chat {
     fn drop(&mut self) {
         if self.gateway.cleanup(&self.session).is_err() {
-            crate::antigravity::log("MuseAI: could not clean up a ccat request session after disconnect");
+            crate::common::log("MuseAI: could not clean up a ccat request session after disconnect");
         }
     }
 }
@@ -297,12 +297,12 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     let gateway = Gateway::connect(&id, cancel.clone())?;
     let tools = effective_tools(payload);
     let tool_choice = payload.get("tool_choice").cloned();
-    let request_id = crate::antigravity::random_hex(8);
-    crate::antigravity::log(&json!({"event":"muse_native_request","phase":"start","request_id":request_id,"prompt_bytes":prompt.len(),"prompt_characters":prompt.chars().count(),"active_tools":tools.as_array().map_or(0, Vec::len),"usage_source":"unavailable"}).to_string());
+    let request_id = crate::common::random_hex(8);
+    crate::common::log(&json!({"event":"muse_native_request","phase":"start","request_id":request_id,"prompt_bytes":prompt.len(),"prompt_characters":prompt.chars().count(),"active_tools":tools.as_array().map_or(0, Vec::len),"usage_source":"unavailable"}).to_string());
     std::thread::Builder::new().name("muse-native".into()).spawn(move || {
         let _slot = slot;
         let result = run_chat(gateway, &prompt, &tools, tool_choice.as_ref(), &tx, &cancel);
-        crate::antigravity::log(&json!({"event":"muse_native_request","phase":"end","request_id":request_id,"status":result.as_ref().err().map_or(200, |f| f.status),"elapsed_ms":started.elapsed().as_millis(),"usage_source":"unavailable"}).to_string());
+        crate::common::log(&json!({"event":"muse_native_request","phase":"end","request_id":request_id,"status":result.as_ref().err().map_or(200, |f| f.status),"elapsed_ms":started.elapsed().as_millis(),"usage_source":"unavailable"}).to_string());
         if let Err(f) = result { let _ = tx.send(Err(io::Error::other(f.message))); }
     }).map_err(|_| fail(500, "Could not start native MuseAI worker"))?;
     Ok(Box::new(BufReader::new(reader)))
@@ -314,7 +314,7 @@ fn run_chat(mut gateway: Gateway, prompt: &str, tools: &Value, tool_choice: Opti
     let path = format!("/chat/history?limit=20&session_id={}", native::encode_query(&chat.session));
     let history = chat.gateway.request("GET", &path, None)?;
     let baseline = history["chat_events"].as_array().ok_or_else(|| fail(502, "MuseAI returned invalid history"))?.iter().filter_map(|e| e["seq"].as_i64()).max().unwrap_or(0);
-    chat.gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":prompt}],"node_id":crate::antigravity::random_hex(8),"capabilities":{},"session_id":chat.session})))?;
+    chat.gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":prompt}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":chat.session})))?;
     let deadline = Instant::now() + REPLY_TIMEOUT;
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         emit(tx, json!({"ccat_ping":true}))?;
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(call["function"]["name"], "ccat_probe", "Muse must request the declared client tool");
         let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args, json!({"probe":"native"}));
-        let marker = format!("CCAT_{}", crate::antigravity::random_hex(8));
+        let marker = format!("CCAT_{}", crate::common::random_hex(8));
         body["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","content":[{"type":"tool_use","id":call["id"],"name":"ccat_probe","input":args}]}),
             json!({"role":"user","content":[{"type":"tool_result","tool_use_id":call["id"],"content":marker}]}),

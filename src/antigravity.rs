@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::common::{agent, fail, log, log_path, random_hex, Failure};
+
 const ENDPOINTS: [&str; 2] = ["https://daily-cloudcode-pa.googleapis.com", "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 // Antigravity's public desktop OAuth client; base64 only so secret scanners leave it alone.
 const CLIENT_ID: &str = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
@@ -62,33 +64,10 @@ pub fn plan_label(plan: &str) -> &'static str {
     }
 }
 
-/// Errors reach the GUI as text and the proxy as an HTTP status for Claude Code.
-#[derive(Debug)]
-pub struct Failure {
-    pub status: u16,
-    pub message: String,
-    pub retry_after: Option<u64>,
-}
-
-fn fail(status: u16, message: impl Into<String>) -> Failure {
-    Failure { status, message: message.into(), retry_after: None }
-}
-
 // ---------------------------------------------------------------- small helpers
 
 fn unb64(s: &str) -> String {
     String::from_utf8(B64.decode(s).expect("embedded base64")).expect("embedded utf-8")
-}
-
-pub fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("OS randomness");
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-pub fn uuid() -> String {
-    let h = random_hex(16);
-    format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
 }
 
 pub fn enc(s: &str) -> String {
@@ -111,16 +90,6 @@ pub fn dec(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-pub fn agent(global: Option<Duration>) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(300)))
-        .timeout_global(global)
-        .build()
-        .into()
 }
 
 /// Google's `error.message` from a JSON error body, else the (trimmed) raw text.
@@ -172,25 +141,6 @@ pub fn retry_secs_in(v: &Value) -> Option<u64> {
 
 fn retry_secs(text: &str) -> Option<u64> {
     retry_secs_in(&serde_json::from_str(text).ok()?)
-}
-
-/// Appends to `antigravity.log` next to the config: claude owns the terminal while the proxy runs.
-pub fn log(line: &str) {
-    if cfg!(test) {
-        return;
-    }
-    let path = log_path();
-    let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 2_000_000);
-    let file = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path);
-    if let Ok(mut f) = file {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        // Several ccat sessions can share this log; the pid tells their lines apart.
-        let _ = writeln!(f, "{secs} [{}] {line}", std::process::id());
-    }
-}
-
-pub fn log_path() -> std::path::PathBuf {
-    crate::config_path().with_file_name("antigravity.log")
 }
 
 /// The backend gates newer models on the client version, so track the live Antigravity release.
