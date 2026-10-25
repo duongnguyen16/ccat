@@ -1370,9 +1370,9 @@ impl Feed {
         Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default(), stats: Default::default() }
     }
 
-    /// A provider page's header card: its tokens per day by model over the last `DAYS`, counted from `tokens.jsonl`
+    /// A provider page's tokens card (an item of `g`): its tokens per day by model over the last `DAYS`, counted from `tokens.jsonl`
     /// records whose provider is `provider`. The file is looked at every 3 seconds and read again only when it changed.
-    pub(crate) fn analytics(&self, ui: &mut egui::Ui, provider: &str) {
+    pub(crate) fn analytics(&self, ui: &mut egui::Ui, g: &mut crate::settings::Cards, provider: &str) {
         let (p, today) = (crate::pal(ui), local_day(now()));
         // The range is shared by the provider pages and lasts as long as this window.
         let range_id = egui::Id::new("tokens-range-days");
@@ -1389,11 +1389,11 @@ impl Feed {
             }
         }
         let st = &cache[&key].0;
-        crate::settings::card(ui, |ui| {
-            row(ui, SECTION_H, |ui| {
+        g.item(ui, |ui| {
+            row(ui, SECTION_H.max(34.0), |ui| {
                 ui.label(egui::RichText::new("Tokens by model").family(crate::anthropic()).size(16.0).color(p.fg));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if segmented(ui, &mut days, &[(7, "7d"), (30, "30d"), (90, "90d")]) {
+                    if segmented_lg(ui, &mut days, &[(7, "7d"), (30, "30d"), (90, "90d")]) {
                         ui.data_mut(|d| d.insert_temp(range_id, days));
                     }
                 });
@@ -2148,24 +2148,30 @@ enum Tab {
 
 /// A row of options in a sunken track, the chosen one raised. Returns whether the choice changed.
 pub(crate) fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_layout(ui, cur, items, false)
+    segmented_layout(ui, cur, items, false, false)
+}
+
+/// `segmented`, the Settings window's size: taller, larger text, wider segments.
+pub(crate) fn segmented_lg<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+    segmented_layout(ui, cur, items, false, true)
 }
 
 pub(super) fn segmented_full_width<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_layout(ui, cur, items, true)
+    segmented_layout(ui, cur, items, true, false)
 }
 
-fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)], full_width: bool) -> bool {
+fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)], full_width: bool, lg: bool) -> bool {
     if items.is_empty() {
         return false;
     }
     let p = crate::pal(ui);
-    let font = egui::FontId::proportional(11.5);
-    let pad = if full_width { 6.0 } else { 9.0 };
-    let cell = (ui.available_width() - 4.0) / items.len() as f32;
+    // The Settings size has no borders and a track that is only a fill; the raised segment is a clearly lighter pill.
+    let (font, track, pill, inset, min_h) = if lg { (egui::FontId::proportional(13.0), 8.0, 6.0, 2.0, 30.0) } else { (egui::FontId::proportional(11.5), 6.0, 5.0, 2.0, 24.0) };
+    let pad = if lg { 12.0 } else if full_width { 6.0 } else { 9.0 };
+    let cell = (ui.available_width() - 2.0 * inset) / items.len() as f32;
     let multiline = items.iter().any(|(_, t)| t.contains('\n'));
     let natural: Vec<_> = items.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.fg).size().x).collect();
-    let scale = ((ui.available_width() - 4.0) / natural.iter().map(|w| w + 18.0).sum::<f32>()).min(1.0);
+    let scale = ((ui.available_width() - 2.0 * inset) / natural.iter().map(|w| w + 18.0).sum::<f32>()).min(1.0);
     let galleys: Vec<_> = items.iter().zip(natural).map(|((_, t), width)| {
         let width = if full_width { (cell - 2.0 * pad).max(1.0) } else if multiline { ((width + 18.0) * scale - 18.0).max(1.0) } else { f32::INFINITY };
         let mut job = egui::text::LayoutJob::simple(t.to_string(), font.clone(), p.fg, width);
@@ -2173,20 +2179,20 @@ fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: 
         job.wrap.max_rows = 2;
         ui.painter().layout_job(job)
     }).collect();
-    let w = if full_width { ui.available_width() } else { galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 4.0 };
-    let h = galleys.iter().map(|g| g.size().y + 8.0).fold(24.0, f32::max);
+    let w = if full_width { ui.available_width() } else { galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 2.0 * inset };
+    let h = galleys.iter().map(|g| g.size().y + 8.0).fold(min_h, f32::max);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 6.0, p.sunken);
-    let mut x = rect.left() + 2.0;
+    ui.painter().rect_filled(rect, track, if lg { p.field } else { p.sunken });
+    let mut x = rect.left() + inset;
     let mut changed = false;
     for ((v, text), g) in items.iter().zip(galleys) {
         let width = if full_width { cell } else { g.size().x + 2.0 * pad };
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), egui::vec2(width, rect.height() - 4.0));
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + inset), egui::vec2(width, rect.height() - 2.0 * inset));
         let resp = ui.interact(seg, ui.id().with(("seg", x as i32)), egui::Sense::click());
         let on = *cur == *v;
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, *text));
         if on || resp.has_focus() {
-            ui.painter().rect_filled(seg, 5.0, p.hover);
+            ui.painter().rect_filled(seg, pill, if lg { p.pill } else { p.hover });
         }
         let color = if on || resp.hovered() { p.fg } else { p.muted };
         ui.painter().galley_with_override_text_color(seg.center() - g.rect.center().to_vec2(), g, color);
@@ -2203,12 +2209,12 @@ fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: 
 fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
     let p = crate::pal(ui);
     let g = ui.painter().layout_no_wrap(name.to_string(), egui::FontId::proportional(11.5), p.fg);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 28.0, 24.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 6.0, p.sunken);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 32.0, 28.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 7.0, p.btn);
     ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, p.fg);
     let mut moved = 0;
     for (dir, on) in [(-1, left), (1, right)] {
-        let zone = egui::Rect::from_min_size(egui::pos2(if dir < 0 { rect.left() } else { rect.right() - 13.0 }, rect.top()), egui::vec2(13.0, 24.0));
+        let zone = egui::Rect::from_min_size(egui::pos2(if dir < 0 { rect.left() } else { rect.right() - 15.0 }, rect.top()), egui::vec2(15.0, 28.0));
         let resp = ui.interact(zone, ui.id().with((name, dir)), egui::Sense::click());
         let color = if !on { p.subtle.gamma_multiply(0.4) } else if resp.hovered() { p.fg } else { p.muted };
         let (c, d) = (zone.center(), dir as f32 * 2.5);
@@ -2221,17 +2227,17 @@ fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
 }
 
 /// Settings → Display: which usage sources the Usage tab and the tray dial show, and in what order.
-pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
+pub(crate) fn display_block(ui: &mut egui::Ui, g: &mut crate::settings::Cards, cfg: &mut crate::Config) {
     use crate::ViewMode::{All, Follow};
-    use crate::settings::{setting_w, SETTING_W};
+    use crate::settings::SETTING_W;
     let modes = [(All, "All"), (Follow, "Follow profile")];
-    setting_w(ui, "Usage view", "Which providers the usage window lists.", 260.0, |ui| {
-        ui.push_id("usage-view", |ui| segmented(ui, &mut cfg.usage_view_mode, &modes));
+    g.setting_w(ui, "Usage view", "Which providers the usage window lists.", 260.0, |ui| {
+        ui.push_id("usage-view", |ui| segmented_lg(ui, &mut cfg.usage_view_mode, &modes));
     });
-    setting_w(ui, "Tray icon", "Which providers the tray icon shows.", 260.0, |ui| {
-        ui.push_id("tray-mode", |ui| segmented(ui, &mut cfg.tray_mode, &modes));
+    g.setting_w(ui, "Tray icon", "Which providers the tray icon shows.", 260.0, |ui| {
+        ui.push_id("tray-mode", |ui| segmented_lg(ui, &mut cfg.tray_mode, &modes));
     });
-    setting_w(ui, "Order", "Move a provider with its arrows.", 460.0, |ui| {
+    g.setting_w(ui, "Order", "Move a provider with its arrows.", 460.0, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let mut list = ordered(&cfg.source_order);
         let last = list.len() - 1;
@@ -2248,7 +2254,7 @@ pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
             cfg.source_order = list.iter().map(|s| s.name().to_string()).collect();
         }
     });
-    setting_w(ui, "Show Fable limit bar", "Claude's page and the usage window.", SETTING_W, |ui| {
+    g.setting_w(ui, "Show Fable limit bar", "Claude's page and the usage window.", SETTING_W, |ui| {
         crate::switch(ui, &mut cfg.show_fable, "");
     });
 }

@@ -636,10 +636,11 @@ pub(crate) fn ollama_messages(
 
 /// Settings → Ollama: its on/off switch, the URL (local, or Ollama Cloud) and key, and the model list.
 pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed) {
-    use crate::settings::{card, providers::{count, head, name, note, row}};
+    use crate::settings::{group, providers::{count, head, name, note, row}};
     use eframe::egui::{self, RichText, Sense};
     let p = crate::pal(ui);
     let Some(ol) = cfg.providers.iter().position(|p| p.ollama) else { return };
+    let cloud = crate::usage::ollama_active(cfg);
     let pr = &mut cfg.providers[ol];
     let title = pr.name.clone();
     head(ui, |ui| {
@@ -649,7 +650,13 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
         }
         name(ui, &title, on);
     });
-    feed.analytics(ui, &title);
+    group(ui, |ui, g| {
+        feed.analytics(ui, g, &title);
+        // Only an Ollama Cloud key has an allowance to show.
+        if cloud {
+            g.item(ui, |ui| feed.limits(ui, 3, "", &feed.usage.ollama.bars, feed.usage.ollama.fetched, &feed.usage.ollama.error));
+        }
+    });
     let n = crate::model_count(pr);
     row(ui, |ui, _| {
         ed.fetch_btn(ui, pr);
@@ -658,11 +665,14 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
     if let Some(e) = ed.fetch_errs.get(&pr.name) {
         note(ui, e, p.danger);
     }
-    card(ui, |ui| {
-        crate::settings::providers::field(ui, "URL", &mut pr.url, egui::Id::new("ccat-ollama-url"), false, DEFAULT_URL);
-        if pr.url.is_empty() {
-            pr.url = DEFAULT_URL.into();
-        }
+    group(ui, |ui, g| {
+        g.item(ui, |ui| {
+            crate::settings::providers::field(ui, "URL", &mut pr.url, egui::Id::new("ccat-ollama-url"), false, DEFAULT_URL);
+            if pr.url.is_empty() {
+                pr.url = DEFAULT_URL.into();
+            }
+        });
+        g.item(ui, |ui| {
         crate::settings::providers::field(ui, "API key", &mut pr.key, egui::Id::new("ccat-ollama-key"), true, "");
         let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
         if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -671,11 +681,8 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
         if pr.models.is_empty() && pr.custom.is_empty() {
             note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
         }
+        });
     });
-    // Only an Ollama Cloud key has an allowance to show.
-    if crate::usage::ollama_active(cfg) {
-        card(ui, |ui| feed.limits(ui, 3, "", &feed.usage.ollama.bars, feed.usage.ollama.fetched, &feed.usage.ollama.error));
-    }
 }
 
 #[cfg(test)]

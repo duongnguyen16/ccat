@@ -144,11 +144,13 @@ pub(crate) fn page(ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &cr
     });
     note(ui, "Claude Code's own login. Off: Claude models leave the model pickers (Default stays) and are skipped as fallbacks. A tier already on Claude keeps working.", p.subtle);
     ui.add_space(10.0);
-    feed.analytics(ui, "Claude");
     let u = &feed.usage;
-    if !u.plan.is_empty() || !u.claude.bars.is_empty() || !u.claude.error.is_empty() {
-        crate::settings::card(ui, |ui| feed.limits(ui, 0, &u.plan, &crate::usage::tidy(&u.claude.bars, cfg.show_fable), u.claude.fetched, &u.claude.error));
-    }
+    crate::settings::group(ui, |ui, g| {
+        feed.analytics(ui, g, "Claude");
+        if !u.plan.is_empty() || !u.claude.bars.is_empty() || !u.claude.error.is_empty() {
+            g.item(ui, |ui| feed.limits(ui, 0, &u.plan, &crate::usage::tidy(&u.claude.bars, cfg.show_fable), u.claude.fetched, &u.claude.error));
+        }
+    });
 }
 
 #[cfg(test)]
