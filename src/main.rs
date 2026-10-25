@@ -567,6 +567,12 @@ impl Disk {
 
 struct Pal {
     bg: Color32,
+    /// Settings: the sidebar's and the content area's background, the vertical line between them and the horizontal
+    /// rules inside the content.
+    side: Color32,
+    content: Color32,
+    vsep: Color32,
+    hsep: Color32,
     surface: Color32,
     /// A settings card's fill: lifted a little off `bg`, which the light theme's `surface` is not.
     card: Color32,
@@ -597,14 +603,17 @@ const fn hex(v: u32) -> Color32 {
 }
 
 const DARK: Pal = Pal {
-    bg: hex(0x1a1a19), surface: hex(0x212120), card: hex(0x212120), hover: hex(0x2b2b29), sunken: hex(0x161615),
+    bg: hex(0x1a1a19), side: hex(0x191919), content: hex(0x1f1f1f), vsep: hex(0x303030), hsep: hex(0x2a2a2a),
+    surface: hex(0x212120), card: hex(0x282828), hover: hex(0x2b2b29), sunken: hex(0x161615),
     border: hex(0x302f2d), border_strong: hex(0x454440), fg: hex(0xf0eee6), muted: hex(0xa8a59c),
     subtle: hex(0x8a8780), accent: hex(0xd97757), danger: hex(0xe5726a),
-    field: hex(0x2c2b29), btn: hex(0x363532), btn_hover: hex(0x403f3b), strong: hex(0x4a4944), pill: hex(0x45443f),
-    pop: hex(0x2a2a28), item: hex(0x3a3936), blue: hex(0x5b9cf5),
+    // Settings controls sit on the cards (0x282828) or on the content (0x1f1f1f): neutral greys a step above each.
+    field: hex(0x313131), btn: hex(0x353535), btn_hover: hex(0x3e3e3e), strong: hex(0x484848), pill: hex(0x434343),
+    pop: hex(0x2b2b2b), item: hex(0x383838), blue: hex(0x5b9cf5),
 };
 const LIGHT: Pal = Pal {
-    bg: hex(0xffffff), surface: hex(0xffffff), card: hex(0xf5f3ee), hover: hex(0xedebe5), sunken: hex(0xfaf9f7),
+    bg: hex(0xffffff), side: hex(0xf6f5f2), content: hex(0xffffff), vsep: hex(0xe6e4de), hsep: hex(0xece9e3),
+    surface: hex(0xffffff), card: hex(0xf5f3ee), hover: hex(0xedebe5), sunken: hex(0xfaf9f7),
     border: hex(0xe6e4de), border_strong: hex(0xd2cfc7), fg: hex(0x191817), muted: hex(0x63605a),
     subtle: hex(0x6e6b63), accent: hex(0xbd5d3c), danger: hex(0xc0392b),
     field: hex(0xebe8e1), btn: hex(0xe4e1d9), btn_hover: hex(0xd9d6cd), strong: hex(0xcfcbc1), pill: hex(0xffffff),
