@@ -41,21 +41,18 @@ function AgBuckets($quota, [string]$prefix) {
     $parts -join ' '
 }
 
-function AgLine($quota, [bool]$show3p = $true) {
-    $g = AgBuckets $quota 'gemini'
+function AgLine($quota, [bool]$show3p = $true, [bool]$showGemini = $true) {
+    $g = if ($showGemini) { AgBuckets $quota 'gemini' }
     $t = if ($show3p) { AgBuckets $quota '3p' }
     (@(if ($g) { "$iGem Gemini $g" }; if ($t) { "$i3p Claude/GPT $t" })) -join $dot
 }
 
-# The 3P bucket (Claude/GPT on Antigravity) only matters when a ccat Antigravity provider (with accounts) maps a non-Gemini model
+# The 3P bucket (Claude/GPT on Antigravity) only matters when a ccat tier runs a non-Gemini model on Antigravity
 function CcatUses3p {
     $f = Join-Path $env:APPDATA 'ccat\config.json'
     if (-not (Test-Path $f)) { return $false }
-    foreach ($p in (Get-Content $f -Raw | ConvertFrom-Json).providers) {
-        if (-not $p.antigravity -or -not $p.accounts) { continue }
-        foreach ($m in $p.default, $p.fable, $p.opus, $p.sonnet, $p.haiku) {
-            if ("$m".Trim() -and "$m" -notmatch '^gemini') { return $true }
-        }
+    foreach ($t in (Get-Content $f -Raw | ConvertFrom-Json).tiers) {
+        if ($t.provider -eq 'Antigravity' -and "$($t.model)".Trim() -and "$($t.model)" -notmatch '^gemini') { return $true }
     }
     $false
 }
@@ -91,7 +88,8 @@ if (Test-Path $cache) {
     $ag = Get-Content $cache -Raw | ConvertFrom-Json
     $age = [DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($ag.captured_at)
     $stale = if ($age.TotalHours -ge 1) { " $([char]27)[2m$iStale$([int]$age.TotalHours)h$([char]27)[0m" } else { '' }
-    $text = AgLine $ag.quota (CcatUses3p)
+    # The Gemini bucket stays in agy's own line only; here it is just the Claude/GPT one, when a tier uses it
+    $text = AgLine $ag.quota (CcatUses3p) $false
     if ($text) { $line += "$iAg $text$stale" }
 }
 $line -join $sep

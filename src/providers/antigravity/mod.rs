@@ -5,15 +5,23 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
 };
+
+use crate::common::{agent, fail, log, log_path, random_hex, Failure};
+use crate::usage::{parse_time, Bar, FIVE_HOURS, WEEK};
+
+pub(crate) mod mcp;
+pub(crate) mod proxy;
+mod ui;
+pub(crate) use ui::page;
 
 const ENDPOINTS: [&str; 2] = ["https://daily-cloudcode-pa.googleapis.com", "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 // Antigravity's public desktop OAuth client; base64 only so secret scanners leave it alone.
@@ -34,18 +42,32 @@ pub struct Account {
     pub email: String,
     pub refresh: String,
     pub project: String,
+    /// Google's id for the account's paid plan ("free-tier", "g1-plus-tier", "g1-pro-tier"…); "" until known.
+    pub plan: String,
+    /// Turned off in the Providers view: the pool skips it (running sessions follow, see `Pool::disabled`).
+    pub disabled: bool,
 }
 
-/// Errors reach the GUI as text and the proxy as an HTTP status for Claude Code.
-#[derive(Debug)]
-pub struct Failure {
-    pub status: u16,
-    pub message: String,
-    pub retry_after: Option<u64>,
+/// Lower plans are spent first, so paid quota is kept for when the free accounts run out. Unknown sits mid-way.
+pub fn rank(plan: &str) -> u8 {
+    match plan {
+        "" => 1,
+        p if p.contains("ultra") => 4,
+        p if p.contains("pro") => 3,
+        p if p.contains("plus") => 2,
+        _ => 0,
+    }
 }
 
-fn fail(status: u16, message: impl Into<String>) -> Failure {
-    Failure { status, message: message.into(), retry_after: None }
+/// "Free", "Plus", "Pro", "Ultra" for the UI ("" while unknown).
+pub fn plan_label(plan: &str) -> &'static str {
+    match rank(plan) {
+        0 => "Free",
+        2 => "Plus",
+        3 => "Pro",
+        4 => "Ultra",
+        _ => "",
+    }
 }
 
 // ---------------------------------------------------------------- small helpers
@@ -54,22 +76,11 @@ fn unb64(s: &str) -> String {
     String::from_utf8(B64.decode(s).expect("embedded base64")).expect("embedded utf-8")
 }
 
-pub fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    getrandom::fill(&mut b).expect("OS randomness");
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-pub fn uuid() -> String {
-    let h = random_hex(16);
-    format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
-}
-
-fn enc(s: &str) -> String {
+pub fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-fn dec(s: &str) -> String {
+pub fn dec(s: &str) -> String {
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let b = s.as_bytes();
     let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
@@ -85,16 +96,6 @@ fn dec(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-fn agent(global: Option<Duration>) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(300)))
-        .timeout_global(global)
-        .build()
-        .into()
 }
 
 /// Google's `error.message` from a JSON error body, else the (trimmed) raw text.
@@ -146,24 +147,6 @@ pub fn retry_secs_in(v: &Value) -> Option<u64> {
 
 fn retry_secs(text: &str) -> Option<u64> {
     retry_secs_in(&serde_json::from_str(text).ok()?)
-}
-
-/// Appends to `antigravity.log` next to the config: claude owns the terminal while the proxy runs.
-pub fn log(line: &str) {
-    if cfg!(test) {
-        return;
-    }
-    let path = log_path();
-    let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 2_000_000);
-    let file = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path);
-    if let Ok(mut f) = file {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let _ = writeln!(f, "{secs} {line}");
-    }
-}
-
-pub fn log_path() -> std::path::PathBuf {
-    crate::config_path().with_file_name("antigravity.log")
 }
 
 /// The backend gates newer models on the client version, so track the live Antigravity release.
@@ -257,7 +240,8 @@ fn userinfo(token: &str) -> Result<String, String> {
 }
 
 /// The Cloud Code project every request is billed to; provisions the free tier on first use.
-fn discover_project(token: &str) -> Result<String, String> {
+/// The account's Cloud Code project (set up on first use) and its paid plan id.
+fn discover_project(token: &str) -> Result<(String, String), String> {
     let meta = json!({ "metadata": { "ideType": "ANTIGRAVITY" } });
     let mut info = cloud_code(token, "/v1internal:loadCodeAssist", Some(&meta))?;
     if info.get("currentTier").is_none_or(Value::is_null) {
@@ -270,11 +254,19 @@ fn discover_project(token: &str) -> Result<String, String> {
         onboard(token, &meta)?;
         info = cloud_code(token, "/v1internal:loadCodeAssist", Some(&meta))?;
     }
-    info["cloudaicompanionProject"]
-        .as_str()
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .ok_or_else(|| "Google did not return an Antigravity project for this account.".into())
+    let project = info["cloudaicompanionProject"].as_str().filter(|p| !p.is_empty()).ok_or("Google did not return an Antigravity project for this account.")?;
+    Ok((project.to_string(), plan_id(&info)))
+}
+
+/// `paidTier` names the subscription (`currentTier` is the Antigravity tier, "free-tier" for everyone).
+fn plan_id(info: &Value) -> String {
+    info["paidTier"]["id"].as_str().or(info["currentTier"]["id"].as_str()).unwrap_or("").to_string()
+}
+
+/// The paid plan of an account saved before plans were recorded.
+pub fn plan_of(acc: &Account) -> Result<String, String> {
+    let (token, _) = refresh(&acc.refresh)?;
+    cloud_code(&token, "/v1internal:loadCodeAssist", Some(&json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))).map(|v| plan_id(&v))
 }
 
 fn onboard(token: &str, meta: &Value) -> Result<(), String> {
@@ -307,6 +299,11 @@ pub fn list_models(acc: &Account) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
+/// The account's quota: per model group, a 5-hour and a weekly bucket with `remainingFraction` and `resetTime`.
+pub fn quota_summary(token: &str, project: &str) -> Result<Value, String> {
+    cloud_code(token, "/v1internal:retrieveUserQuotaSummary", Some(&json!({ "project": project })))
+}
+
 /// Browser sign-in. `start` binds the callback port (so a busy port fails before the browser opens);
 /// `finish` blocks until Google redirects back, then sets up the account.
 pub struct Login {
@@ -336,52 +333,60 @@ impl Login {
         let refresh = tok["refresh_token"].as_str().filter(|s| !s.is_empty()).ok_or("Google returned no refresh token; try again.")?;
         let access = tok["access_token"].as_str().ok_or("Google returned no access token")?;
         let email = userinfo(access)?;
-        let project = discover_project(access)?;
-        log(&format!("signed in {email} (project {project})"));
-        Ok(Account { email, refresh: refresh.to_string(), project })
+        let (project, plan) = discover_project(access)?;
+        log(&format!("signed in {email} (project {project}, plan {plan})"));
+        Ok(Account { email, refresh: refresh.to_string(), project, plan, disabled: false })
     }
 
     fn wait_code(&self, cancel: &AtomicBool) -> Result<String, String> {
-        let deadline = Instant::now() + Duration::from_secs(300);
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Sign-in cancelled.".into());
-            }
-            if Instant::now() > deadline {
-                return Err("Timed out waiting for the browser sign-in.".into());
-            }
-            match self.listener.accept() {
-                Ok((s, _)) => {
-                    if let Some(r) = callback(s, &self.state) {
-                        return r;
-                    }
+        accept(&self.listener, cancel, "/oauth-callback", &self.state, "Google")?.remove("code").ok_or_else(|| "No code in the sign-in callback.".into())
+    }
+}
+
+/// Waits (up to 5 minutes) for the browser's OAuth redirect to `path` on `listener`; its query once the `state` checks out
+/// and a `code` is in it. `who` names the provider in errors. Shared by the Google and ChatGPT sign-ins.
+pub fn accept(listener: &TcpListener, cancel: &AtomicBool, path: &str, state: &str, who: &str) -> Result<HashMap<String, String>, String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Sign-in cancelled.".into());
+        }
+        if Instant::now() > deadline {
+            return Err("Timed out waiting for the browser sign-in.".into());
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
+                if let Some(r) = callback(s, path, state, who) {
+                    return r;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(150)),
-                Err(e) => return Err(e.to_string()),
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(150)),
+            Err(e) => return Err(e.to_string()),
         }
     }
 }
 
 /// One browser hit on the callback port: `Some` for the OAuth redirect, `None` for anything else (favicon…).
-fn callback(mut s: TcpStream, state: &str) -> Option<Result<String, String>> {
+fn callback(mut s: TcpStream, path_wanted: &str, state: &str, who: &str) -> Option<Result<HashMap<String, String>, String>> {
     let _ = s.set_nonblocking(false);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).ok()?;
     let target = line.split_whitespace().nth(1)?.to_string();
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-    if path != "/oauth-callback" {
+    if path != path_wanted {
         let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return None;
     }
     let q: HashMap<String, String> = query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (dec(k), dec(v))).collect();
     let r = if let Some(e) = q.get("error") {
-        Err(format!("Google sign-in failed: {e}"))
+        Err(format!("{who} sign-in failed: {e}"))
     } else if q.get("state").map(String::as_str) != Some(state) {
         Err("Sign-in state mismatch; try again.".into())
+    } else if !q.contains_key("code") {
+        Err("No code in the sign-in callback.".into())
     } else {
-        q.get("code").cloned().ok_or_else(|| "No code in the sign-in callback.".into())
+        Ok(q)
     };
     let msg = if r.is_ok() { "Signed in. You can close this tab and go back to ccat." } else { "Sign-in failed. Go back to ccat for details." };
     let body = format!("<!doctype html><meta charset=utf-8><title>ccat</title><p style=\"font:16px system-ui;margin:40px\">{msg}</p>");
@@ -392,6 +397,10 @@ fn callback(mut s: TcpStream, state: &str) -> Option<Result<String, String>> {
 // ---------------------------------------------------------------- account pool
 
 /// Antigravity meters each backend family separately, so a block is per (account, family).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 pub fn family(model: &str) -> &'static str {
     if model.starts_with("claude") {
         "claude"
@@ -406,10 +415,14 @@ pub fn family(model: &str) -> &'static str {
 struct Slot {
     token: Option<(String, Instant)>,
     blocked: HashMap<&'static str, Instant>,
+    /// Unix time each block was set: only usage fetched after it can lift it (see `Pool::unblock`).
+    since: HashMap<&'static str, u64>,
 }
 
 pub struct Pool {
     accounts: Vec<Account>,
+    /// Emails the pool must not use; shared so a running session follows the Providers switches.
+    pub disabled: Arc<RwLock<HashSet<String>>>,
     /// (sticky account index, per-account state)
     state: Mutex<(usize, Vec<Slot>)>,
     endpoints: Vec<String>,
@@ -417,9 +430,19 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(accounts: Vec<Account>) -> Pool {
+    /// Accounts are tried cheapest plan first (see `rank`); within a plan, in the order they were added.
+    pub fn new(mut accounts: Vec<Account>) -> Pool {
+        accounts.sort_by_key(|a| rank(&a.plan));
         let slots = accounts.iter().map(|_| Slot::default()).collect();
-        Pool { accounts, state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
+        Pool { accounts, disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
+    fn off(&self, i: usize) -> bool {
+        self.disabled.read().unwrap().contains(&self.accounts[i].email)
     }
 
     /// Valid access token for account `i`. Refreshing under the lock keeps refreshes single-flight.
@@ -437,7 +460,23 @@ impl Pool {
 
     pub fn block(&self, i: usize, fam: &'static str, secs: u64) {
         log(&format!("{} blocked for {fam} for {secs}s", self.accounts[i].email));
-        self.state.lock().unwrap().1[i].blocked.insert(fam, Instant::now() + Duration::from_secs(secs));
+        let mut g = self.state.lock().unwrap();
+        g.1[i].blocked.insert(fam, Instant::now() + Duration::from_secs(secs));
+        g.1[i].since.insert(fam, unix_now());
+    }
+
+    /// Lifts `email`'s block for `fam` when usage fetched at `fetched` (after the block was set) shows quota again:
+    /// a reset the block's own guess didn't know of. True if one was lifted.
+    pub fn unblock(&self, email: &str, fam: &str, fetched: u64) -> bool {
+        let Some(i) = self.accounts.iter().position(|a| a.email == email) else { return false };
+        let mut g = self.state.lock().unwrap();
+        let s = &mut g.1[i];
+        let live = s.blocked.get(fam).is_some_and(|t| *t > Instant::now()) && s.since.get(fam).is_some_and(|t| *t < fetched);
+        if live {
+            s.blocked.remove(fam);
+            log(&format!("{email} has {fam} quota again (usage at {fetched}): back in the rotation"));
+        }
+        live
     }
 
     fn blocked_for(&self, i: usize, fam: &str) -> Option<Duration> {
@@ -445,7 +484,8 @@ impl Pool {
         g.1[i].blocked.get(fam).and_then(|t| t.checked_duration_since(Instant::now()))
     }
 
-    /// Opens a `streamGenerateContent` SSE stream, starting at the sticky account and moving on when one is out of quota.
+    /// Opens a `streamGenerateContent` SSE stream on the first account (cheapest plan first) that isn't out of quota
+    /// for this model family: free accounts carry the load until they run out, and get it back once they reset.
     /// Returns the account index used and the raw SSE reader.
     pub fn stream(&self, model: &str, request: &Value, beta: bool) -> Result<(usize, Box<dyn BufRead + Send>), Failure> {
         let fam = family(model);
@@ -453,11 +493,12 @@ impl Pool {
         if n == 0 {
             return Err(fail(403, "No Antigravity accounts. Add one in ccat → Config."));
         }
-        let start = self.state.lock().unwrap().0;
+        if (0..n).all(|i| self.off(i)) {
+            return Err(fail(403, "Every Antigravity account is turned off. Turn one on in ccat → Providers."));
+        }
         let mut last: Option<Failure> = None;
-        for k in 0..n {
-            let i = (start + k) % n;
-            if self.blocked_for(i, fam).is_some() {
+        for i in 0..n {
+            if self.off(i) || self.blocked_for(i, fam).is_some() {
                 continue;
             }
             let who = &self.accounts[i].email;
@@ -553,7 +594,11 @@ impl Pool {
         if self.accounts.is_empty() {
             return Err(fail(403, "No Antigravity accounts."));
         }
-        let i = self.state.lock().unwrap().0;
+        // The sticky account, or the first one that's on when it was turned off.
+        let sticky = self.state.lock().unwrap().0;
+        let Some(i) = std::iter::once(sticky).chain(0..self.accounts.len()).find(|&i| !self.off(i)) else {
+            return Err(fail(403, "Every Antigravity account is turned off."));
+        };
         let token = self.token(i, false).map_err(|e| fail(403, e))?;
         let mut last = fail(502, format!("{path}: no endpoint answered"));
         for ep in &self.endpoints {
@@ -599,14 +644,32 @@ impl Pool {
     }
 }
 
+// ---------------------------------------------------------------- usage
+
+/// Bars from `retrieveUserQuotaSummary`: per group (Gemini, Claude & GPT), its 5-hour and weekly buckets.
+pub fn parse_ag(v: &Value) -> Vec<Bar> {
+    let mut bars = Vec::new();
+    for b in v["groups"].as_array().into_iter().flatten().flat_map(|g| g["buckets"].as_array().into_iter().flatten()) {
+        let id = b["bucketId"].as_str().unwrap_or("");
+        // The second group is Claude, Sonnet and GPT-OSS; Claude is what anyone here uses it for.
+        let group = if id.starts_with("gemini") { "Gemini" } else { "Claude" };
+        let (window, label) = if b["window"] == "5h" || id.ends_with("5h") { (FIVE_HOURS, "5hr") } else { (WEEK, "Weekly") };
+        let used = (1.0 - b["remainingFraction"].as_f64().unwrap_or(1.0)) * 100.0;
+        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window, ..Default::default() });
+    }
+    // Session before weekly within a group, as in the Claude section.
+    bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
+    bars
+}
+
 #[cfg(test)]
 impl Pool {
     /// Accounts whose access token is the email, pointed at a fake upstream.
     pub fn fake(endpoint: &str, emails: &[&str]) -> Pool {
-        let accounts: Vec<Account> = emails.iter().map(|e| Account { email: e.to_string(), refresh: String::new(), project: format!("p-{e}") }).collect();
+        let accounts: Vec<Account> = emails.iter().map(|e| Account { email: e.to_string(), refresh: String::new(), project: format!("p-{e}"), plan: String::new(), disabled: false }).collect();
         let far = Instant::now() + Duration::from_secs(3600);
         let slots = emails.iter().map(|e| Slot { token: Some((e.to_string(), far)), ..Default::default() }).collect();
-        Pool { accounts, state: Mutex::new((0, slots)), endpoints: vec![endpoint.to_string()], ua: "test".into() }
+        Pool { accounts, disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: vec![endpoint.to_string()], ua: "test".into() }
     }
 }
 
@@ -636,6 +699,15 @@ mod tests {
         assert_eq!(manifest_version("version: 2.9.1\nfiles:\n"), Some("2.9.1".into()));
         assert_eq!(manifest_version("version: '3.0.0'"), Some("3.0.0".into()));
         assert_eq!(manifest_version("minimumSystemVersion: 1\n"), None);
+    }
+
+    #[test]
+    fn cheaper_plans_go_first() {
+        let acc = |e: &str, plan: &str| Account { email: e.into(), plan: plan.into(), ..Default::default() };
+        let pool = Pool::new(vec![acc("pro", "g1-pro-tier"), acc("unknown", ""), acc("plus", "g1-plus-tier"), acc("free", "free-tier"), acc("free2", "free-tier")]);
+        let order: Vec<&str> = pool.accounts.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(order, ["free", "free2", "unknown", "plus", "pro"]);
+        assert_eq!((plan_label("free-tier"), plan_label("g1-pro-tier"), plan_label("")), ("Free", "Pro", ""));
     }
 
     #[test]

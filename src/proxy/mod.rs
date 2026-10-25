@@ -1,0 +1,2177 @@
+//! A local Anthropic Messages endpoint for Claude Code that routes each model tier to its own provider:
+//! Antigravity (Claude Code → Cloud Code Assist `streamGenerateContent` → Anthropic SSE), an Anthropic-compatible
+//! endpoint (forwarded with its key), or the official API (forwarded with Claude Code's own login).
+//! Also serves `/mcp` (see `providers::antigravity::mcp`) for Antigravity abilities Claude Code has no built-in tool for.
+//! Binds 127.0.0.1 on a random port. Routes that spend ccat's accounts or keys need the per-launch token;
+//! official routes only ever carry the caller's own credentials, so they don't.
+
+mod breaker;
+mod compress;
+pub(crate) mod http;
+pub(crate) mod sse;
+
+use crate::common::{self, Failure};
+use crate::providers::antigravity::{Account, Pool};
+use crate::providers::chatgpt::{self, ChatgptAccount, ChatgptModel};
+use http::{anthropic_api, forward, read_request, respond, respond_error, upstream_body, Req};
+use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{self, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::Duration,
+};
+
+/// System-prompt lines Cloud Code refuses with a fake quota 429 ("Resource has been exhausted"): Claude Code's
+/// per-request billing header and the Agent SDK identity line. Neither carries anything a model needs.
+const FILTERED_SYSTEM_LINES: [&str; 2] = ["x-anthropic-billing-header:", "You are a Claude agent, built on Anthropic's Claude Agent SDK."];
+/// Google Search grounding only runs on Gemini; a web search asked of a Claude/GPT route goes here instead.
+/// (Gemini 3.5 Flash was retired in Oct 2026: it now answers with a "switch models" notice and no finish reason.)
+pub(crate) const SEARCH_MODEL: &str = "gemini-3.8-flash-low";
+
+#[derive(Clone)]
+pub struct Proxy {
+    pub url: String,
+    pub token: String,
+    /// Swappable while the session runs: a model switched in ccat's settings reaches the next request.
+    pub routes: Arc<RwLock<Vec<Route>>>,
+    /// Emails of the Antigravity accounts to skip; swappable like `routes`.
+    pub disabled: Arc<RwLock<HashSet<String>>>,
+    /// The ChatGPT accounts (their on/off switches included); swappable like `routes`.
+    pub chatgpt: Arc<RwLock<Vec<ChatgptAccount>>>,
+    /// What the config knows of each ChatGPT model (efforts, fast tier); swappable too.
+    pub chatgpt_models: Arc<RwLock<Vec<ChatgptModel>>>,
+    /// Answer usage limits at once instead of holding the request until a route can run; switchable too.
+    pub fail_on_limit: Arc<AtomicBool>,
+    /// Skip fallbacks that are custom endpoints (a paid API key); a tier's primary always runs. Switchable too.
+    pub no_paid_fallback: Arc<AtomicBool>,
+    /// Clean the tool results of requests that go to third-party routes (never Claude); switchable too.
+    pub compress_tool_results: Arc<AtomicBool>,
+    ctx: Arc<Ctx>,
+}
+
+impl Proxy {
+    /// Fresh usage (the tray's `usage.json`): an account it shows with quota again, fetched after its block was set,
+    /// goes back into rotation now rather than when the block's guess runs out. So a tier returns to its first
+    /// route as soon as that resets, and held requests try again at once.
+    pub fn recheck(&self, u: &crate::usage::Usage) {
+        let ctx = &self.ctx;
+        let mut lifted = false;
+        for (email, src) in u.antigravity.iter().filter(|(_, s)| s.error.is_empty()) {
+            // The second group's buckets cover Claude and GPT-OSS alike.
+            for (group, fams) in [("Gemini", &["gemini"][..]), ("Claude", &["claude", "gpt"][..])] {
+                let bars: Vec<_> = src.bars.iter().filter(|b| b.label.starts_with(group)).collect();
+                if !bars.is_empty() && bars.iter().all(|b| !b.out()) {
+                    for f in fams {
+                        lifted |= ctx.pool.unblock(email, f, src.fetched);
+                    }
+                }
+            }
+        }
+        let g = &u.chatgpt;
+        if g.error.is_empty() && !g.bars.is_empty() && g.bars.iter().all(|b| !b.out()) {
+            lifted |= ctx.gpt.unblock(g.fetched);
+        }
+        *ctx.plan_backs.lock().unwrap() = [plan_back(&u.claude), plan_back(&u.chatgpt)];
+        if lifted {
+            ctx.wake.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Rewrites this session's live file, so the usage window knows it still runs.
+    pub fn heartbeat(&self) {
+        self.ctx.note(|_| {});
+    }
+}
+
+/// When a plan is back by its usage bars: the latest reset among those used up (a used-up week outlasts the 5
+/// hours); 0 when none is, or the fetch failed.
+fn plan_back(src: &crate::usage::Source) -> u64 {
+    if !src.error.is_empty() {
+        return 0;
+    }
+    src.bars.iter().filter(|b| b.out()).map(|b| b.resets).max().unwrap_or(0)
+}
+
+/// The config's name for a route: provider ("" = Claude) and model.
+fn hop(u: &Upstream, model: &str) -> crate::live::Hop {
+    let provider = match u {
+        Upstream::Official => String::new(),
+        Upstream::Endpoint { name, .. } => name.clone(),
+        Upstream::Antigravity => crate::providers::AG_NAME.into(),
+        Upstream::ChatGPT => crate::providers::GPT_NAME.into(),
+        Upstream::Ollama { .. } => crate::providers::OLLAMA_NAME.into(),
+        Upstream::MuseAI { .. } => crate::providers::MUSE_NAME.into(),
+    };
+    crate::live::Hop { provider, model: model.to_string() }
+}
+
+/// A request held at a usage limit, counted in the live file while it waits.
+struct Held<'a> {
+    ctx: &'a Ctx,
+    tier: &'static str,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.ctx.note(|s| {
+            let t = s.tiers.entry(self.tier.to_string()).or_default();
+            t.held = t.held.saturating_sub(1);
+            if t.held == 0 {
+                t.waiting.clear();
+            }
+        });
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Upstream {
+    Official,
+    /// `name` is the provider's, for the token log.
+    Endpoint { name: String, url: String, key: String },
+    Antigravity,
+    /// The ChatGPT plan: Anthropic Messages translated to the Responses API.
+    ChatGPT,
+    /// Ollama model server (Cloud or Local): Anthropic Messages translated to Ollama's native `/api/chat`.
+    Ollama { url: String, key: String },
+    /// MuseAI Hatch Gateway VM via local sidecar: Anthropic Messages translated to OpenAI Chat Completions.
+    MuseAI { url: String, key: String },
+}
+
+/// Names the provider and never the key, so a route can be logged.
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Upstream::Official => "Claude",
+            Upstream::Endpoint { name, .. } => name,
+            Upstream::Antigravity => "Antigravity",
+            Upstream::ChatGPT => "ChatGPT",
+            Upstream::Ollama { .. } => "Ollama",
+            Upstream::MuseAI { .. } => "MuseAI",
+        })
+    }
+}
+
+/// One model tier: the names Claude Code may send for it (fixed at launch), where it goes, the model it runs there
+/// ("" keeps the asked name: an official tier left at Claude Code's own pick), and where it goes when that fails.
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub tier: &'static str,
+    pub names: Vec<String>,
+    pub upstream: Upstream,
+    pub model: String,
+    /// Tried in order when the one before fails before anything streamed.
+    pub fallbacks: Vec<(Upstream, String)>,
+}
+
+/// Where one request goes: upstream, model, tier (for the token log), and the fallbacks.
+type Target = (Upstream, String, &'static str, Vec<(Upstream, String)>);
+
+pub(crate) struct Ctx {
+    pub(crate) pool: Pool,
+    pub(crate) gpt: chatgpt::Pool,
+    pub(crate) token: String,
+    pub(crate) agent_id: String,
+    pub(crate) trajectory: String,
+    pub(crate) step: AtomicU64,
+    /// Gemini puts thought signatures on function calls, which Anthropic tool_use blocks can't carry: tool id → tagged signature.
+    pub(crate) sigs: Mutex<HashMap<String, String>>,
+    pub(crate) routes: Arc<RwLock<Vec<Route>>>,
+    /// For official and endpoint tiers: one agent, so their connections (and TLS sessions) are reused.
+    pub(crate) http: ureq::Agent,
+    /// The folder Claude Code runs in: MCP tools resolve relative paths against it.
+    pub(crate) folder: PathBuf,
+    /// Tokens per text byte of an Anthropic request, learned per model family from Google's real prompt counts.
+    pub(crate) ratio: Mutex<HashMap<&'static str, f64>>,
+    pub(crate) fail_on_limit: Arc<AtomicBool>,
+    pub(crate) no_paid_fallback: Arc<AtomicBool>,
+    pub(crate) compress_tool_results: Arc<AtomicBool>,
+    /// Providers that keep failing are skipped for a while (see `breaker`).
+    pub(crate) breaker: breaker::Breaker,
+    /// What this session's tiers are doing, written to its live file (see `live`).
+    pub(crate) live: Mutex<crate::live::Session>,
+    /// Bumped when a block is lifted early: held requests try again at once.
+    pub(crate) wake: AtomicU64,
+    /// When Claude Code's plan and the ChatGPT plan are back, by the last usage seen (see `plan_back`).
+    pub(crate) plan_backs: Mutex<[u64; 2]>,
+}
+
+impl Ctx {
+    /// When route `u`'s plan should be back by its usage bars, if that is still ahead; else 0.
+    fn plan_back(&self, u: &Upstream, now: u64) -> u64 {
+        let [claude, gpt] = *self.plan_backs.lock().unwrap();
+        let at = match u {
+            Upstream::Official => claude,
+            Upstream::ChatGPT => gpt,
+            _ => 0,
+        };
+        if at > now { at } else { 0 }
+    }
+
+    fn note(&self, f: impl FnOnce(&mut crate::live::Session)) {
+        let mut g = self.live.lock().unwrap();
+        f(&mut g);
+        g.updated = crate::now();
+        crate::live::write(&g);
+    }
+
+    /// Where a model name goes. An exact name wins, then an explicit `@tier` suffix, then the tier named in it
+    /// (`claude-haiku-…` → Haiku), then — for names Claude Code picks on its own — the official API when a tier
+    /// uses it (the login is there), else the first tier. No routes at all: the name runs on Antigravity as-is.
+    fn resolve(&self, asked: &str) -> Target {
+        let routes = self.routes.read().unwrap();
+        let (base, suffix) = asked.rsplit_once('@').unwrap_or((asked, ""));
+        let low = base.to_lowercase();
+        let route = (routes.iter().find(|r| r.names.iter().any(|n| n == asked)))
+            .or_else(|| routes.iter().find(|r| !suffix.is_empty() && r.tier == suffix))
+            .or_else(|| routes.iter().find(|r| low.contains(r.tier)));
+        // An empty model is Claude Code's pick: the name it sent. Fallbacks too (an empty one reached the API as "").
+        let pick = |m: &str| if m.is_empty() { asked.to_string() } else { m.to_string() };
+        match route {
+            Some(r) => (r.upstream.clone(), pick(&r.model), r.tier, r.fallbacks.iter().map(|(u, m)| (u.clone(), pick(m))).collect()),
+            // The official API knows (or rejects) the name itself.
+            None if routes.iter().any(|r| r.upstream == Upstream::Official) => (Upstream::Official, asked.to_string(), "", Vec::new()),
+            None => routes.first().map_or((Upstream::Antigravity, asked.to_string(), "", Vec::new()), |r| (r.upstream.clone(), r.model.clone(), r.tier, r.fallbacks.clone())),
+        }
+    }
+}
+
+/// `accounts` serve the Antigravity routes, `chatgpt` the ChatGPT ones; `routes` say where each tier goes (see `Ctx::resolve`).
+pub fn start(accounts: Vec<Account>, chatgpt: Vec<ChatgptAccount>, models: Vec<ChatgptModel>, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+    serve_with(Pool::new(accounts), chatgpt::Pool::new(chatgpt, models), routes, folder)
+}
+
+fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+    let routes = Arc::new(RwLock::new(routes));
+    let fail_on_limit = Arc::new(AtomicBool::new(false));
+    let no_paid_fallback = Arc::new(AtomicBool::new(false));
+    let compress_tool_results = Arc::new(AtomicBool::new(false));
+    let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let token = common::random_hex(24);
+    let ctx = Arc::new(Ctx {
+        pool,
+        gpt,
+        token: token.clone(),
+        agent_id: common::uuid(),
+        trajectory: common::uuid(),
+        step: AtomicU64::new(0),
+        sigs: Mutex::new(HashMap::new()),
+        routes: routes.clone(),
+        // A held request may wait for hours (ccat lifts Claude Code's timeout), so an upstream that never answers
+        // must fail on its own: as long as Claude Code's default wait for an answer.
+        http: ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(600)))
+            .build()
+            .into(),
+        folder,
+        ratio: Mutex::new(HashMap::new()),
+        fail_on_limit: fail_on_limit.clone(),
+        no_paid_fallback: no_paid_fallback.clone(),
+        compress_tool_results: compress_tool_results.clone(),
+        breaker: Default::default(),
+        live: Default::default(),
+        wake: AtomicU64::new(0),
+        plan_backs: Default::default(),
+    });
+    let handle = ctx.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || serve(conn, &ctx));
+        }
+    });
+    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results, ctx: handle })
+}
+
+// ---------------------------------------------------------------- request dispatch
+
+fn serve(mut s: TcpStream, ctx: &Ctx) {
+    let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
+    let req = match read_request(&s) {
+        Ok(r) => r,
+        Err(e) => return respond_error(&mut s, &Failure { status: 400, message: format!("bad request: {e}"), retry_after: None }),
+    };
+    // Claude Code probes connectivity with an unauthenticated `HEAD /api/hello` before its first request.
+    if req.path == "/api/hello" {
+        return respond(&mut s, 200, &json!({}), "");
+    }
+    // With an official tier Claude Code keeps its login in `authorization`, so the token comes as a custom header.
+    let bearer = req.header("authorization").and_then(|a| a.strip_prefix("Bearer "));
+    let authed = [req.header("x-ccat-token"), req.header("x-api-key"), bearer].contains(&Some(ctx.token.as_str()));
+    let denied = |s: &mut TcpStream| respond_error(s, &Failure { status: 401, message: "ccat proxy: wrong token".into(), retry_after: None });
+    match (req.method.as_str(), req.path.split('?').next().unwrap_or("")) {
+        ("POST", path @ ("/v1/messages" | "/v1/messages/count_tokens")) => {
+            let body: Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => return respond_error(&mut s, &Failure { status: 400, message: format!("body is not JSON: {e}"), retry_after: None }),
+            };
+            // Claude Code may tag a name with a context hint such as `[1m]`.
+            let asked = body["model"].as_str().unwrap_or("").split('[').next().unwrap_or("").trim().to_string();
+            let counted = path == "/v1/messages";
+            if counted {
+                common::log(&json!({"event":"api_request","model":asked,"request_bytes":req.body.len(),"declared_tools":body["tools"].as_array().map_or(0, Vec::len)}).to_string());
+            }
+
+            // In order, and only while nothing has reached Claude Code: a stream that breaks halfway can't start over.
+            // Every try out of quota: the request waits, open, until one can run (or Claude Code stops waiting), so an
+            // agent pauses at a usage limit instead of stopping.
+            let hold = !ctx.fail_on_limit.load(Ordering::Relaxed);
+            let mut held: Option<Held> = None;
+            // The request with its tool results cleaned, for the third-party tries; built once (see `compress`).
+            let mut cleaned: Option<(Req, Value)> = None;
+            let mut passes = 0u32;
+            loop {
+                // Resolved on every pass: a route changed in Settings reaches a request already waiting.
+                let (up, model, tier, fallbacks) = ctx.resolve(&asked);
+                let chain: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).collect();
+                if !chain.iter().any(|(u, _)| *u == Upstream::Official || authed) {
+                    return denied(&mut s);
+                }
+                let tries = pick_tries(chain, authed, ctx.no_paid_fallback.load(Ordering::Relaxed), &ctx.breaker);
+                if cleaned.is_none() && ctx.compress_tool_results.load(Ordering::Relaxed) && tries.iter().any(|(u, _)| *u != Upstream::Official) {
+                    let mut b = body.clone();
+                    let saved = compress::tool_results(&mut b);
+                    if saved > 0 {
+                        common::log(&format!("{asked} [{tier}]: cleaned tool output, {saved} bytes saved"));
+                    }
+                    // Serialized either way, so the same history is the same bytes whether or not this turn saved anything.
+                    let raw = b.to_string().into_bytes();
+                    cleaned = Some((Req { method: req.method.clone(), path: req.path.clone(), headers: req.headers.clone(), body: raw }, b));
+                }
+                let mut fails = Vec::new();
+                for (n, (u, m)) in tries.iter().enumerate() {
+                    let last = n + 1 == tries.len();
+                    if n > 0 {
+                        common::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+                    }
+                    let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
+                    // Claude always gets Claude Code's own bytes.
+                    let (rq, bd) = match &cleaned {
+                        Some((r, b)) if *u != Upstream::Official => (r, b),
+                        _ => (&req, &body),
+                    };
+                    let key = format!("{u:?}");
+                    // The half-open probe is claimed only now, by a try that runs (the verdict can't skip it: a request is never failed untried).
+                    ctx.breaker.allow(&key);
+                    let result = run(&mut s, ctx, rq, bd, &asked, u, m, tier, counted, may_fail);
+                    // Only a 5xx (or a timeout / connection error, which come back as 502) counts against the provider.
+                    // ponytail: the last try's `Ok` may be an upstream 5xx passed straight through, so it neither trips
+                    // nor closes the breaker: a provider only ever used last stays as it was. `Ok` carries no status.
+                    match &result {
+                        Err(f) if f.status >= 500 => ctx.breaker.fail(&key),
+                        Ok(()) if last => {}
+                        _ => ctx.breaker.ok(&key),
+                    }
+                    match result {
+                        Ok(()) => {
+                            if !tier.is_empty() {
+                                ctx.note(|s| {
+                                    let t = s.tiers.entry(tier.to_string()).or_default();
+                                    (t.used, t.at) = (Some(hop(u, m)), crate::now());
+                                });
+                            }
+                            return;
+                        }
+                        Err(f) => {
+                            common::log(&format!("{asked} [{tier}]: {m} failed with {} {}", f.status, f.message));
+                            fails.push(f);
+                        }
+                    }
+                }
+                let Some(last) = fails.last() else { return };
+                if fails.iter().any(|f| f.status != 429) {
+                    return respond_error(&mut s, last);
+                }
+                // When each route should be back: what it said, else what the tray's usage shows for its plan (the
+                // 5-hour reset, or the weekly one once the week is used up), else unknown. The request waits for the
+                // soonest; a route with no idea (Claude's bare "429 Error" can pass in seconds) is tried again soon,
+                // backing off 15 s, 30 s, 60 s … and every route at least every 5 minutes.
+                let now = crate::now();
+                let backs: Vec<u64> = tries.iter().zip(&fails).map(|((u, _), f)| f.retry_after.map(|r| now + r).unwrap_or_else(|| ctx.plan_back(u, now))).collect();
+                let soon = 15u64 << passes.min(4);
+                passes += 1;
+                let wait = backs.iter().map(|b| if *b > now { b - now } else { soon }).min().unwrap_or(soon).clamp(15, 300);
+                common::log(&format!("{asked} [{tier}]: every route is at its usage limit; holding the request, next try in {wait}s"));
+                // Tell the usage window what this tier waits for, and when each route should be back.
+                if !tier.is_empty() {
+                    let waiting = tries.iter().zip(&backs).map(|((u, m), b)| (hop(u, m), *b)).collect();
+                    let first = held.is_none();
+                    ctx.note(|s| {
+                        let t = s.tiers.entry(tier.to_string()).or_default();
+                        t.held += first as u32;
+                        t.waiting = waiting;
+                    });
+                    if first {
+                        held = Some(Held { ctx, tier });
+                    }
+                }
+                if !still_waiting(&s, wait, &ctx.wake) {
+                    common::log(&format!("{asked} [{tier}]: Claude Code stopped waiting; request dropped"));
+                    return;
+                }
+            }
+        }
+        (_, "/mcp") if !authed => denied(&mut s),
+        ("POST", "/mcp") => match serde_json::from_slice::<Value>(&req.body) {
+            Ok(msg) => match crate::providers::antigravity::mcp::handle(&ctx.pool, &ctx.folder, &msg) {
+                Some(reply) => respond(&mut s, 200, &reply, ""),
+                None => {
+                    let _ = s.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            },
+            Err(e) => respond(&mut s, 400, &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } }), ""),
+        },
+        // No server-initiated stream and no sessions: the MCP spec's answer for both is 405.
+        ("GET" | "DELETE", "/mcp") => respond_error(&mut s, &Failure { status: 405, message: "no SSE stream".into(), retry_after: None }),
+        // Anything else Claude Code asks its API for, with its own login, goes to the real one.
+        _ if bearer.is_some_and(|b| b != ctx.token) => drop(forward(&mut s, &ctx.http, &req, &anthropic_api(), None, req.body.clone(), None, Fail::Never)),
+        _ if !authed => denied(&mut s),
+        _ => {
+            common::log(&format!("404 {} {} (Claude Code asked for something the proxy doesn't serve)", req.method, req.path));
+            respond_error(&mut s, &Failure { status: 404, message: format!("ccat proxy has no {} {}", req.method, req.path), retry_after: None })
+        }
+    }
+}
+
+/// The chain a request may try, in order. Each try spends ccat's keys or accounts unless it's Claude: those need the
+/// token. With `no_paid` a fallback that is a custom endpoint (a paid API key) is dropped; the primary never is.
+/// Tries whose breaker is open are skipped, unless that would leave none: a request is never failed untried. Only
+/// looks (`is_open`): the half-open probe is claimed by the serve loop right before a try runs.
+fn pick_tries(chain: Vec<(Upstream, String)>, authed: bool, no_paid: bool, breaker: &breaker::Breaker) -> Vec<(Upstream, String)> {
+    let all: Vec<_> = chain
+        .into_iter()
+        .enumerate()
+        .filter(|(n, (u, _))| (*u == Upstream::Official || authed) && (*n == 0 || !(no_paid && matches!(u, Upstream::Endpoint { .. }))))
+        .map(|(_, t)| t)
+        .collect();
+    let ready: Vec<_> = all.iter().filter(|(u, _)| !breaker.is_open(&format!("{u:?}"))).cloned().collect();
+    if ready.is_empty() { all } else { ready }
+}
+
+/// Sleeps `secs` while Claude Code keeps the connection open; false as soon as it closes it (Esc, or a timeout). Ends
+/// early when `wake` moves: a route came back.
+fn still_waiting(s: &TcpStream, secs: u64, wake: &AtomicU64) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    let at = wake.load(Ordering::Relaxed);
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let open = loop {
+        match s.peek(&mut [0u8; 1]) {
+            Ok(0) => break false,
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => break false,
+            _ if std::time::Instant::now() >= until || wake.load(Ordering::Relaxed) != at => break true,
+            _ => std::thread::sleep(Duration::from_secs(2)),
+        }
+    };
+    open && s.set_nonblocking(false).is_ok()
+}
+
+/// Runs a request on one upstream. With `may_fail` a failure that left nothing written comes back as `Err`
+/// (so a fallback can take over); without, it answers Claude Code with the upstream's own error.
+#[allow(clippy::too_many_arguments)]
+fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &Upstream, model: &str, tier: &'static str, counted: bool, may_fail: Fail) -> Result<(), Failure> {
+    match up {
+        Upstream::Official => {
+            let meter = counted.then_some((tier, "Claude", model));
+            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body, &req.body, model, false), meter, may_fail)
+        }
+        Upstream::Endpoint { name, url, key } => {
+            let base = url.trim().trim_end_matches('/');
+            let meter = counted.then_some((tier, name.as_str(), model));
+            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body, &req.body, model, true), meter, may_fail)
+        }
+        Upstream::Antigravity if !counted => {
+            crate::providers::antigravity::proxy::count_tokens(s, ctx, body, model);
+            Ok(())
+        }
+        Upstream::Antigravity => crate::providers::antigravity::proxy::messages(s, ctx, body, asked, model.to_string(), tier, may_fail),
+        // The count has no ChatGPT endpoint: the estimate, calibrated on this session's real answers.
+        Upstream::ChatGPT if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("gpt", body) }), "");
+            Ok(())
+        }
+        Upstream::ChatGPT => crate::providers::chatgpt::proxy::chatgpt_messages(s, ctx, req, body, asked, model, tier, may_fail),
+        Upstream::Ollama { .. } if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("ollama", body) }), "");
+            Ok(())
+        }
+        Upstream::Ollama { url, key } => crate::providers::ollama::ollama_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
+        Upstream::MuseAI { .. } if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("muse", body) }), "");
+            Ok(())
+        }
+        Upstream::MuseAI { url, key } => crate::providers::museai::muse_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
+    }
+}
+
+/// Worth trying the fallback for: the upstream is down, out of quota, or doesn't know the model or the key.
+/// A malformed request (400) would fail there too.
+fn worth_falling_back(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404 | 408 | 429) || status >= 500
+}
+
+/// Which failures `run` hands back instead of answering Claude Code with them (only while nothing was written).
+#[derive(Clone, Copy)]
+pub(crate) enum Fail {
+    /// None: the upstream's own answer goes through as it is (the last try).
+    Never,
+    /// Those a fallback can help with (see `worth_falling_back`).
+    Fallback,
+    /// Usage limits only: the last try of a request that waits them out. Anything else still goes through as it is
+    /// (Claude Code acts on its own errors: compacting on a too-long prompt, refreshing its login on a 401).
+    Limit,
+}
+
+impl Fail {
+    pub(crate) fn takes(self, status: u16) -> bool {
+        match self {
+            Fail::Never => false,
+            Fail::Fallback => worth_falling_back(status),
+            Fail::Limit => status == 429,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- shared by several providers: web search, system prompt
+
+/// The `web_search_*` server tool, when it is the request's only tool — Claude Code's WebSearch sub-request.
+/// ponytail: mixed with client tools it is still dropped; Google grounding and function calls don't combine reliably.
+pub(crate) fn web_search(req: &Value) -> Option<&Value> {
+    let tools = req["tools"].as_array()?;
+    let search = tools.iter().find(|t| t["type"].as_str().is_some_and(|k| k.starts_with("web_search")))?;
+    tools.iter().all(|t| t.get("input_schema").is_none()).then_some(search)
+}
+
+/// The system prompt as Cloud Code `systemInstruction` parts, minus the lines it refuses.
+pub(crate) fn system_parts(req: &Value) -> Vec<Value> {
+    match &req["system"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str().map(String::from)).collect(),
+        _ => vec![],
+    }
+    .into_iter()
+    .map(|t| t.lines().filter(|l| !FILTERED_SYSTEM_LINES.iter().any(|f| l.trim_start().starts_with(f))).collect::<Vec<_>>().join("\n"))
+    .filter(|t| !t.trim().is_empty())
+    .map(|t| json!({ "text": t }))
+    .collect()
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use super::sse::{untag, weigh, Tx, DEFAULT_RATIO, IMAGE_TOKENS};
+    use crate::providers::antigravity::proxy::{build, declarations, function_response};
+    use crate::providers::chatgpt::proxy::{response_input, response_tools, responses_body, Hints};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use std::io::Read;
+
+    #[test]
+    fn upstream_keepalive_comments_reach_claude_before_content() {
+        for google in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            let sigs = Mutex::new(HashMap::new());
+            let tail = if google {
+                sse(&[json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}})])
+            } else { "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into() };
+            let reader = Box::new(io::Cursor::new(format!(": keep-alive\n\n{tail}").into_bytes()));
+            let mut tx = Tx::new("model", "asked", Some(&mut server), &sigs);
+            let result = if google { tx.run(reader) } else { tx.run_openai_chat(reader, "Upstream") };
+            assert!(result.is_ok());
+            drop(tx); drop(server);
+            let mut output = String::new();
+            client.read_to_string(&mut output).unwrap();
+            assert!(output.find("event: ping").expect("Upstream keep-alive must reach Claude") < output.find("content_block_delta").unwrap());
+        }
+    }
+
+    #[test]
+    fn tool_search_definitions_reach_each_translated_provider() {
+        let req = json!({"tools":[{"name":"ToolSearch","input_schema":{"type":"object"}},{"name":"Unused","defer_loading":true,"input_schema":{"type":"object"}}],
+            "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"search_1","name":"ToolSearch","input":{"query":"select:Read"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"search_1","content":[{"type":"tool_reference","tool_name":"Read"}]}]},
+                {"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"Read","input_schema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}}}}]}]});
+        let original = req.clone();
+        let openai = response_tools(&req, false);
+        assert_eq!(openai.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        assert_eq!(openai[1]["parameters"]["properties"]["path"]["type"], "string");
+        let google = declarations(&req);
+        assert_eq!(google.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        let ollama = crate::ollama::chat_body(&req, "model", true);
+        assert_eq!(ollama["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect::<Vec<_>>(), ["ToolSearch", "Read"]);
+        let outputs = response_input(&req, false);
+        assert!(outputs.iter().any(|t| t["type"] == "function_call_output" && t["output"].as_str().unwrap_or("").contains("Read")));
+        let names = HashMap::from([("search_1".to_string(), "ToolSearch".to_string())]);
+        assert!(function_response(&req["messages"][1]["content"][0], &names, "gemini")["functionResponse"]["response"]["output"].as_str().unwrap().contains("Read"));
+        assert!(ollama["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool" && m["content"].as_str().unwrap_or("").contains("Read")));
+        assert_eq!(req, original, "official forwarding keeps the original request");
+    }
+
+    #[test]
+    fn muse_native_heartbeat_precedes_content_with_valid_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let sigs = Mutex::new(HashMap::new());
+        let input = b"data: {\"ccat_ping\":true}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let mut tx = Tx::new("muse-chat", "asked", Some(&mut server), &sigs);
+        assert!(tx.run_openai_chat(Box::new(io::Cursor::new(input.to_vec())), "MuseAI").is_ok());
+        drop(tx); drop(server);
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        assert!(output.starts_with("HTTP/1.1 200 OK\r\n"));
+        let ping = output.find("event: ping").expect("Native heartbeat must reach client to detect disconnection");
+        assert!(ping < output.find("content_block_delta").unwrap());
+    }
+
+    pub static FAKE_API: Mutex<Option<String>> = Mutex::new(None);
+    /// Held by a test that points `FAKE_API` somewhere, so two of them never swap it under each other.
+    static FAKE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serve_pool(pool: Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
+        serve_with(pool, chatgpt::Pool::new(Vec::new(), Vec::new()), routes, folder).inspect(|p| p.fail_on_limit.store(true, Ordering::Relaxed))
+    }
+
+    /// One Antigravity tier that Claude Code knows as `name`.
+    fn ag(name: &str, model: &str) -> Vec<Route> {
+        vec![route("opus", &[name], Upstream::Antigravity, model)]
+    }
+
+    pub(crate) fn ctx() -> Ctx {
+        Ctx {
+            pool: Pool::fake("http://127.0.0.1:1", &["a"]),
+            gpt: chatgpt::Pool::new(Vec::new(), Vec::new()),
+            token: "t".into(),
+            agent_id: "agent".into(),
+            trajectory: "traj".into(),
+            step: AtomicU64::new(0),
+            sigs: Mutex::new(HashMap::new()),
+            routes: Default::default(),
+            http: ureq::Agent::new_with_defaults(),
+            folder: PathBuf::new(),
+            ratio: Mutex::new(HashMap::new()),
+            fail_on_limit: Default::default(),
+            no_paid_fallback: Default::default(),
+            compress_tool_results: Default::default(),
+            breaker: Default::default(),
+            live: Default::default(),
+            wake: AtomicU64::new(0),
+            plan_backs: Default::default(),
+        }
+    }
+
+    // ---- end to end against a fake Cloud Code server
+
+    fn sse(chunks: &[Value]) -> String {
+        chunks.iter().map(|c| format!("data: {c}\r\n\r\n")).collect()
+    }
+
+    /// Answers by bearer token: `quota` → 429, `inband` → in-stream RESOURCE_EXHAUSTED, `empty` → empty STOP, anything else → `ok`.
+    fn fake_upstream(ok: String) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let who = req.header("authorization").unwrap_or("").trim_start_matches("Bearer ").to_string();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push(match req.path.contains("countTokens") {
+                    true => format!("count {body}"),
+                    false => format!("{who} {}", body["project"].as_str().unwrap_or("")),
+                });
+                let (status, text) = match who.as_str() {
+                    _ if req.path.contains("countTokens") => (200, json!({ "totalTokens": 42 }).to_string()),
+                    "search" => (200, sse(&[
+                        json!({ "response": { "candidates": [{ "content": { "parts": [{ "text": "Rust 1.99 is out." }] } }] } }),
+                        json!({ "response": { "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP", "groundingMetadata": {
+                            "webSearchQueries": ["latest rust version"],
+                            "groundingChunks": [{ "web": { "uri": "https://blog.rust-lang.org/x", "title": "rust-lang.org" } },
+                                                { "web": { "uri": "https://blog.rust-lang.org/x", "title": "dup" } }] } }],
+                                     "usageMetadata": { "promptTokenCount": 50, "toolUsePromptTokenCount": 30, "candidatesTokenCount": 5 } } }),
+                    ])),
+                    // What Google really sent for a retired model (Oct 2026): words, then the stream just ends.
+                    "retired" => (200, sse(&[json!({ "response": { "candidates": [{ "content": { "parts": [
+                        { "text": "Gemini 3.5 Flash is no longer available. Please switch to Gemini 3.7 Flash in the latest version of Antigravity." } ] } }] } })])),
+                    "silent" => (200, sse(&[json!({ "response": { "candidates": [{ "content": { "parts": [] } }] } })])),
+                    "image" => (200, sse(&[json!({ "response": { "candidates": [{ "content": { "parts": [
+                        { "thought": true, "inlineData": { "mimeType": "image/png", "data": "ZHJhZnQ=" } },
+                        { "text": "Here is your cat." },
+                        { "inlineData": { "mimeType": "image/jpeg", "data": "/9j/AA==" } } ] }, "finishReason": "STOP" }] } })])),
+                    "quota" =>(429, r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"exhausted","details":[{"retryDelay":"90s"}]}}"#.to_string()),
+                    "inband" => (200, sse(&[json!({ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota" } })])),
+                    "empty" => (200, sse(&[json!({ "response": { "candidates": [{ "content": { "parts": [{ "text": " " }] }, "finishReason": "STOP" }] } })])),
+                    _ => (200, ok.clone()),
+                };
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        (url, seen)
+    }
+
+    fn post(proxy: &Proxy, token: &str, body: &Value) -> (u16, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut res = agent.post(format!("{}/v1/messages?beta=true", proxy.url)).header("authorization", format!("Bearer {token}")).send(body.to_string()).unwrap();
+        (res.status().as_u16(), res.body_mut().read_to_string().unwrap())
+    }
+
+    fn reply() -> String {
+        sse(&[
+            json!({ "response": { "candidates": [{ "content": { "role": "model", "parts": [{ "thought": true, "text": "think" }] } }],
+                    "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 40 } } }),
+            json!({ "response": { "candidates": [{ "content": { "parts": [{ "text": "", "thoughtSignature": "U0lH" }, { "text": "Hello" }] } }] } }),
+            json!({ "response": { "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "Read", "args": { "p": "a" } }, "thoughtSignature": "Q0FMTA==" }] },
+                    "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 7, "thoughtsTokenCount": 3 } } }),
+        ])
+    }
+
+    #[test]
+    fn rotates_past_quota_and_in_band_errors() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["quota", "inband", "good"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        assert_eq!(post(&proxy, "nope", &req).0, 401);
+
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("message_stop"));
+        // quota: HTTP 429 → next account. inband: 200 then an in-stream quota error → blocked, request retried.
+        assert_eq!(*seen.lock().unwrap(), ["quota p-quota", "inband p-inband", "good p-good"].map(String::from));
+
+        // Both stay blocked for this family, so the next request goes straight to the healthy account.
+        post(&proxy, &proxy.token, &req);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "good p-good");
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn turned_off_accounts_are_skipped_live() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["first", "second"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "first p-first");
+
+        // Switched off while running: the next request goes to the other account, the one after to none.
+        proxy.disabled.write().unwrap().insert("first".into());
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "second p-second");
+        proxy.disabled.write().unwrap().insert("second".into());
+        let n = seen.lock().unwrap().len();
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status >= 400 && body.contains("turned off"), "{status} {body}");
+        assert_eq!(seen.lock().unwrap().len(), n, "nothing reached Google");
+
+        // And back on.
+        proxy.disabled.write().unwrap().clear();
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+    }
+
+    #[test]
+    fn empty_answers_are_retried_then_reported() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["empty"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "gemini-3.1-pro-low", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 529, "nothing was streamed, so Claude Code gets a retryable status: {body}");
+        assert!(body.contains("overloaded_error") && body.contains("empty response"), "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn translates_stream_and_non_stream() {
+        let (url, seen) = fake_upstream(reply());
+        let aliases = ag("claude-opus-5-5", "gemini-3.1-pro-low");
+        let proxy = serve_pool(Pool::fake(&url, &["good", "quota"]), aliases, PathBuf::new()).unwrap();
+        let req = json!({ "model": "claude-opus-5-5[1m]", "max_tokens": 1000, "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let events: Vec<Value> = body.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect();
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start",
+                "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"
+            ]
+        );
+        assert_eq!(events[0]["message"]["usage"]["input_tokens"], 60);
+        assert_eq!(events[0]["message"]["model"], "claude-opus-5-5", "replies keep the spoofed name");
+        assert_eq!(events[3]["delta"], json!({ "type": "signature_delta", "signature": "ag:gemini:U0lH" }));
+        assert_eq!(events[6]["delta"]["text"], "Hello");
+        let tool_id = events[8]["content_block"]["id"].as_str().unwrap().to_string();
+        assert!(tool_id.starts_with("toolu_"));
+        assert_eq!(events[9]["delta"]["partial_json"], r#"{"p":"a"}"#);
+        assert_eq!(events[11]["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events[11]["usage"]["output_tokens"], 10);
+
+        // Non-stream: one JSON message; the function-call signature is remembered for the next turn.
+        let mut req = req;
+        req["stream"] = json!(false);
+        req["model"] = json!("claude-haiku-4-5-20251001"); // a name Claude Code picked itself → fallback model
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["content"][0], json!({ "type": "thinking", "thinking": "think", "signature": "ag:gemini:U0lH" }));
+        assert_eq!(msg["content"][2]["input"], json!({ "p": "a" }));
+        assert_eq!(msg["stop_reason"], "tool_use");
+        assert_eq!(msg["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(*seen.lock().unwrap(), ["good p-good", "good p-good"].map(String::from), "sticky on the healthy account");
+    }
+
+    fn route(tier: &'static str, names: &[&str], upstream: Upstream, model: &str) -> Route {
+        Route { tier, names: names.iter().map(|n| n.to_string()).collect(), upstream, model: model.into(), fallbacks: Vec::new() }
+    }
+
+    #[test]
+    fn a_held_request_runs_as_soon_as_its_route_is_back() {
+        let ep = |name: &str, url: String| Upstream::Endpoint { name: name.into(), url, key: "k".into() };
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![route("sonnet", &["m@sonnet"], ep("Busy", fake_endpoint(429, "busy")), "m")], PathBuf::new()).unwrap();
+        proxy.fail_on_limit.store(false, Ordering::Relaxed);
+        let body = json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
+        let (p2, b2) = (proxy.clone(), body.clone());
+        let t = std::time::Instant::now();
+        let waiting = std::thread::spawn(move || post(&p2, &p2.token, &b2));
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!waiting.is_finished(), "held, not answered with the 429");
+        // The route comes back (here: switched in Settings) and the pools say so: it runs at once, not at the next try.
+        proxy.routes.write().unwrap()[0].upstream = ep("Good", fake_endpoint(200, "good"));
+        proxy.ctx.wake.fetch_add(1, Ordering::Relaxed);
+        let (status, text) = waiting.join().unwrap();
+        assert_eq!(status, 200, "{text}");
+        assert!(t.elapsed() < Duration::from_secs(10), "well before the 15 s floor");
+
+        // Holding doesn't touch any other error: Claude Code still gets the upstream's own answer.
+        for (code, who) in [(400, "bad"), (503, "down")] {
+            proxy.routes.write().unwrap()[0].upstream = ep(who, fake_endpoint(code, who));
+            let (status, text) = post(&proxy, &proxy.token, &body);
+            assert_eq!(status, code);
+            assert!(text.contains(&format!("{who} says {code}")), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_held_request_stops_waiting_when_claude_code_hangs_up() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (server, _) = l.accept().unwrap();
+        let wake = AtomicU64::new(0);
+        assert!(still_waiting(&server, 0, &wake), "open: keep holding");
+        drop(client);
+        let t = std::time::Instant::now();
+        assert!(!still_waiting(&server, 60, &wake), "closed: give up");
+        assert!(t.elapsed() < Duration::from_secs(5), "at once, not after the wait");
+    }
+
+    #[test]
+    fn tiers_resolve_by_name_then_tier_then_family_then_login() {
+        let ctx = ctx();
+        *ctx.routes.write().unwrap() = vec![
+            route("fable", &["claude-fable-5-1"], Upstream::Official, "claude-fable-5-1"),
+            route("opus", &[], Upstream::Official, ""),
+            route("sonnet", &["gemini-x@sonnet", "claude-sonnet-5-5"], Upstream::Antigravity, "gemini-x"),
+            route("haiku", &["m@haiku"], Upstream::Endpoint { name: "OR".into(), url: "u".into(), key: "k".into() }, "vendor/m"),
+        ];
+        let got = |asked: &str| {
+            let (u, m, _, _) = ctx.resolve(asked);
+            (u, m)
+        };
+        assert_eq!(got("gemini-x@sonnet"), (Upstream::Antigravity, "gemini-x".into()), "a spoofed tier's override target");
+        assert_eq!(got("claude-sonnet-5-5"), (Upstream::Antigravity, "gemini-x".into()), "its Claude name, if Claude Code sends that");
+        assert_eq!(got("claude-opus-4-6"), (Upstream::Official, "claude-opus-4-6".into()), "an official tier left at Claude Code's pick keeps the name");
+        assert_eq!(got("claude-haiku-4-5-20251001").1, "vendor/m", "a Claude Code pick goes to its family's tier");
+        assert_eq!(got("claude-opus-x@haiku").1, "vendor/m", "an explicit @tier beats the family in the name");
+        assert_eq!(got("something-else"), (Upstream::Official, "something-else".into()), "unknown names go to the login");
+        ctx.routes.write().unwrap().retain(|r| r.upstream != Upstream::Official);
+        assert_eq!(got("something-else"), (Upstream::Antigravity, "gemini-x".into()), "…or, with no official tier, to the first one");
+
+        // A Default fallback ("" = Claude Code's pick) goes out with the name Claude Code sent.
+        ctx.routes.write().unwrap()[0].fallbacks = vec![(Upstream::Official, String::new())];
+        assert_eq!(ctx.resolve("claude-sonnet-5-5").3, [(Upstream::Official, "claude-sonnet-5-5".to_string())]);
+
+        // A switch made while the session runs: same names, new upstream.
+        ctx.routes.write().unwrap()[0].upstream = Upstream::Official;
+        ctx.routes.write().unwrap()[0].model = "claude-sonnet-5-5".into();
+        assert_eq!(got("gemini-x@sonnet"), (Upstream::Official, "claude-sonnet-5-5".into()));
+    }
+
+    /// An endpoint that answers `status` with a body naming itself, for fallback tests.
+    fn fake_endpoint(status: u16, who: &'static str) -> String {
+        counted_endpoint(status, who).0
+    }
+
+    /// `fake_endpoint` plus the number of requests it has received.
+    fn counted_endpoint(status: u16, who: &'static str) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let n = hits.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let _ = read_request(&s);
+                n.fetch_add(1, Ordering::Relaxed);
+                let text = json!({ "type": "message", "who": who, "error": { "message": format!("{who} says {status}") }, "usage": { "input_tokens": 1, "output_tokens": 1 } }).to_string();
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}", text.len());
+            }
+        });
+        (url, hits)
+    }
+
+    fn ep(name: &str, url: String) -> Upstream {
+        Upstream::Endpoint { name: name.into(), url, key: "k".into() }
+    }
+
+    fn ask(proxy: &Proxy) -> (u16, String) {
+        post(proxy, &proxy.token, &json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] }))
+    }
+
+    #[test]
+    fn never_paid_skips_endpoint_fallbacks_but_not_the_primary() {
+        let chain = |first: Upstream| vec![(first, "a".to_string()), (ep("Paid", "u".into()), "b".into()), (Upstream::Antigravity, "c".into()), (Upstream::Ollama { url: "u".into(), key: String::new() }, "d".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        let b = breaker::Breaker::default();
+        assert_eq!(names(pick_tries(chain(Upstream::Official), true, false, &b)), "abcd", "off: as before");
+        assert_eq!(names(pick_tries(chain(Upstream::Official), true, true, &b)), "acd", "on: the endpoint fallback goes, subscriptions and Ollama stay");
+        assert_eq!(names(pick_tries(chain(ep("Mine", "u".into())), true, true, &b)), "acd", "on: an endpoint primary still runs, the endpoint fallback goes");
+
+        let (busy, good) = (fake_endpoint(429, "busy"), fake_endpoint(200, "good"));
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy), "m");
+        r.fallbacks = vec![(ep("Good", good), "x".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        assert!(ask(&proxy).1.contains("\"who\":\"good\""), "off: the endpoint fallback answers");
+        proxy.no_paid_fallback.store(true, Ordering::Relaxed);
+        let (status, text) = ask(&proxy);
+        assert_eq!(status, 429, "on: the endpoint primary ran and its limit reached Claude Code: {text}");
+        assert!(text.contains("busy says 429"), "{text}");
+    }
+
+    #[test]
+    fn open_breakers_are_skipped_but_never_leave_a_request_untried() {
+        let b = breaker::Breaker::default();
+        let chain = || vec![(ep("A", "u".into()), "a".to_string()), (ep("B", "u".into()), "b".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        (0..3).for_each(|_| b.fail("A"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "b", "A is open: skipped, the order of the rest kept");
+        (0..3).for_each(|_| b.fail("B"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "ab", "every route open: all are tried, in order");
+    }
+
+    #[test]
+    fn a_tripped_fallback_is_probed_when_needed_even_after_many_requests_served_by_the_primary() {
+        let b = breaker::Breaker::new(Duration::from_millis(60));
+        let chain = || vec![(ep("A", "u".into()), "a".to_string()), (ep("B", "u".into()), "b".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        (0..3).for_each(|_| b.fail("B"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "a", "B is open");
+        std::thread::sleep(Duration::from_millis(80));
+        for _ in 0..5 {
+            // A answers, B is never claimed: picking must not push B's open time forward.
+            assert_eq!(names(pick_tries(chain(), true, false, &b)), "ab", "cooldown over: B is back in the chain");
+            assert!(b.allow("A"));
+        }
+        assert!(b.allow("B"), "A fails now: B is tried, and it is the probe");
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "a", "a claimed probe holds the others off");
+    }
+
+    #[test]
+    fn a_last_try_never_wipes_the_failure_count() {
+        let (flaky, flaky_hits) = counted_endpoint(503, "flaky");
+        let good = fake_endpoint(200, "good");
+        let mut sonnet = route("sonnet", &["m@sonnet"], ep("Flaky", flaky.clone()), "m");
+        sonnet.fallbacks = vec![(ep("Good", good), "x".into())];
+        // Flaky is the last (only) try here: its 503 goes straight to Claude Code.
+        let opus = route("opus", &["m@opus"], ep("Flaky", flaky), "m");
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![sonnet, opus], PathBuf::new()).unwrap();
+        let sonnet = || assert_eq!(ask(&proxy).0, 200);
+        let opus = || assert_eq!(post(&proxy, &proxy.token, &json!({ "model": "m@opus", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] })).0, 503);
+        sonnet();
+        opus();
+        sonnet();
+        opus();
+        sonnet();
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 5);
+        sonnet();
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 5, "three failures as a fallback-able try tripped it, the opus passes in between didn't reset them");
+    }
+
+    #[test]
+    fn the_breaker_trips_on_5xx_not_on_usage_limits() {
+        let (flaky, flaky_hits) = counted_endpoint(503, "flaky");
+        let (busy, busy_hits) = counted_endpoint(429, "busy");
+        let good = fake_endpoint(200, "good");
+        let mut r = route("sonnet", &["m@sonnet"], ep("Flaky", flaky), "m");
+        r.fallbacks = vec![(ep("Good", good.clone()), "x".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        for _ in 0..4 {
+            assert_eq!(ask(&proxy).0, 200, "the fallback answers every time");
+        }
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 3, "tripped after 3 failures: the 4th request skipped it");
+
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy), "m");
+        r.fallbacks = vec![(ep("Good", good), "x".into())];
+        proxy.routes.write().unwrap()[0] = r;
+        for _ in 0..5 {
+            assert!(ask(&proxy).1.contains("\"who\":\"good\""));
+        }
+        assert_eq!(busy_hits.load(Ordering::Relaxed), 5, "a usage limit never opens the breaker");
+    }
+
+    #[test]
+    fn a_failing_tier_falls_back_once() {
+        let ep = |name: &str, url: String| Upstream::Endpoint { name: name.into(), url, key: "k".into() };
+        let (busy, good) = (fake_endpoint(429, "busy"), fake_endpoint(200, "good"));
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy.clone()), "m");
+        r.fallbacks = vec![(ep("Down", fake_endpoint(503, "down")), "second".into()), (ep("Good", good), "other".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        let body = json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, text) = post(&proxy, &proxy.token, &body);
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("\"who\":\"good\""), "the second fallback answered after the first was down too: {text}");
+
+        // No fallback: the upstream's own 429 reaches Claude Code untouched.
+        proxy.routes.write().unwrap()[0].fallbacks.clear();
+        let (status, text) = post(&proxy, &proxy.token, &body);
+        assert_eq!(status, 429);
+        assert!(text.contains("busy says 429"), "{text}");
+
+        // A bad request isn't the upstream's fault: no fallback for a 400.
+        proxy.routes.write().unwrap()[0] = Route { fallbacks: vec![(ep("Good", fake_endpoint(200, "good")), "x".into())], ..route("sonnet", &["m@sonnet"], ep("Bad", fake_endpoint(400, "bad")), "m") };
+        assert_eq!(post(&proxy, &proxy.token, &body).0, 400);
+
+        // A Claude tier (no token needed) whose fallback spends a key: without the token, no fallback.
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        proxy.routes.write().unwrap()[0] = Route { fallbacks: vec![(ep("Good", fake_endpoint(200, "good")), "x".into())], ..route("sonnet", &["m@sonnet"], Upstream::Official, "m") };
+        *FAKE_API.lock().unwrap() = Some(busy);
+        let (status, text) = post(&proxy, "not-the-token", &body);
+        assert_ne!(status, 200, "{text}");
+        assert!(!text.contains("good"), "{text}");
+        assert_eq!(format!("{:?}", ep("OR", "u".into())), "OR", "logs name the provider, never the key");
+    }
+
+    #[test]
+    fn endpoint_tiers_get_their_key_model_and_clean_history() {
+        // Echoes what reached the endpoint, in a streamed answer with a rate-limit header.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let h = |k: &str| req.header(k).unwrap_or("-").to_string();
+                let seen = json!({ "path": req.path, "key": h("x-api-key"), "auth": h("authorization"), "beta": h("anthropic-beta"),
+                                   "token": h("x-ccat-token"), "body": serde_json::from_slice::<Value>(&req.body).unwrap() });
+                let text = format!("event: seen\ndata: {seen}\n\n");
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nanthropic-ratelimit-unified-5h-utilization: 0.25\r\nContent-Length: {}\r\n\r\n{text}", text.len());
+            }
+        });
+        let routes = vec![route("sonnet", &["m@sonnet"], Upstream::Endpoint { name: "OR".into(), url, key: "ek".into() }, "vendor/m")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let body = json!({ "model": "m@sonnet[1m]", "max_tokens": 10, "stream": true,
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=2; cch=7;" },
+                       { "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }], "messages": [
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "from gemini", "signature": "ag:gemini:U0lH" },
+                { "type": "thinking", "thinking": "unsigned", "signature": "" },
+                { "type": "thinking", "thinking": "from anthropic", "signature": "EqQBCkg" },
+                { "type": "text", "text": "hello" } ] },
+            { "role": "user", "content": "again" } ] });
+        let call = |token: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            agent.post(format!("{}/v1/messages?beta=true", proxy.url))
+                .header("authorization", "Bearer sk-ant-oat01-login")
+                .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
+                .header("x-ccat-token", token)
+                .send(body.to_string())
+                .unwrap()
+        };
+        assert_eq!(call("nope").status().as_u16(), 401, "an endpoint tier spends ccat's key, so it needs the token");
+
+        let mut res = call(&proxy.token);
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(res.headers()["anthropic-ratelimit-unified-5h-utilization"], "0.25", "upstream headers come back");
+        let text = res.body_mut().read_to_string().unwrap();
+        let seen: Value = serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+        assert_eq!(seen["path"], "/v1/messages?beta=true", "the /v1 the URL ended with isn't doubled");
+        assert_eq!((&seen["key"], &seen["auth"]), (&json!("ek"), &json!("Bearer ek")), "the endpoint's key, never the Claude login");
+        assert_eq!(seen["beta"], "interleaved-thinking-2025-05-14", "the login's beta flag stays home");
+        assert_eq!(seen["token"], "-", "the proxy token stays home");
+        assert_eq!(seen["body"]["model"], "vendor/m");
+        assert_eq!(seen["body"]["system"], json!([{ "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }]), "the per-request billing block is gone, the rest as it was");
+        let kept: Vec<&str> = seen["body"]["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
+        assert_eq!(kept, ["from anthropic", "hello"], "thinking another provider signed is dropped");
+    }
+
+    /// What reached a fake Anthropic API: the raw body bytes and the headers, per request.
+    type Seen = Arc<Mutex<Vec<(Vec<u8>, Vec<(String, String)>)>>>;
+
+    fn fake_anthropic() -> (String, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Seen::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                log.lock().unwrap().push((req.body, req.headers));
+                let text = r#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1}}"#;
+                let _ = write!(s, "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{text}", text.len());
+            }
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn compression_cleans_third_party_requests_and_never_claudes() {
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (claude, claude_seen) = fake_anthropic();
+        let (other, other_seen) = fake_anthropic();
+        *FAKE_API.lock().unwrap() = Some(claude);
+        let routes = vec![
+            route("opus", &["claude-opus-5-5"], Upstream::Official, "claude-opus-5-5"),
+            route("sonnet", &["m@sonnet"], ep("Other", other), "vendor/m"),
+        ];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let dirty = "\\u001b[32m   Compiling\\u001b[0m foo   \\n\\n\\n\\n\\n\\n    Finished";
+        let body = |model: &str| format!(r#"{{"model": "{model}", "max_tokens": 9, "messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":"Bash","input":{{}}}},{{"type":"tool_use","id":"e","name":"Bash","input":{{}}}},{{"type":"tool_use","id":"r","name":"Read","input":{{}}}}]}},{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"e","is_error":true,"content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"r","content":"{dirty}"}}]}}]}}"#);
+        let send = |model: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let res = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(body(model)).unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+        };
+        let results = |seen: &Seen| -> Vec<String> {
+            let v: Value = serde_json::from_slice(&seen.lock().unwrap().pop().unwrap().0).unwrap();
+            v["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["content"].as_str().unwrap().to_string()).collect()
+        };
+        let cleaned = "   Compiling foo\n\n    Finished";
+
+        send("m@sonnet");
+        assert_eq!(results(&other_seen), [dirty_text(dirty), dirty_text(dirty), dirty_text(dirty)], "off: untouched");
+        proxy.compress_tool_results.store(true, Ordering::Relaxed);
+        send("m@sonnet");
+        assert_eq!(results(&other_seen), [cleaned.to_string(), dirty_text(dirty), dirty_text(dirty)], "on: a third-party route gets clean Bash output; an error result and a Read result stay");
+        send("m@sonnet");
+        let first = other_seen.lock().unwrap().last().map(|r| r.0.clone());
+        send("m@sonnet");
+        assert_eq!(first, other_seen.lock().unwrap().last().map(|r| r.0.clone()), "the same history is the same bytes every turn");
+        other_seen.lock().unwrap().clear();
+
+        send("claude-opus-5-5");
+        let (raw, _) = claude_seen.lock().unwrap().pop().unwrap();
+        assert_eq!(String::from_utf8(raw).unwrap(), body("claude-opus-5-5"), "Claude gets the very same bytes, flag on");
+    }
+
+    fn dirty_text(json_escaped: &str) -> String {
+        serde_json::from_str(&format!("\"{json_escaped}\"")).unwrap()
+    }
+
+    /// The official route sends Claude Code's request on exactly as it came: same bytes when nothing needs changing,
+    /// and the same key order (only the model swapped, foreign thinking dropped) when something does.
+    #[test]
+    fn official_route_forwards_claude_codes_request_natively() {
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, seen) = fake_anthropic();
+        *FAKE_API.lock().unwrap() = Some(url);
+        let routes = vec![route("opus", &["claude-opus-4-5", "claude-opus-5-5"], Upstream::Official, "claude-opus-5-5")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let send = |body: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let res = agent.post(format!("{}/v1/messages?beta=true", proxy.url))
+                .header("authorization", "Bearer sk-ant-oat01-login")
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+                .header("anthropic-version", "2023-06-01")
+                .header("x-app", "cli")
+                .send(body.to_string())
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+            let (raw, headers) = seen.lock().unwrap().pop().unwrap();
+            (String::from_utf8(raw).unwrap(), headers)
+        };
+        // Keys deliberately out of alphabetical order, odd spacing, an escape and a float serde would write differently.
+        let body = r#"{"model": "claude-opus-5-5", "max_tokens":  64000,
+            "system":[{"type":"text","text":"You are Claude Code, caf\u00e9","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"hi"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"EqQBCkgIBhABGAIiQJz7Zp0YcRk3mV0aN8w"},{"type":"text","text":"yo"}]},
+                {"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]}],
+            "tools":[{"name":"Read","description":"d","input_schema":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"abc":{"type":"boolean"}},"required":["path"]}}],
+            "temperature": 1.0, "stream": true}"#;
+        let (got, headers) = send(body);
+        assert_eq!(got, body, "nothing to change: the very same bytes");
+        let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(h("authorization"), Some("Bearer sk-ant-oat01-login"), "Claude Code's own login");
+        assert_eq!(h("anthropic-beta"), Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"));
+        assert_eq!((h("anthropic-version"), h("x-app")), (Some("2023-06-01"), Some("cli")));
+        assert_eq!(h("x-api-key"), None);
+
+        // Another model name: the model is swapped in place, nothing else moves.
+        let compact = r#"{"model":"claude-opus-4-5","tools":[{"name":"Read","input_schema":{"type":"object","properties":{"path":{},"limit":{},"abc":{}}}}],"max_tokens":9,"stream":true}"#;
+        let (got, _) = send(compact);
+        assert_eq!(got, compact.replace("claude-opus-4-5", "claude-opus-5-5"));
+
+        // Thinking another provider signed is dropped; the key order stays.
+        let foreign = r#"{"model":"claude-opus-5-5","messages":[{"role":"assistant","content":[{"signature":"ag:claude:QUJD","type":"thinking","thinking":"x"},{"type":"text","text":"t"}]}],"z":1,"a":2}"#;
+        let (got, _) = send(foreign);
+        assert_eq!(got, r#"{"model":"claude-opus-5-5","messages":[{"role":"assistant","content":[{"type":"text","text":"t"}]}],"z":1,"a":2}"#);
+        *FAKE_API.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn all_blocked_is_a_429_with_retry_after() {
+        let (url, _) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["quota"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 429);
+        assert!(body.contains("rate_limit_error") && body.contains("claude quota"), "{body}");
+    }
+
+    fn web_search_req(model: &str) -> Value {
+        json!({
+            "model": model, "max_tokens": 1000, "stream": true,
+            "messages": [{ "role": "user", "content": "Perform a web search for the query: latest rust version" }],
+            "tools": [{ "type": "web_search_20250305", "name": "web_search", "max_uses": 8, "allowed_domains": ["rust-lang.org"] }]
+        })
+    }
+
+    #[test]
+    fn web_search_becomes_google_grounding() {
+        let ctx = ctx();
+        let (body, _) = build(&web_search_req("gemini-3.1-pro-low"), "gemini-3.1-pro-low", &ctx);
+        let r = &body["request"];
+        assert_eq!(r["tools"], json!([{ "googleSearch": {} }]));
+        assert!(r.get("toolConfig").is_none(), "no function calling alongside grounding");
+        assert_eq!(r["systemInstruction"]["parts"][0]["text"], "Only use web results from these domains: rust-lang.org.");
+
+        // Mixed with client tools it is not a WebSearch sub-request: the server tool is dropped as before.
+        let mut mixed = web_search_req("gemini-3.1-pro-low");
+        mixed["tools"].as_array_mut().unwrap().push(json!({ "name": "Read", "input_schema": { "type": "object" } }));
+        assert!(web_search(&mixed).is_none());
+        let (body, _) = build(&mixed, "gemini-3.1-pro-low", &ctx);
+        assert_eq!(body["request"]["tools"][0]["functionDeclarations"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn web_search_results_reach_claude_code() {
+        let (url, _) = fake_upstream(reply());
+        // The Claude route is swapped to the Gemini search model; replies keep the asked-for name.
+        let aliases = ag("claude-opus-5-5", "claude-opus-4-6-thinking");
+        let proxy = serve_pool(Pool::fake(&url, &["search"]), aliases, PathBuf::new()).unwrap();
+        let (status, body) = post(&proxy, &proxy.token, &web_search_req("claude-opus-5-5"));
+        assert_eq!(status, 200, "{body}");
+        let events: Vec<Value> = body.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect();
+        let starts: Vec<&Value> = events.iter().filter(|e| e["type"] == "content_block_start").map(|e| &e["content_block"]).collect();
+        assert_eq!(starts.iter().map(|b| b["type"].as_str().unwrap()).collect::<Vec<_>>(), ["text", "server_tool_use", "web_search_tool_result"]);
+        assert_eq!(starts[1]["name"], "web_search");
+        assert_eq!(starts[2]["tool_use_id"], starts[1]["id"]);
+        assert_eq!(starts[2]["content"], json!([{ "type": "web_search_result", "url": "https://blog.rust-lang.org/x", "title": "rust-lang.org", "encrypted_content": "", "page_age": null }]));
+        assert!(body.contains(r#"{\"query\":\"latest rust version\"}"#), "{body}");
+        let end = events.iter().find(|e| e["type"] == "message_delta").unwrap();
+        assert_eq!(end["delta"]["stop_reason"], "end_turn");
+        assert_eq!(end["usage"]["server_tool_use"]["web_search_requests"], 1);
+        assert_eq!(end["usage"]["input_tokens"], 80, "pages Google Search read count as input");
+        assert_eq!(events[0]["message"]["model"], "claude-opus-5-5");
+
+        let mut req = web_search_req("claude-opus-5-5");
+        req["stream"] = json!(false);
+        let msg: Value = serde_json::from_str(&post(&proxy, &proxy.token, &req).1).unwrap();
+        let kinds: Vec<&str> = msg["content"].as_array().unwrap().iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["text", "server_tool_use", "web_search_tool_result"]);
+    }
+
+    #[test]
+    fn structured_output_maps_to_response_schema() {
+        let ctx = ctx();
+        let schema = json!({ "type": "object", "properties": { "n": { "type": "integer" } }, "required": ["n"], "additionalProperties": false });
+        let mut req = json!({ "model": "m", "max_tokens": 100, "messages": [{ "role": "user", "content": "hi" }],
+                              "output_config": { "format": { "type": "json_schema", "schema": schema } } });
+        let (body, _) = build(&req, "gemini-3.1-pro-low", &ctx);
+        let gen = &body["request"]["generationConfig"];
+        assert_eq!(gen["responseMimeType"], "application/json");
+        assert_eq!(gen["responseSchema"], json!({ "type": "object", "properties": { "n": { "type": "integer" } }, "required": ["n"] }));
+        let (body, _) = build(&req, "claude-sonnet-4-6", &ctx);
+        assert!(body["request"]["generationConfig"].get("responseSchema").is_none(), "Gemini only");
+        req.as_object_mut().unwrap().remove("output_config");
+        req["output_format"] = json!({ "type": "json_schema", "schema": schema });
+        assert!(build(&req, "gemini-3.1-pro-low", &ctx).0["request"]["generationConfig"].get("responseSchema").is_some(), "older beta field");
+    }
+
+    #[test]
+    fn google_notices_surface_once_instead_of_looping() {
+        let (url, seen) = fake_upstream(reply());
+        let req = |stream: bool| json!({ "model": "gemini-3.5-flash-low", "max_tokens": 64, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] });
+
+        let proxy = serve_pool(Pool::fake(&url, &["retired"]), Vec::new(), PathBuf::new()).unwrap();
+        let (status, body) = post(&proxy, &proxy.token, &req(false));
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("invalid_request_error") && body.contains("no longer available"), "Google's words reach the user: {body}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "a client error is not retried");
+        // Streaming: the notice already went out as text, so the error rides in-band — as a non-retryable kind.
+        let (_, body) = post(&proxy, &proxy.token, &req(true));
+        assert!(body.contains("event: error") && body.contains("invalid_request_error"), "{body}");
+
+        // Nothing said and no finish reason: still a retryable hiccup.
+        let proxy = serve_pool(Pool::fake(&url, &["silent"]), Vec::new(), PathBuf::new()).unwrap();
+        let (status, body) = post(&proxy, &proxy.token, &req(false));
+        assert_eq!(status, 529, "{body}");
+        assert!(body.contains("without a finish reason; last line: data:"), "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 2 + 3);
+    }
+
+    #[test]
+    fn weigh_skips_media_but_counts_images() {
+        let img = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "A".repeat(50_000) } });
+        let (bytes, images) = weigh(&json!({ "messages": [{ "role": "user", "content": [img.clone(), { "type": "text", "text": "hi" }] }] }));
+        assert_eq!(images, 1);
+        assert!(bytes < 200, "base64 is not text: {bytes}");
+        let ctx = ctx();
+        let req = json!({ "messages": [{ "role": "user", "content": [img] }] });
+        assert_eq!(ctx.estimate("claude", &req), (weigh(&req).0 as f64 * DEFAULT_RATIO).round() as u64 + IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn count_tokens_is_exact_on_gemini_and_calibrated_elsewhere() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["good"]), Vec::new(), PathBuf::new()).unwrap();
+        let tools = json!([{ "name": "Read", "description": "Read a file", "input_schema": { "type": "object", "additionalProperties": false,
+                             "properties": { "path": { "type": "string", "minLength": 1 } } } }, { "type": "web_search_20250305", "name": "web_search" }]);
+        let req = |model: &str| json!({ "model": model, "system": [{ "type": "text", "text": "x-anthropic-billing-header: cch=1;" }, { "type": "text", "text": "be brief" }],
+                                       "tools": tools, "messages": [{ "role": "user", "content": "hello there" }] });
+        let count = |body: &Value| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let mut res = agent.post(format!("{}/v1/messages/count_tokens", proxy.url)).header("x-api-key", &proxy.token).send(body.to_string()).unwrap();
+            let v: Value = serde_json::from_str(&res.body_mut().read_to_string().unwrap()).unwrap();
+            v["input_tokens"].as_u64().unwrap()
+        };
+
+        // Gemini: Google counts the translated request — filtered system prompt, Cloud Code declarations, contents.
+        assert_eq!(count(&req("gemini-3.1-pro-low")), 42);
+        let sent: Value = serde_json::from_str(seen.lock().unwrap()[0].strip_prefix("count ").unwrap()).unwrap();
+        let c = &sent["request"]["contents"];
+        assert_eq!(sent["request"]["model"], "models/gemini-3.1-pro-low");
+        assert_eq!(c[0]["parts"][0], json!({ "text": "be brief" }), "billing header filtered as on the real request");
+        let decls: Value = serde_json::from_str(c[0]["parts"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(decls, json!([{ "name": "Read", "description": "Read a file",
+                                   "parameters": { "type": "object", "properties": { "path": { "type": "string", "description": "(minLength: 1)" } } } }]),
+                   "what Gemini is really sent, not the raw Anthropic schema; server tools skipped");
+        assert_eq!(c[1], json!({ "role": "user", "parts": [{ "text": "hello there" }] }));
+
+        // Claude route, nothing learned yet: bytes/4 of the text.
+        let claude = req("claude-sonnet-4-6");
+        assert_eq!(count(&claude), (weigh(&claude).0 as f64 * DEFAULT_RATIO).round() as u64);
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the Gemini count went upstream");
+
+        // One real Claude-route answer (fake upstream: promptTokenCount 100) calibrates the ratio for that family.
+        let mut turn = req("claude-sonnet-4-6");
+        turn["max_tokens"] = json!(100);
+        assert_eq!(post(&proxy, &proxy.token, &turn).0, 200);
+        let learned = 100.0 / weigh(&turn).0 as f64;
+        assert_eq!(count(&claude), (weigh(&claude).0 as f64 * learned).round() as u64);
+        let r2 = 100.0 / weigh(&turn).0 as f64;
+        post(&proxy, &proxy.token, &turn);
+        assert_eq!(count(&claude), (weigh(&claude).0 as f64 * (learned * 0.7 + r2 * 0.3)).round() as u64, "moving average");
+    }
+
+    #[test]
+    fn mcp_generates_and_saves_images() {
+        let (url, _) = fake_upstream(reply());
+        let dir = std::env::temp_dir().join(format!("ccat-mcp-{}", common::random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("in.png"), b"png").unwrap();
+        let proxy = serve_pool(Pool::fake(&url, &["image"]), Vec::new(), dir.clone()).unwrap();
+        let rpc = |body: Value| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let mut res = agent.post(format!("{}/mcp", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(body.to_string()).unwrap();
+            (res.status().as_u16(), res.body_mut().read_to_string().unwrap())
+        };
+        let (status, body) = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }));
+        assert_eq!(status, 200);
+        let init: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(rpc(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })), (202, String::new()));
+        let list: Value = serde_json::from_str(&rpc(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).1).unwrap();
+        assert_eq!(list["result"]["tools"][0]["name"], "generate_image");
+
+        let call = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                           "params": { "name": "generate_image", "arguments": { "prompt": "a cat", "path": "art/cat.png", "images": ["in.png"] } } });
+        let out: Value = serde_json::from_str(&rpc(call).1).unwrap();
+        let content = &out["result"]["content"];
+        assert!(out["result"].get("isError").is_none(), "{out}");
+        assert_eq!(content[1], json!({ "type": "image", "data": "/9j/AA==", "mimeType": "image/jpeg" }), "the final image, not the thought draft");
+        assert!(content[0]["text"].as_str().unwrap().contains("Here is your cat."));
+        assert_eq!(std::fs::read(dir.join("art/cat.jpg")).unwrap(), [0xff, 0xd8, 0xff, 0x00], "saved with the real format's extension");
+
+        let bad = json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "generate_image", "arguments": { "prompt": "x", "images": ["nope.png"] } } });
+        let out: Value = serde_json::from_str(&rpc(bad).1).unwrap();
+        assert_eq!(out["result"]["isError"], true);
+        let unknown: Value = serde_json::from_str(&rpc(json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" })).1).unwrap();
+        assert_eq!(unknown["error"]["code"], -32601);
+        assert_eq!(rpc(json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" })).0, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- ChatGPT: end to end against a fake Responses API
+
+    fn rsse(events: &[Value]) -> String {
+        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap_or("x"))).collect()
+    }
+
+    /// Answers every POST with `reply(bearer, body, how many came before)`; the requests it saw are the second value.
+    fn fake_responses(reply: impl Fn(&str, &Value, usize) -> (u16, String) + Send + 'static) -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                assert!(req.path.ends_with("/responses"));
+                let who = req.header("authorization").unwrap_or("").trim_start_matches("Bearer ").to_string();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let n = {
+                    let mut l = log.lock().unwrap();
+                    l.push((who.clone(), body.clone()));
+                    l.len() - 1
+                };
+                let (status, text) = reply(&who, &body, n);
+                let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        (url, seen)
+    }
+
+    fn completed(input: u64, cached: u64, output: u64) -> Value {
+        json!({ "type": "response.completed", "response": { "usage": { "input_tokens": input, "input_tokens_details": { "cached_tokens": cached }, "output_tokens": output } } })
+    }
+
+    /// A streamed text answer.
+    fn gpt_text(parts: &[&str]) -> String {
+        let mut ev = vec![json!({ "type": "response.created" }), json!({ "type": "response.output_item.added", "item": { "type": "message", "role": "assistant" } })];
+        ev.extend(parts.iter().map(|p| json!({ "type": "response.output_text.delta", "delta": p })));
+        ev.push(json!({ "type": "response.output_item.done", "item": { "type": "message" } }));
+        ev.push(completed(100, 40, 7));
+        rsse(&ev)
+    }
+
+    fn failed(code: &str) -> Value {
+        json!({ "type": "response.failed", "response": { "error": { "code": code, "message": format!("{code}!") } } })
+    }
+
+    fn gpt_proxy(base: &str, accounts: &[&str], models: Vec<chatgpt::ChatgptModel>) -> Proxy {
+        let routes = vec![route("opus", &["claude-opus-5-5"], Upstream::ChatGPT, "gpt-test")];
+        let gpt = chatgpt::Pool::fake(base, accounts);
+        *gpt.models.write().unwrap() = models;
+        let p = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), gpt, routes, PathBuf::new()).unwrap();
+        p.fail_on_limit.store(true, Ordering::Relaxed);
+        p
+    }
+
+    fn gpt_req(stream: bool) -> Value {
+        json!({ "model": "claude-opus-5-5", "max_tokens": 1000, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] })
+    }
+
+    fn post_h(proxy: &Proxy, headers: &[(&str, &str)], body: &Value) -> (u16, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut r = agent.post(format!("{}/v1/messages?beta=true", proxy.url)).header("authorization", format!("Bearer {}", proxy.token));
+        for (k, v) in headers {
+            r = r.header(*k, *v);
+        }
+        let mut res = r.send(body.to_string()).unwrap();
+        (res.status().as_u16(), res.body_mut().read_to_string().unwrap())
+    }
+
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect()
+    }
+
+    fn types(events: &[Value]) -> Vec<&str> {
+        events.iter().map(|e| e["type"].as_str().unwrap()).collect()
+    }
+
+    pub(crate) fn model(slug: &str, efforts: &[&str], default: &str) -> chatgpt::ChatgptModel {
+        chatgpt::ChatgptModel { slug: slug.into(), name: slug.into(), efforts: efforts.iter().map(|e| e.to_string()).collect(), default_effort: default.into() }
+    }
+
+    #[test]
+    fn chatgpt_text_answer_becomes_anthropic_sse() {
+        let (url, seen) = fake_responses(|_, _, _| (200, gpt_text(&["Hel", "lo"])));
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        assert_eq!(post(&proxy, "nope", &gpt_req(true)).0, 401, "ChatGPT spends the plan: it needs the token");
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200, "{body}");
+        let ev = sse_events(&body);
+        assert_eq!(types(&ev), ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+        assert_eq!(ev[0]["message"]["model"], "claude-opus-5-5");
+        assert_eq!((ev[2]["delta"]["text"].as_str(), ev[3]["delta"]["text"].as_str()), (Some("Hel"), Some("lo")));
+        assert_eq!(ev[5]["delta"]["stop_reason"], "end_turn");
+        assert_eq!(ev[5]["usage"], json!({ "input_tokens": 60, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 0, "output_tokens": 7 }));
+        assert_eq!(seen.lock().unwrap()[0].0, "good", "the account's access token went upstream");
+
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((msg["content"][0]["text"].as_str(), msg["stop_reason"].as_str()), (Some("Hello"), Some("end_turn")));
+        assert_eq!(msg["usage"]["cache_read_input_tokens"], 40);
+        let before = seen.lock().unwrap().len();
+        assert!(count_tokens_of(&proxy) > 0);
+        assert_eq!(seen.lock().unwrap().len(), before, "the count is a local estimate");
+    }
+
+    /// `count_tokens` for a ChatGPT tier: the local estimate, nothing sent upstream.
+    fn count_tokens_of(proxy: &Proxy) -> u64 {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut res = agent.post(format!("{}/v1/messages/count_tokens", proxy.url)).header("x-api-key", &proxy.token).send(gpt_req(false).to_string()).unwrap();
+        serde_json::from_str::<Value>(&res.body_mut().read_to_string().unwrap()).unwrap()["input_tokens"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn chatgpt_function_calls_round_trip() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["input"].as_array().unwrap().iter().any(|i| i["type"] == "function_call_output") {
+                return (200, gpt_text(&["done"]));
+            }
+            let call = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": "" });
+            let done = json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}" });
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": call }),
+                json!({ "type": "response.function_call_arguments.delta", "delta": "{\"p\":" }),
+                json!({ "type": "response.function_call_arguments.delta", "delta": "\"a\"}" }),
+                json!({ "type": "response.output_item.done", "item": done }),
+                completed(10, 0, 3),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let mut req = gpt_req(true);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object", "properties": { "p": { "type": "string" } } } }]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let ev = sse_events(&body);
+        assert_eq!(types(&ev), ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+        assert_eq!(ev[1]["content_block"], json!({ "type": "tool_use", "id": "call_1", "name": "Read", "input": {} }));
+        assert_eq!((ev[2]["delta"]["partial_json"].as_str(), ev[3]["delta"]["partial_json"].as_str()), (Some("{\"p\":"), Some("\"a\"}")));
+        assert_eq!(ev[5]["delta"]["stop_reason"], "tool_use");
+
+        // The next turn replays the call and its result under the same call id.
+        req["messages"] = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [{ "type": "text", "text": "reading" }, { "type": "tool_use", "id": "call_1", "name": "Read", "input": { "p": "a" } }] },
+            { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": [{ "type": "text", "text": "contents" }] }] }
+        ]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let input = &seen.lock().unwrap()[1].1["input"];
+        assert_eq!(input[0], json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }));
+        assert_eq!(input[1], json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "reading" }] }));
+        assert_eq!(input[2], json!({ "type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{\"p\":\"a\"}" }));
+        assert_eq!(input[3], json!({ "type": "function_call_output", "call_id": "call_1", "output": "contents" }));
+    }
+
+    #[test]
+    fn chatgpt_reasoning_is_signed_and_replayed() {
+        let (url, seen) = fake_responses(|_, _, _| {
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": { "type": "reasoning", "id": "rs_1" } }),
+                json!({ "type": "response.reasoning_summary_part.added", "summary_index": 0 }),
+                json!({ "type": "response.reasoning_summary_text.delta", "delta": "think" }),
+                json!({ "type": "response.output_item.done", "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": [] } }),
+                json!({ "type": "response.output_item.added", "item": { "type": "message" } }),
+                json!({ "type": "response.output_text.delta", "delta": "Hello" }),
+                json!({ "type": "response.output_item.done", "item": { "type": "message" } }),
+                completed(10, 0, 3),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let (_, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        let ev = sse_events(&body);
+        assert_eq!(
+            types(&ev),
+            ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(ev[1]["content_block"]["type"], "thinking");
+        assert_eq!(ev[2]["delta"], json!({ "type": "thinking_delta", "thinking": "think" }));
+        let sig = ev[3]["delta"]["signature"].as_str().unwrap().to_string();
+        let held: Value = serde_json::from_slice(&B64.decode(sig.strip_prefix("oa:").unwrap()).unwrap()).unwrap();
+        assert_eq!(held, json!({ "id": "rs_1", "encrypted_content": "ENC" }));
+
+        let mut req = gpt_req(true);
+        req["messages"] = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": [{ "type": "thinking", "thinking": "think", "signature": sig }, { "type": "thinking", "thinking": "g", "signature": "ag:gemini:U0lH" }, { "type": "text", "text": "Hello" }] },
+            { "role": "user", "content": "more" }
+        ]);
+        post(&proxy, &proxy.token, &req);
+        let input = seen.lock().unwrap()[1].1["input"].clone();
+        let kinds: Vec<&str> = input.as_array().unwrap().iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["message", "reasoning", "message", "message"], "another provider's thinking is dropped");
+        assert_eq!(input[1], json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": [] }));
+    }
+
+    #[test]
+    fn chatgpt_usage_limit_rotates_to_the_next_account() {
+        let (url, seen) = fake_responses(|who, _, _| match who {
+            "limit" => (200, rsse(&[json!({ "type": "response.created" }), failed("subscription_sharing_usage_limit_exceeded")])),
+            _ => (200, gpt_text(&["fine"])),
+        });
+        let proxy = gpt_proxy(&url, &["limit", "good"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("fine") && body.contains("message_stop") && !body.contains("event: error"), "{body}");
+        let who = |s: &Arc<Mutex<Vec<(String, Value)>>>| s.lock().unwrap().iter().map(|(w, _)| w.clone()).collect::<Vec<_>>();
+        assert_eq!(who(&seen), ["limit", "good"]);
+        // The block is remembered: the next request goes straight to the second account.
+        post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(who(&seen), ["limit", "good", "good"]);
+
+        // Everything over its usage: a 429 with a Retry-After (the tier's fallback would take over).
+        let proxy = gpt_proxy(&url, &["limit"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("rate_limit_error") && body.contains("over their plan usage"), "{body}");
+    }
+
+    #[test]
+    fn chatgpt_failure_after_output_is_an_error_event() {
+        let (url, seen) = fake_responses(|_, _, _| {
+            let ev = [
+                json!({ "type": "response.output_item.added", "item": { "type": "message" } }),
+                json!({ "type": "response.output_text.delta", "delta": "Hi" }),
+                failed("subscription_sharing_usage_limit_exceeded"),
+            ];
+            (200, rsse(&ev))
+        });
+        let proxy = gpt_proxy(&url, &["a", "b"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(true));
+        assert_eq!(status, 200);
+        assert!(body.contains("Hi") && body.contains("event: error") && body.contains("rate_limit_error"), "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "text had started: no second account");
+    }
+
+    #[test]
+    fn billing_line_is_stripped_for_endpoints_only() {
+        let sent = |body: &Value, endpoint: bool| upstream_body(body, body.to_string().as_bytes(), "m", endpoint);
+        let billing = "x-anthropic-billing-header: cc_version=2; cch=abc;";
+        // Its own block: the whole block goes, the others stay byte-equal and in order.
+        let body = json!({ "model": "m", "system": [{ "type": "text", "text": billing }, { "type": "text", "text": "You are Claude Code.", "cache_control": { "type": "ephemeral" } }, { "type": "text", "text": "More" }], "messages": [] });
+        let got: Value = serde_json::from_slice(&sent(&body, true)).unwrap();
+        assert_eq!(got["system"], json!([body["system"][1], body["system"][2]]));
+        assert_eq!(got["messages"], json!([]));
+        // Official keeps the very same bytes.
+        assert_eq!(sent(&body, false), body.to_string().as_bytes());
+        // Sharing a block with real text: only the line goes.
+        let mixed = json!({ "model": "m", "system": [{ "type": "text", "text": format!("{billing}\nSecond line"), "cache_control": { "type": "ephemeral" } }] });
+        let got: Value = serde_json::from_slice(&sent(&mixed, true)).unwrap();
+        assert_eq!(got["system"], json!([{ "type": "text", "text": "Second line", "cache_control": { "type": "ephemeral" } }]));
+        // A string system; one holding only the line leaves no `system` at all.
+        let got: Value = serde_json::from_slice(&sent(&json!({ "model": "m", "system": format!("Intro\n{billing}\nEnd") }), true)).unwrap();
+        assert_eq!(got["system"], "Intro\nEnd");
+        let got: Value = serde_json::from_slice(&sent(&json!({ "model": "m", "system": billing, "max_tokens": 1 }), true)).unwrap();
+        assert!(got.get("system").is_none() && got["max_tokens"] == 1);
+        // Nothing to strip: Claude Code's own bytes.
+        let raw = br#"{"model": "m",  "system":[{"type":"text","text":"Agent SDK identity stays"}]}"#;
+        assert_eq!(upstream_body(&serde_json::from_slice(raw).unwrap(), raw, "m", true), raw);
+    }
+
+    #[test]
+    fn oa_thinking_never_reaches_anthropic_or_endpoints() {
+        let body = json!({ "model": "x", "messages": [{ "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "a", "signature": "oa:eyJ9" }, { "type": "thinking", "thinking": "b", "signature": "ag:claude:QUJD" },
+            { "type": "thinking", "thinking": "c", "signature": "EqQBCkg" }, { "type": "text", "text": "t" }] }] });
+        let sent: Value = serde_json::from_slice(&upstream_body(&body, body.to_string().as_bytes(), "claude-x", true)).unwrap();
+        let kept: Vec<&str> = sent["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
+        assert_eq!(kept, ["c", "t"]);
+        assert_eq!(untag(Some("oa:eyJ9"), "gpt"), None, "an Antigravity family never takes a ChatGPT signature");
+        assert_eq!(untag(Some("oa:QUJD"), "claude"), None);
+    }
+
+    #[test]
+    fn chatgpt_request_is_built_from_scratch() {
+        let (url, seen) = fake_responses(|_, _, _| (200, gpt_text(&["ok"])));
+        let proxy = gpt_proxy(&url, &["good"], vec![model("gpt-test", &["low", "medium", "high"], "medium")]);
+        let req = json!({
+            "model": "claude-opus-5-5", "max_tokens": 1000, "stream": false, "temperature": 0.2, "top_p": 0.9, "top_k": 5, "stop_sequences": ["x"],
+            "metadata": { "user_id": "u" }, "user": "u", "truncation": "auto", "service_tier": "auto", "background": true,
+            "thinking": { "type": "enabled", "budget_tokens": 2000 },
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=2;" }, { "type": "text", "text": "Be brief." }],
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } }] },
+                { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Shot", "input": {} }] },
+                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "REVG" } }] }] }],
+            "tools": [{ "name": "Shot", "description": "d", "input_schema": { "$schema": "x", "type": "object", "properties": {} } }, { "type": "web_search_20250305", "name": "web_search" }, { "type": "bash_20250124", "name": "bash" }],
+            "tool_choice": { "type": "any" }
+        });
+        let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-9")], &req);
+        assert_eq!(status, 200, "{body}");
+        let sent = seen.lock().unwrap()[0].1.clone();
+        let keys: Vec<&str> = sent.as_object().unwrap().keys().map(String::as_str).collect();
+        for banned in ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id", "max_tokens", "top_k", "stop_sequences", "thinking", "system", "messages", "service_tier"] {
+            assert!(!keys.contains(&banned), "{banned} leaked: {keys:?}");
+        }
+        assert_eq!((&sent["store"], &sent["stream"], &sent["model"]), (&json!(false), &json!(true), &json!("gpt-test")), "never stored, always streamed, the tier's model");
+        assert_eq!(sent["instructions"], "Be brief.", "billing header filtered");
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["reasoning"], json!({ "effort": "low", "summary": "auto" }), "a 2000-token budget");
+        assert_eq!(sent["tool_choice"], "required");
+        assert_eq!(sent["tools"], json!([{ "type": "function", "name": "Shot", "description": "d", "parameters": { "type": "object", "properties": {} }, "strict": false }, { "type": "web_search" }]));
+        assert_eq!(sent["input"][0]["content"][1], json!({ "type": "input_image", "image_url": "data:image/png;base64,QUJD" }));
+        assert_eq!(sent["input"][2], json!({ "type": "function_call_output", "call_id": "t1", "output": "(see attached image)" }));
+        assert_eq!(sent["input"][3], json!({ "type": "message", "role": "user", "content": [{ "type": "input_image", "image_url": "data:image/png;base64,REVG" }] }), "tool-result images ride in a user message");
+        assert_eq!(sent["prompt_cache_key"], "sess-9");
+        assert!(sent["input"].as_array().unwrap().iter().all(|i| i["role"] != "system"));
+    }
+
+    #[test]
+    fn chatgpt_tools_are_namespaced_after_one_refusal() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["tools"][0]["type"] == "function" {
+                let e = json!({ "error": { "code": "subscription_sharing_unsupported_capability", "message": "tools not supported", "param": "tools" } });
+                return (400, e.to_string());
+            }
+            let item = json!({ "type": "function_call", "id": "fc", "call_id": "c1", "name": "claude_code.Read", "arguments": "{}" });
+            (200, rsse(&[json!({ "type": "response.output_item.added", "item": item }), json!({ "type": "response.output_item.done", "item": item }), completed(1, 0, 1)]))
+        });
+        let proxy = gpt_proxy(&url, &["good"], Vec::new());
+        let mut req = gpt_req(false);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object" } }]);
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["content"][0]["name"], "Read", "the namespace prefix is stripped");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "one retry");
+            assert_eq!(seen[1].1["tools"], json!([{ "type": "namespace", "name": "claude_code", "description": "Claude Code tools", "tools": seen[0].1["tools"] }]));
+        }
+        // Remembered: the next request is wrapped at once.
+        post(&proxy, &proxy.token, &req);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].1["tools"][0]["type"], "namespace");
+
+        // What the official route refused is not the Codex route's business.
+        let pool = chatgpt::Pool::new(Vec::new(), Vec::new());
+        pool.wrap.store(true, Ordering::Relaxed);
+        pool.no_cache_key.store(true, Ordering::Relaxed);
+        let hints = Hints { session: "s".into() };
+        let official = responses_body(&req, "m", None, &hints, &pool, false);
+        let codex = responses_body(&req, "m", None, &hints, &pool, true);
+        assert_eq!((official["tools"][0]["type"].as_str(), official.get("prompt_cache_key").is_none()), (Some("namespace"), true));
+        assert_eq!((codex["tools"][0]["type"].as_str(), codex["prompt_cache_key"].as_str()), (Some("function"), Some("s")));
+    }
+
+    #[test]
+    fn prompt_cache_key_is_sent_and_dropped_when_refused_and_service_tier_never() {
+        let (url, seen) = fake_responses(|_, body, _| {
+            if body["prompt_cache_key"] == "refused" {
+                let e = json!({ "error": { "code": "subscription_sharing_unsupported_capability", "message": "no", "param": "prompt_cache_key" } });
+                return (400, e.to_string());
+            }
+            (200, gpt_text(&["ok"]))
+        });
+        let proxy = gpt_proxy(&url, &["good"], vec![model("gpt-test", &["low"], "low")]);
+        let mut req = gpt_req(false);
+        req["speed"] = json!("fast"); // Claude Code's fast mode: ignored on purpose
+        post_h(&proxy, &[("x-claude-code-session-id", "s1"), ("anthropic-beta", "fast-mode-2026-02-01")], &req);
+        post_h(&proxy, &[], &req);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].1["prompt_cache_key"], "s1", "the session id keys the cache");
+            assert!(seen[1].1["prompt_cache_key"].as_str().unwrap().starts_with("ccat-"), "no session header: a hash of the system prompt");
+            assert!(seen.iter().all(|(_, b)| b.get("service_tier").is_none()), "fast mode is off: no service_tier, ever");
+        }
+        // Refused once: dropped for the rest of the process, and the request still succeeds.
+        let (status, _) = post_h(&proxy, &[("x-claude-code-session-id", "refused")], &req);
+        assert_eq!(status, 200);
+        let n = seen.lock().unwrap().len();
+        post_h(&proxy, &[("x-claude-code-session-id", "refused")], &req);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), n + 1, "no second refusal");
+        assert!(seen[n - 2].1.get("prompt_cache_key").is_some(), "the refused try had it");
+        assert!(seen[n - 1].1.get("prompt_cache_key").is_none() && seen[n].1.get("prompt_cache_key").is_none());
+    }
+
+    /// The Codex route against a fake backend: its own path, headers, and body shaping.
+    #[test]
+    fn codex_route_shapes_url_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<(String, Vec<(String, String)>, Value)>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push((req.path.clone(), req.headers.clone(), body));
+                let text = gpt_text(&["codex says hi"]);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        let proxy = gpt_proxy(&url, &["cx1"], Vec::new());
+        let mut req = gpt_req(false);
+        req["tools"] = json!([{ "name": "Read", "description": "d", "input_schema": { "type": "object" } }]);
+        let (status, body) = post_h(&proxy, &[("x-claude-code-session-id", "sess-7")], &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("codex says hi"));
+        let seen = seen.lock().unwrap();
+        let (path, headers, sent) = &seen[0];
+        assert_eq!(path, "/codex/responses");
+        let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(h("authorization"), Some("Bearer cx1"));
+        assert_eq!(h("chatgpt-account-id"), Some("acct-cx1"), "the workspace id from the token");
+        assert_eq!((h("originator"), h("openai-beta")), (Some("ccat"), Some("responses=experimental")));
+        assert_eq!((h("session_id"), h("conversation_id"), h("x-client-request-id")), (Some("sess-7"), Some("sess-7"), Some("sess-7")));
+        assert_eq!(h("x-codex-routing-hint"), Some("model=gpt-test"));
+        assert!(h("version").is_some() && h("user-agent").is_some_and(|u| u.starts_with("ccat/")));
+        assert_eq!((&sent["store"], &sent["stream"], &sent["prompt_cache_key"], &sent["parallel_tool_calls"]), (&json!(false), &json!(true), &json!("sess-7"), &json!(true)));
+        assert!(sent.get("service_tier").is_none() && sent.get("max_output_tokens").is_none() && sent.get("temperature").is_none());
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["reasoning"]["summary"], "auto");
+        assert_eq!(sent["tools"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn codex_usage_limits_use_the_reset_time_they_carry() {
+        let reset = now_secs() + 7200;
+        let (url, _) = fake_responses(move |who, _, _| match who {
+            "cxlimit" => (429, json!({ "error": { "type": "usage_limit_reached", "message": "limit", "resets_at": reset } }).to_string()),
+            _ => (200, gpt_text(&["fine"])),
+        });
+        let proxy = gpt_proxy(&url, &["cxlimit", "cxgood"], Vec::new());
+        let (status, body) = post(&proxy, &proxy.token, &gpt_req(false));
+        assert_eq!(status, 200, "{body}");
+        let proxy = gpt_proxy(&url, &["cxlimit"], Vec::new());
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let res = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(gpt_req(false).to_string()).unwrap();
+        assert_eq!(res.status().as_u16(), 429);
+        let wait: u64 = res.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((6000..=7200).contains(&wait), "blocked until the reset OpenAI named, not a guess: {wait}");
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Live check against Google with the first Antigravity account in the ccat config: the proxy's `count_tokens`
+    /// vs the `promptTokenCount` Google bills for the same request, implicit caching on a repeat, and the calibrated
+    /// Claude-route estimate. Spends a few requests of quota. `cargo test -- --ignored live_ --nocapture`.
+    #[test]
+    #[ignore = "uses your real Antigravity account from the ccat config"]
+    fn live_counts_and_caching_match_google() {
+        let cfg = crate::tests::live_config();
+        let p = cfg.providers.iter().find(|p| p.antigravity && !p.accounts.is_empty()).expect("an Antigravity provider with an account in the ccat config");
+        let proxy = start(p.accounts.clone(), Vec::new(), Vec::new(), Vec::new(), std::env::temp_dir()).unwrap();
+        // Big enough (~5k tokens) for Gemini's implicit cache, which skips short prompts.
+        let manual: String = (0..400).map(|i| format!("Rule {i}: keep functions short, name things for what they do, test the edge cases.\n")).collect();
+        let req = |model: &str| json!({
+            "model": model, "max_tokens": 1024, "stream": false,
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cch=live;" }, { "type": "text", "text": manual }],
+            "tools": [{ "name": "Read", "description": "Read a file from disk", "input_schema": { "type": "object",
+                        "properties": { "file_path": { "type": "string", "description": "Absolute path" }, "limit": { "type": ["integer", "null"] } }, "required": ["file_path"] } }],
+            "messages": [{ "role": "user", "content": "Reply with the single word: ok" }]
+        });
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let call = |path: &str, body: &Value| {
+            let mut res = agent.post(format!("{}{path}", proxy.url)).header("x-api-key", &proxy.token).send(body.to_string()).unwrap();
+            let status = res.status().as_u16();
+            let text = res.body_mut().read_to_string().unwrap();
+            assert_eq!(status, 200, "{path}: {text}");
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+        let billed = |m: &Value| ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter().map(|k| m["usage"][k].as_u64().unwrap_or(0)).sum::<u64>();
+        let near = |a: u64, b: u64, pct: f64| (a as f64 - b as f64).abs() <= b as f64 * pct;
+
+        let gemini = SEARCH_MODEL; // a live Gemini model ccat relies on anyway
+        let counted = call("/v1/messages/count_tokens", &req(gemini))["input_tokens"].as_u64().unwrap();
+        println!("gemini: count_tokens {counted}");
+        // The first live run failed here with max_tokens 64 ("stream ended without a finish reason"): report what a tiny
+        // budget gets back, without failing on it, so the cause shows up in the output.
+        let mut tiny = req(gemini);
+        tiny["max_tokens"] = json!(64);
+        let mut res = agent.post(format!("{}/v1/messages", proxy.url)).header("x-api-key", &proxy.token).send(tiny.to_string()).unwrap();
+        println!("gemini max_tokens 64: {} {}", res.status().as_u16(), res.body_mut().read_to_string().unwrap().chars().take(600).collect::<String>());
+        let first = call("/v1/messages", &req(gemini));
+        let real = billed(&first);
+        println!("gemini: count_tokens {counted} vs Google prompt {real}");
+        assert!(near(counted, real, 0.05), "Gemini count {counted} should be within 5% of Google's {real}");
+
+        let mut cached = 0;
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_secs(3));
+            let again = call("/v1/messages", &req(gemini));
+            cached = again["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            println!("gemini repeat: input {} cache_read {cached}", again["usage"]["input_tokens"]);
+            if cached > 0 {
+                break;
+            }
+        }
+        assert!(cached > 0, "an identical repeat should hit Google's implicit cache");
+
+        let claude = "claude-sonnet-4-6";
+        let before = call("/v1/messages/count_tokens", &req(claude))["input_tokens"].as_u64().unwrap();
+        let real = billed(&call("/v1/messages", &req(claude)));
+        let after = call("/v1/messages/count_tokens", &req(claude))["input_tokens"].as_u64().unwrap();
+        println!("claude: estimate before {before}, after learning {after}, real {real}");
+        assert!(near(after, real, 0.02), "after one answer the Claude estimate {after} should match the real {real}");
+    }
+
+    /// The real `claude` CLI against this proxy over a scripted fake Cloud Code: proves Claude Code itself accepts the
+    /// web-search blocks and the MCP server. No Google account, no network. `cargo test -- --ignored claude_code`.
+    #[test]
+    #[ignore = "needs the claude CLI on PATH"]
+    fn claude_code_end_to_end() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let body: Value = serde_json::from_slice(&read_request(&s).unwrap().body).unwrap();
+                let r = &body["request"];
+                let decls: Vec<&str> = r["tools"][0]["functionDeclarations"].as_array().into_iter().flatten().filter_map(|d| d["name"].as_str()).collect();
+                let last = r["contents"].as_array().and_then(|c| c.last()).cloned().unwrap_or_default();
+                let first = r["contents"][0]["parts"].to_string();
+                let parts = if body["model"] == crate::providers::antigravity::mcp::IMAGE_MODEL {
+                    log.lock().unwrap().push("image".into());
+                    json!([{ "text": "a cat" }, { "inlineData": { "mimeType": "image/png", "data": PNG } }])
+                } else if r["tools"][0].get("googleSearch").is_some() {
+                    log.lock().unwrap().push(format!("search via {}", body["model"]));
+                    json!([{ "text": "Rust 1.99 is the latest stable release." }])
+                } else if let Some(fr) = last["parts"][0].get("functionResponse") {
+                    // Echo the tool result so the test can read what Claude Code made of it.
+                    json!([{ "text": format!("FINAL {}", fr["response"]) }])
+                } else if first.contains("SEARCHTEST") && decls.contains(&"WebSearch") {
+                    json!([{ "functionCall": { "name": "WebSearch", "args": { "query": "latest rust version" } } }])
+                } else if first.contains("IMAGETEST") && decls.contains(&"mcp__antigravity__generate_image") {
+                    json!([{ "functionCall": { "name": "mcp__antigravity__generate_image", "args": { "prompt": "a cat", "path": "out/cat.png" } } }])
+                } else {
+                    log.lock().unwrap().push(format!("plain; tools: {}", decls.join(",")));
+                    json!([{ "text": "ok" }])
+                };
+                let mut cand = json!({ "content": { "role": "model", "parts": parts }, "finishReason": "STOP" });
+                if r["tools"][0].get("googleSearch").is_some() {
+                    cand["groundingMetadata"] = json!({ "webSearchQueries": ["latest rust version"],
+                        "groundingChunks": [{ "web": { "uri": "https://blog.rust-lang.org/2026/rust-1.99", "title": "blog.rust-lang.org" } }] });
+                }
+                let text = sse(&[json!({ "response": { "candidates": [cand], "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 } } })]);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("ccat-e2e-{}", common::random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // As ccat launches it: a Claude name for the main model, everything else falling back to it.
+        let aliases = ag("claude-sonnet-4-6", "gemini-3.1-pro-low");
+        let proxy = serve_pool(Pool::fake(&upstream, &["acct"]), aliases, dir.clone()).unwrap();
+        let cfg = dir.join("mcp.json");
+        let servers = json!({ "mcpServers": { "antigravity": { "type": "http", "url": format!("{}/mcp", proxy.url), "headers": { "Authorization": format!("Bearer {}", proxy.token) } } } });
+        std::fs::write(&cfg, servers.to_string()).unwrap();
+        let run = |prompt: &str| {
+            let cmd = |program: &str| {
+                let mut c = std::process::Command::new(program);
+                // A parent Claude Code session (e.g. the one running this test) passes host auth down; drop it all.
+                for (k, _) in std::env::vars_os() {
+                    let k = k.to_string_lossy().to_ascii_uppercase();
+                    if k.starts_with("CLAUDE") || k.starts_with("ANTHROPIC") {
+                        c.env_remove(&k);
+                    }
+                }
+                c.current_dir(&dir)
+                    // Not --bare (that mode ships a minimal toolset without WebSearch); no user settings, so no user hooks.
+                    .args(["-p", prompt, "--no-session-persistence", "--model", "claude-sonnet-4-6", "--strict-mcp-config", "--setting-sources", "project"])
+                    .args(["--allowedTools", "WebSearch", "mcp__antigravity__generate_image", "--mcp-config"])
+                    .arg(&cfg)
+                    .env("ANTHROPIC_BASE_URL", &proxy.url)
+                    .env("ANTHROPIC_AUTH_TOKEN", &proxy.token)
+                    .env_remove("ANTHROPIC_API_KEY");
+                c
+            };
+            let out = cmd("claude").output().or_else(|_| cmd("claude.cmd").output()).expect("claude on PATH");
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+        };
+
+        let out = run("SEARCHTEST");
+        let log = seen.lock().unwrap().clone();
+        assert!(out.contains("blog.rust-lang.org/2026/rust-1.99"), "WebSearch result should carry the cited link.\n{out}\n{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("search via")), "{log:?}");
+
+        let out = run("IMAGETEST");
+        assert!(out.contains("Saved"), "MCP tool result should reach the model.\n{out}\n{:?}", seen.lock().unwrap());
+        assert!(dir.join("out/cat.png").exists(), "image saved in the launch folder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ollama_proxy_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push(body);
+                let text = "\
+HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"Hello from Ollama\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":20,\"eval_count\":5}\n";
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+
+        let routes = vec![Route {
+            tier: "sonnet",
+            names: vec!["claude-sonnet-5-5".into()],
+            upstream: Upstream::Ollama { url: url.clone(), key: String::new() },
+            model: "qwen2.5-coder:32b".into(),
+            fallbacks: Vec::new(),
+        }];
+        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
+        let req = json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Hello from Ollama"));
+        assert!(body.contains("message_stop"));
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent["model"], "qwen2.5-coder:32b");
+        assert_eq!(sent["options"]["num_ctx"], 65536, "Ollama num_ctx configured");
+        assert_eq!(sent["keep_alive"], "30m");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn ollama_retries_without_think_for_a_model_that_cannot_think_and_remembers_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let thinks = body.get("think").is_some();
+                log.lock().unwrap().push(body);
+                let text = if thinks {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"\\\"nothink-model:1b\\\" does not support thinking\"}".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"Plain answer\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":2,\"eval_count\":2}\n".to_string()
+                };
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+        let routes = vec![route("sonnet", &["claude-sonnet-5-5"], Upstream::Ollama { url, key: String::new() }, "nothink-model:1b")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let req = json!({ "model": "claude-sonnet-5-5", "max_tokens": 9, "stream": true, "thinking": { "type": "enabled", "budget_tokens": 5000 },
+                          "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status == 200 && body.contains("Plain answer"), "{status} {body}");
+        let thinks = || seen.lock().unwrap().iter().map(|b| b.get("think").is_some()).collect::<Vec<_>>();
+        assert_eq!(thinks(), [true, false], "rejected with think, retried once without it");
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status == 200 && body.contains("Plain answer"), "{status} {body}");
+        assert_eq!(thinks(), [true, false, false], "remembered: the next request never sends think");
+    }
+
+    #[test]
+    #[ignore = "uses the real Claude CLI and signed-in Muse account"]
+    fn live_claude_code_muse_greeting_and_tool_search() {
+        let dir = std::env::temp_dir().join(format!("ccat-muse-cli-{}", common::random_hex(8)));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}"#).unwrap();
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &[]), vec![route("haiku", &["claude-haiku-5-5"], Upstream::MuseAI { url: crate::museai::DEFAULT_URL.into(), key: String::new() }, "muse-chat")], dir.clone()).unwrap();
+        let mut settings = crate::claude_settings(&serde_json::Map::new(), &[("ANTHROPIC_BASE_URL", proxy.url.clone())]);
+        settings["env"]["ENABLE_TOOL_SEARCH"] = json!("true");
+        let mut cmd = std::process::Command::new("claude");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            if name.starts_with("CLAUDE") || name.starts_with("ANTHROPIC") { cmd.env_remove(key); }
+        }
+        let out = cmd.current_dir(&dir)
+            .args(["-p", "Call the client tool ToolSearch with arguments {\"query\":\"select:WebSearch\",\"max_results\":1}. For this first step reply ONLY with the JSON tool_calls object. After the client returns the actual tool result, reply with exactly CCAT_TOOL_SEARCH_OK. Do not perform a web search.", "--model", "claude-haiku-5-5", "--output-format", "json", "--no-session-persistence", "--setting-sources", "project", "--settings"])
+            .arg(settings.to_string()).args(["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"])
+            .env("ANTHROPIC_BASE_URL", &proxy.url).env("ANTHROPIC_CUSTOM_HEADERS", format!("x-ccat-token: {}", proxy.token))
+            .env("API_TIMEOUT_MS", "60000").output().expect("claude on PATH");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result: Value = serde_json::from_str(stdout.lines().rfind(|line| line.starts_with('{')).unwrap_or("{}")).unwrap();
+        assert!(out.status.success() && result["is_error"] == false, "Claude CLI failed: {stdout} {}", String::from_utf8_lossy(&out.stderr));
+        assert!(result["result"].as_str().unwrap_or("").contains("CCAT_TOOL_SEARCH_OK"), "Claude CLI must receive Muse's answer: {stdout}");
+        assert!(result["num_turns"].as_u64().unwrap_or(0) >= 2, "ToolSearch must complete a client-tool follow-up: {stdout}");
+    }
+
+    #[test]
+    fn muse_proxy_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                log.lock().unwrap().push(body);
+                let text = "\
+HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello from MuseAI\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":6}}\n\
+data: [DONE]\n\n";
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+
+        let routes = vec![Route {
+            tier: "sonnet",
+            names: vec!["claude-sonnet-5-5".into()],
+            upstream: Upstream::MuseAI { url: url.clone(), key: String::new() },
+            model: "muse-chat".into(),
+            fallbacks: Vec::new(),
+        }];
+        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
+        let req = json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{ "role": "user", "content": "hello muse" }],
+            "stream": true
+        });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Hello from MuseAI"));
+        assert!(body.contains("message_stop"));
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent["model"], "muse-chat");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"], "hello muse");
+    }
+}

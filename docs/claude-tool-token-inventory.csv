@@ -1,0 +1,246 @@
+﻿tool,group,characters,rough_tokens_chars_div_4,description_characters,schema_characters,used_in_pasted_exchange
+Artifact,Claude built-ins,37406,9352,21621,15620,no
+ArtifactData,Claude built-ins,12241,3061,4168,7969,no
+DesignSync,Claude built-ins,9340,2335,4132,5124,no
+mcp__claude_ai_Google_Calendar__create_event,mcp__claude_ai_Google_Calendar__,9088,2272,39,8961,no
+mcp__claude_ai_Gmail__search_threads,mcp__claude_ai_Gmail__,8837,2210,2375,6367,no
+PowerShell,Claude built-ins,8629,2158,7754,712,no
+Monitor,Claude built-ins,7796,1949,6581,1042,no
+ArtifactComments,Claude built-ins,7438,1860,5141,2203,no
+mcp__claude_ai_Google_Calendar__update_event,mcp__claude_ai_Google_Calendar__,7284,1821,39,7157,no
+PublishPlugin,Claude built-ins,6970,1743,2296,4607,no
+mcp__claude_ai_Atlassian__createConfluenceInlineComment,mcp__claude_ai_Atlassian__,6064,1516,472,5493,no
+mcp__claude-in-chrome__computer,mcp__claude-in-chrome__,6029,1508,678,5273,no
+SendMessage,Claude built-ins,5677,1420,4259,1291,no
+mcp__claude_ai_Gmail__list_drafts,mcp__claude_ai_Gmail__,5611,1403,182,5349,no
+Workflow,Claude built-ins,5355,1339,3480,1775,no
+mcp__claude_ai_Gmail__send_message,mcp__claude_ai_Gmail__,5342,1336,853,4406,no
+mcp__claude_ai_Gmail__create_label,mcp__claude_ai_Gmail__,5115,1279,243,4791,no
+mcp__claude_ai_Gmail__reply,mcp__claude_ai_Gmail__,4989,1248,916,3997,no
+mcp__claude_ai_Figma__get_design_context,mcp__claude_ai_Figma__,4898,1225,1588,3220,no
+AskUserQuestion,Claude built-ins,4897,1225,1786,3023,no
+mcp__claude_ai_Gmail__update_draft,mcp__claude_ai_Gmail__,4859,1215,795,3983,no
+mcp__claude_ai_Atlassian__createConfluenceFooterComment,mcp__claude_ai_Atlassian__,4767,1192,46,4622,no
+Agent,Claude built-ins,4725,1182,3049,1600,no
+mcp__claude_ai_Gmail__update_label,mcp__claude_ai_Gmail__,4665,1167,95,4491,no
+ScheduleWakeup,Claude built-ins,4631,1158,3148,1392,no
+mcp__claude_ai_Gmail__create_draft,mcp__claude_ai_Gmail__,4610,1153,750,3777,no
+mcp__claude_ai_Gmail__forward,mcp__claude_ai_Gmail__,4454,1114,593,3785,no
+mcp__claude_ai_Figma__get_screenshot,mcp__claude_ai_Figma__,4352,1088,1964,2308,no
+mcp__claude_ai_Figma__export_video,mcp__claude_ai_Figma__,4327,1082,1168,3073,no
+EnterPlanMode,Claude built-ins,4298,1075,3997,119,no
+mcp__claude_ai_Figma__send_code_to_figma,mcp__claude_ai_Figma__,4131,1033,1562,2475,no
+EnterWorktree,Claude built-ins,4013,1004,3220,687,no
+mcp__claude_ai_Figma__upload_assets,mcp__claude_ai_Figma__,3849,963,1070,2698,no
+CronCreate,Claude built-ins,3815,954,2794,878,no
+mcp__claude_ai_Figma__send_code_connect_mappings,mcp__claude_ai_Figma__,3754,939,568,3092,no
+mcp__claude_ai_Figma__generate_diagram,mcp__claude_ai_Figma__,3731,933,743,2906,no
+RemoteTrigger,Claude built-ins,3698,925,2834,795,no
+mcp__claude_ai_Figma__use_figma,mcp__claude_ai_Figma__,3692,923,2013,1571,no
+Bash,Claude built-ins,3645,912,1993,1589,no
+mcp__claude_ai_Google_Calendar__list_events,mcp__claude_ai_Google_Calendar__,3547,887,260,3200,no
+mcp__claude_ai_Atlassian__getTeamworkGraphContext,mcp__claude_ai_Atlassian__,3534,884,950,2467,no
+mcp__claude_ai_Figma__download_assets,mcp__claude_ai_Figma__,3490,873,1622,1775,no
+mcp__claude_ai_Figma__search_design_system,mcp__claude_ai_Figma__,3308,827,811,2379,no
+mcp__claude_ai_Figma__weave_run_tool,mcp__claude_ai_Figma__,3275,819,1433,1760,no
+Grep,Claude built-ins,3224,806,477,2672,no
+mcp__claude_ai_Gmail__get_message,mcp__claude_ai_Gmail__,3083,771,1498,1494,no
+mcp__claude_ai_Gmail__get_thread,mcp__claude_ai_Gmail__,3081,771,761,2239,no
+mcp__claude_ai_Figma__html_to_figma,mcp__claude_ai_Figma__,3069,768,1351,1631,no
+mcp__claude_ai_Figma__add_code_connect_map,mcp__claude_ai_Figma__,2956,739,517,2353,no
+mcp__context7__resolve-library-id,mcp__context7__,2911,728,2006,796,no
+mcp__claude_ai_Figma__get_metadata,mcp__claude_ai_Figma__,2892,723,1547,1265,no
+mcp__claude_ai_Figma__generate_image,mcp__claude_ai_Figma__,2786,697,779,1927,no
+mcp__claude_ai_Atlassian__updateConfluencePage,mcp__claude_ai_Atlassian__,2736,684,286,2354,no
+mcp__claude_ai_Figma__get_motion_context,mcp__claude_ai_Figma__,2712,678,615,2013,no
+mcp__claude_ai_Figma__create_new_file,mcp__claude_ai_Figma__,2599,650,1053,1457,no
+mcp__claude_ai_Atlassian__createJiraIssue,mcp__claude_ai_Atlassian__,2572,643,145,2342,no
+ExitWorktree,Claude built-ins,2505,627,1923,481,no
+ExitPlanMode,Claude built-ins,2443,611,1849,505,no
+mcp__claude-in-chrome__gif_creator,mcp__claude-in-chrome__,2427,607,648,1701,no
+LSP,Claude built-ins,2305,577,1235,1002,no
+mcp__claude_ai_Atlassian__createConfluencePage,mcp__claude_ai_Atlassian__,2294,574,286,1912,no
+mcp__claude_ai_Figma__update_shader,mcp__claude_ai_Figma__,2185,547,735,1371,no
+ReportFindings,Claude built-ins,2177,545,574,1545,no
+mcp__claude_ai_Atlassian__getJiraIssue,mcp__claude_ai_Atlassian__,2174,544,219,1873,no
+mcp__claude_ai_Figma__get_code_connect_suggestions,mcp__claude_ai_Figma__,2156,539,658,1402,no
+mcp__claude_ai_Figma__get_variable_defs,mcp__claude_ai_Figma__,2094,524,790,1221,no
+mcp__claude_ai_Figma__get_context_for_code_connect,mcp__claude_ai_Figma__,2078,520,763,1221,no
+mcp__claude_ai_Figma__get_code_connect_map,mcp__claude_ai_Figma__,2065,517,691,1288,no
+mcp__context7__query-docs,mcp__context7__,2061,516,547,1439,no
+mcp__claude_ai_Figma__get_figjam,mcp__claude_ai_Figma__,2046,512,521,1449,no
+mcp__claude_ai_Figma__update_generative_plugin,mcp__claude_ai_Figma__,2001,501,734,1177,no
+mcp__claude_ai_Google_Calendar__suggest_time,mcp__claude_ai_Google_Calendar__,1984,496,51,1845,no
+mcp__claude_ai_Atlassian__transitionJiraIssue,mcp__claude_ai_Atlassian__,1980,495,23,1868,no
+mcp__claude_ai_Gmail__get_draft,mcp__claude_ai_Gmail__,1921,481,422,1421,no
+Read,Claude built-ins,1919,480,790,1071,no
+mcp__claude_ai_Figma__list_file_shaders,mcp__claude_ai_Figma__,1869,468,940,842,no
+mcp__claude_ai_Atlassian__searchJiraIssuesUsingJql,mcp__claude_ai_Atlassian__,1824,456,68,1662,no
+mcp__claude_ai_Atlassian__editJiraIssue,mcp__claude_ai_Atlassian__,1810,453,303,1422,no
+Skill,Claude built-ins,1803,451,1417,327,no
+mcp__claude-in-chrome__upload_image,mcp__claude-in-chrome__,1799,450,761,959,no
+mcp__claude-in-chrome__browser_batch,mcp__claude-in-chrome__,1790,448,726,984,no
+PushNotification,Claude built-ins,1764,441,1362,330,no
+mcp__claude_ai_Figma__create_shader,mcp__claude_ai_Figma__,1728,432,806,843,no
+mcp__claude_ai_Atlassian__searchConfluenceUsingCql,mcp__claude_ai_Atlassian__,1656,414,174,1388,no
+mcp__claude_ai_Figma__weave_run_model,mcp__claude_ai_Figma__,1638,410,639,918,no
+mcp__claude_ai_Figma__create_generative_plugin,mcp__claude_ai_Figma__,1636,409,864,682,no
+NotebookEdit,Claude built-ins,1623,406,619,940,no
+mcp__claude_ai_Atlassian__addTeamworkGraphContext,mcp__claude_ai_Atlassian__,1613,404,216,1304,no
+mcp__claude_ai_Figma__weave_get_tool_inputs,mcp__claude_ai_Figma__,1609,403,998,524,no
+mcp__claude_ai_Atlassian__getConfluencePage,mcp__claude_ai_Atlassian__,1593,399,254,1252,no
+mcp__claude_ai_Atlassian__getConfluencePageInlineComments,mcp__claude_ai_Atlassian__,1572,393,43,1428,no
+mcp__claude_ai_Figma__get_libraries,mcp__claude_ai_Figma__,1568,392,626,863,no
+mcp__claude-in-chrome__read_console_messages,mcp__claude-in-chrome__,1543,386,480,975,no
+mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__,1538,385,871,588,no
+mcp__claude-in-chrome__read_page,mcp__claude-in-chrome__,1500,375,487,937,no
+mcp__claude_ai_Atlassian__addWorklogToJiraIssue,mcp__claude_ai_Atlassian__,1466,367,90,1285,no
+mcp__claude_ai_Atlassian__getConfluencePageFooterComments,mcp__claude_ai_Atlassian__,1435,359,43,1291,no
+mcp__claude_ai_Atlassian__addCommentToJiraIssue,mcp__claude_ai_Atlassian__,1380,345,39,1250,no
+mcp__claude_ai_Figma__weave_get_tool_run_output,mcp__claude_ai_Figma__,1344,336,724,529,no
+mcp__claude_ai_Figma__get_generative_plugin,mcp__claude_ai_Figma__,1337,335,591,659,no
+ShareOnboardingGuide,Claude built-ins,1297,325,451,780,no
+mcp__claude_ai_Atlassian__getCompassComponents,mcp__claude_ai_Atlassian__,1287,322,32,1165,no
+mcp__claude_ai_Figma__get_shader,mcp__claude_ai_Figma__,1287,322,552,659,no
+mcp__claude-in-chrome__list_connected_browsers,mcp__claude-in-chrome__,1280,320,1141,47,no
+mcp__claude-in-chrome__read_network_requests,mcp__claude-in-chrome__,1278,320,449,741,no
+mcp__claude_ai_Atlassian__getPagesInConfluenceSpace,mcp__claude_ai_Atlassian__,1269,318,34,1140,no
+WebFetch,Claude built-ins,1264,316,651,554,no
+mcp__claude_ai_Gmail__label_thread,mcp__claude_ai_Gmail__,1263,316,571,611,no
+mcp__claude_ai_Google_Calendar__respond_to_event,mcp__claude_ai_Google_Calendar__,1262,316,35,1135,no
+mcp__claude_ai_Figma__create_session,mcp__claude_ai_Figma__,1258,315,676,502,no
+mcp__claude_ai_Atlassian__createIssueLink,mcp__claude_ai_Atlassian__,1246,312,259,900,no
+mcp__claude_ai_Figma__get_figma_skill,mcp__claude_ai_Figma__,1228,307,610,535,no
+mcp__claude_ai_Gmail__label_message,mcp__claude_ai_Gmail__,1225,307,552,589,no
+mcp__claude_ai_Gmail__update_message_labels,mcp__claude_ai_Gmail__,1204,301,507,606,no
+mcp__claude_ai_Atlassian__getCompassComponent,mcp__claude_ai_Atlassian__,1202,301,29,1084,no
+mcp__claude_ai_Atlassian__getConfluenceSpaces,mcp__claude_ai_Atlassian__,1179,295,10,1080,no
+mcp__claude-in-chrome__file_upload,mcp__claude-in-chrome__,1173,294,577,518,no
+mcp__claude_ai_Gmail__unlabel_thread,mcp__claude_ai_Gmail__,1167,292,446,638,no
+ListAgents,Claude built-ins,1151,288,777,316,no
+mcp__claude_ai_Atlassian__getContentFormatGuide,mcp__claude_ai_Atlassian__,1148,287,474,583,no
+mcp__claude_ai_Gmail__apply_sensitive_message_label,mcp__claude_ai_Gmail__,1144,286,572,470,no
+mcp__claude-in-chrome__javascript_tool,mcp__claude-in-chrome__,1137,285,309,746,no
+mcp__claude_ai_Figma__weave_list_tools,mcp__claude_ai_Figma__,1120,280,786,250,no
+mcp__claude-in-chrome__form_input,mcp__claude-in-chrome__,1091,273,163,851,no
+mcp__claude_ai_Atlassian__getConfluenceCommentChildren,mcp__claude_ai_Atlassian__,1008,252,39,871,no
+mcp__antigravity__generate_image,mcp__antigravity__,992,248,287,629,no
+WaitForMcpServers,Claude built-ins,975,244,668,235,no
+mcp__claude_ai_Gmail__list_labels,mcp__claude_ai_Gmail__,974,244,807,85,no
+mcp__claude_ai_Atlassian__fetch,mcp__claude_ai_Atlassian__,970,243,309,582,no
+Edit,Claude built-ins,964,241,360,552,no
+mcp__claude_ai_Gmail__apply_sensitive_thread_label,mcp__claude_ai_Gmail__,964,241,399,466,no
+mcp__claude_ai_Gmail__unlabel_message,mcp__claude_ai_Gmail__,950,238,253,616,no
+mcp__claude_ai_Figma__weave_find_model,mcp__claude_ai_Figma__,925,232,577,262,no
+mcp__plugin_engineering_atlassian__complete_authentication,mcp__plugin_engineering_atlassian__,921,231,495,322,no
+mcp__plugin_engineering_datadog__complete_authentication,mcp__plugin_engineering_datadog__,915,229,491,322,no
+mcp__plugin_engineering_linear__complete_authentication,mcp__plugin_engineering_linear__,912,228,489,322,no
+mcp__plugin_engineering_notion__complete_authentication,mcp__plugin_engineering_notion__,912,228,489,322,no
+mcp__plugin_context7_context7__complete_authentication,mcp__plugin_context7_context7__,909,228,487,322,no
+mcp__plugin_engineering_slack__complete_authentication,mcp__plugin_engineering_slack__,909,228,487,322,no
+mcp__claude_ai_Google_Sheets__complete_authentication,mcp__claude_ai_Google_Sheets__,906,227,485,322,no
+mcp__claude_ai_Microsoft_365__complete_authentication,mcp__claude_ai_Microsoft_365__,906,227,485,322,no
+mcp__claude_ai_Google_Drive__complete_authentication,mcp__claude_ai_Google_Drive__,903,226,483,322,no
+mcp__claude_ai_HeyJapan_MCP__complete_authentication,mcp__claude_ai_HeyJapan_MCP__,903,226,483,322,no
+mcp__claude_ai_Google_Docs__complete_authentication,mcp__claude_ai_Google_Docs__,900,225,481,322,no
+mcp__claude-in-chrome__find,mcp__claude-in-chrome__,899,225,429,393,no
+mcp__claude_ai_ElevenLabs__complete_authentication,mcp__claude_ai_ElevenLabs__,897,225,479,322,no
+mcp__claude_ai_monday_com__complete_authentication,mcp__claude_ai_monday_com__,897,225,479,322,no
+mcp__claude_ai_Atlassian__createCompassCustomFieldDefinition,mcp__claude_ai_Atlassian__,896,224,43,749,no
+mcp__claude_ai_Figma__weave_get_model_run_output,mcp__claude_ai_Figma__,894,224,495,307,no
+mcp__claude_ai_eup_chat__complete_authentication,mcp__claude_ai_eup_chat__,891,223,475,322,no
+mcp__claude_ai_Intercom__complete_authentication,mcp__claude_ai_Intercom__,891,223,475,322,no
+mcp__claude_ai_HubSpot__complete_authentication,mcp__claude_ai_HubSpot__,888,222,473,322,no
+mcp__claude_ai_Google_Calendar__list_calendars,mcp__claude_ai_Google_Calendar__,886,222,490,306,no
+mcp__claude_ai_Linear__complete_authentication,mcp__claude_ai_Linear__,885,222,471,322,no
+mcp__claude_ai_Mobbin__complete_authentication,mcp__claude_ai_Mobbin__,885,222,471,322,no
+mcp__claude_ai_Notion__complete_authentication,mcp__claude_ai_Notion__,885,222,471,322,no
+mcp__claude_ai_Asana__complete_authentication,mcp__claude_ai_Asana__,882,221,469,322,no
+mcp__claude_ai_Canva__complete_authentication,mcp__claude_ai_Canva__,882,221,469,322,no
+mcp__claude_ai_Figma__weave_cancel_tool_run,mcp__claude_ai_Figma__,879,220,337,455,no
+mcp__claude_ai_Box__complete_authentication,mcp__claude_ai_Box__,876,219,465,322,no
+mcp__claude_ai_Exa__complete_authentication,mcp__claude_ai_Exa__,876,219,465,322,no
+ReadMcpResourceDirTool,Claude built-ins,875,219,513,284,no
+WebSearch,Claude built-ins,861,216,334,468,no
+mcp__claude_ai_Atlassian__getTransitionsForJiraIssue,mcp__claude_ai_Atlassian__,858,215,15,747,no
+mcp__claude_ai_Gmail__trash_message,mcp__claude_ai_Gmail__,830,208,539,207,no
+mcp__claude_ai_Figma__list_generative_plugins,mcp__claude_ai_Figma__,824,206,483,252,no
+mcp__claude-in-chrome__shortcuts_execute,mcp__claude-in-chrome__,821,206,277,460,no
+mcp__claude_ai_Google_Calendar__delete_event,mcp__claude_ai_Google_Calendar__,819,205,39,692,no
+mcp__claude_ai_Claude_Docs__delete,mcp__claude_ai_Claude_Docs__,816,204,241,497,no
+mcp__claude_ai_Gmail__trash_thread,mcp__claude_ai_Gmail__,813,204,529,203,no
+mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__,794,199,396,315,no
+TaskStop,Claude built-ins,789,198,364,366,no
+mcp__claude_ai_Claude_Docs__export,mcp__claude_ai_Claude_Docs__,771,193,254,437,no
+mcp__claude_ai_Claude_Docs__read,mcp__claude_ai_Claude_Docs__,770,193,221,457,no
+mcp__claude_ai_Atlassian__getTeamworkGraphObject,mcp__claude_ai_Atlassian__,755,189,174,489,no
+mcp__claude_ai_Atlassian__search,mcp__claude_ai_Atlassian__,753,189,334,343,no
+mcp__claude_ai_Atlassian__getJiraIssueTypeMetaWithFields,mcp__claude_ai_Atlassian__,733,184,18,615,no
+Glob,Claude built-ins,731,183,140,539,no
+mcp__claude_ai_Atlassian__createCompassComponent,mcp__claude_ai_Atlassian__,717,180,30,595,no
+mcp__claude_ai_Claude_Docs__update,mcp__claude_ai_Claude_Docs__,706,177,69,559,no
+mcp__claude_ai_Figma__list_shaders,mcp__claude_ai_Figma__,693,174,363,252,no
+mcp__claude_ai_Atlassian__getConfluencePageDescendants,mcp__claude_ai_Atlassian__,692,173,33,561,no
+mcp__claude_ai_Atlassian__createCompassComponentRelationship,mcp__claude_ai_Atlassian__,691,173,48,539,no
+mcp__claude-in-chrome__resize_window,mcp__claude-in-chrome__,682,171,217,385,no
+mcp__claude_ai_Figma__whoami,mcp__claude_ai_Figma__,646,162,455,119,no
+Write,Claude built-ins,639,160,240,348,no
+ListMcpResourcesTool,Claude built-ins,628,157,351,205,no
+mcp__claude_ai_Atlassian__lookupJiraAccountId,mcp__claude_ai_Atlassian__,626,157,15,522,no
+mcp__claude_ai_Gmail__mark_thread_spam,mcp__claude_ai_Gmail__,622,156,332,205,no
+mcp__claude_ai_Claude_Docs__create,mcp__claude_ai_Claude_Docs__,609,153,77,454,no
+mcp__claude_ai_Google_Calendar__search_events,mcp__claude_ai_Google_Calendar__,597,150,69,439,no
+mcp__claude_ai_Atlassian__getVisibleJiraProjects,mcp__claude_ai_Atlassian__,582,146,12,478,no
+mcp__web-search__web_search,mcp__web-search__,582,146,79,432,no
+mcp__claude-in-chrome__tabs_close_mcp,mcp__claude-in-chrome__,581,146,302,198,no
+ReadMcpResourceTool,Claude built-ins,577,145,234,274,no
+mcp__claude-in-chrome__get_page_text,mcp__claude-in-chrome__,565,142,264,221,no
+mcp__claude_ai_Microsoft_365__authenticate,mcp__claude_ai_Microsoft_365__,563,141,356,119,no
+mcp__claude_ai_Google_Sheets__authenticate,mcp__claude_ai_Google_Sheets__,560,140,353,119,no
+mcp__claude_ai_HeyJapan_MCP__authenticate,mcp__claude_ai_HeyJapan_MCP__,558,140,352,119,no
+mcp__claude_ai_Google_Drive__authenticate,mcp__claude_ai_Google_Drive__,557,140,351,119,no
+mcp__claude_ai_Google_Docs__authenticate,mcp__claude_ai_Google_Docs__,554,139,349,119,no
+mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__,554,139,425,47,no
+mcp__plugin_engineering_atlassian__authenticate,mcp__plugin_engineering_atlassian__,553,139,341,119,no
+mcp__plugin_engineering_datadog__authenticate,mcp__plugin_engineering_datadog__,549,138,339,119,no
+mcp__claude_ai_ElevenLabs__authenticate,mcp__claude_ai_ElevenLabs__,547,137,343,119,no
+mcp__claude_ai_monday_com__authenticate,mcp__claude_ai_monday_com__,544,136,340,119,no
+mcp__plugin_context7_context7__authenticate,mcp__plugin_context7_context7__,544,136,336,119,no
+mcp__plugin_engineering_linear__authenticate,mcp__plugin_engineering_linear__,544,136,335,119,no
+mcp__plugin_engineering_notion__authenticate,mcp__plugin_engineering_notion__,544,136,335,119,no
+mcp__claude_ai_Intercom__authenticate,mcp__claude_ai_Intercom__,542,136,340,119,no
+mcp__plugin_engineering_slack__authenticate,mcp__plugin_engineering_slack__,541,136,333,119,no
+mcp__claude_ai_HubSpot__authenticate,mcp__claude_ai_HubSpot__,539,135,338,119,no
+mcp__claude_ai_eup_chat__authenticate,mcp__claude_ai_eup_chat__,537,135,335,119,no
+mcp__claude_ai_Linear__authenticate,mcp__claude_ai_Linear__,536,134,336,119,no
+mcp__claude_ai_Mobbin__authenticate,mcp__claude_ai_Mobbin__,536,134,336,119,no
+mcp__claude_ai_Notion__authenticate,mcp__claude_ai_Notion__,536,134,336,119,no
+mcp__claude_ai_Asana__authenticate,mcp__claude_ai_Asana__,533,134,334,119,no
+mcp__claude_ai_Canva__authenticate,mcp__claude_ai_Canva__,533,134,334,119,no
+mcp__claude_ai_Google_Calendar__get_event,mcp__claude_ai_Google_Calendar__,532,133,45,402,no
+mcp__claude-in-chrome__shortcuts_list,mcp__claude-in-chrome__,531,133,227,223,no
+mcp__claude_ai_Box__authenticate,mcp__claude_ai_Box__,527,132,330,119,no
+mcp__claude_ai_Exa__authenticate,mcp__claude_ai_Exa__,526,132,329,119,no
+mcp__claude_ai_Figma__weave_upload_asset,mcp__claude_ai_Figma__,520,130,317,119,no
+mcp__claude-in-chrome__switch_browser,mcp__claude-in-chrome__,511,128,383,47,no
+mcp__claude_ai_Atlassian__getIssueLinkTypes,mcp__claude_ai_Atlassian__,504,126,207,208,no
+mcp__claude_ai_Claude_Docs__guide,mcp__claude_ai_Claude_Docs__,497,125,180,238,no
+mcp__claude_ai_Atlassian__getJiraProjectIssueTypesMetadata,mcp__claude_ai_Atlassian__,475,119,15,358,no
+mcp__claude_ai_Atlassian__getJiraIssueRemoteIssueLinks,mcp__claude_ai_Atlassian__,457,115,16,343,no
+mcp__claude_ai_Gmail__untrash_message,mcp__claude_ai_Gmail__,434,109,137,213,no
+mcp__claude_ai_Gmail__unmark_message_spam,mcp__claude_ai_Gmail__,431,108,130,213,no
+mcp__claude_ai_Claude_Docs__query,mcp__claude_ai_Claude_Docs__,430,108,69,284,no
+mcp__claude_ai_Atlassian__getAccessibleAtlassianResources,mcp__claude_ai_Atlassian__,426,107,240,85,no
+mcp__claude_ai_Gmail__mark_message_spam,mcp__claude_ai_Gmail__,423,106,128,209,no
+mcp__claude-in-chrome__select_browser,mcp__claude-in-chrome__,416,104,191,144,no
+mcp__claude_ai_Claude_Docs__batch,mcp__claude_ai_Claude_Docs__,392,98,64,251,no
+mcp__claude_ai_Gmail__untrash_thread,mcp__claude_ai_Gmail__,373,94,83,209,no
+mcp__claude_ai_Gmail__unmark_thread_spam,mcp__claude_ai_Gmail__,370,93,76,209,no
+mcp__claude_ai_Gmail__delete_draft,mcp__claude_ai_Gmail__,369,93,83,208,no
+CronDelete,Claude built-ins,360,90,100,206,no
+mcp__claude_ai_Atlassian__getCompassCustomFieldDefinitions,mcp__claude_ai_Atlassian__,356,89,46,208,no
+mcp__claude_ai_Gmail__delete_label,mcp__claude_ai_Gmail__,329,83,58,193,no
+CronList,Claude built-ins,231,58,60,119,no
+mcp__web-search__get_webpage_content,mcp__web-search__,194,49,11,103,no
+mcp__claude_ai_Atlassian__atlassianUserInfo,mcp__claude_ai_Atlassian__,193,49,21,85,no
+advisor,Claude built-ins,91,23,0,2,no

@@ -8,12 +8,18 @@ eframe = "0.36"
 rfd = "0.17"
 ureq = "3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.23"
 getrandom = "0.3"
+ctrlc = "3"
+prost = "0.13"
+jsonschema = { version = "0.60.1", default-features = false }
+snow = "0.9"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
 
 [target.'cfg(windows)'.dependencies]
-ctrlc = "3"
+tray-icon = { version = "0.26", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_System_JobObjects", "Win32_Security", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 strip = true
