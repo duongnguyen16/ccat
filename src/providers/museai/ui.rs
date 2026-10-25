@@ -21,7 +21,7 @@ fn start_login(ctx: &egui::Context) -> Result<LoginJob<Account>, String> {
     Ok(LoginJob { url, cancel, rx })
 }
 
-pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config) {
+pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config, feed: &crate::usage::Feed) {
     let p = pal(ui);
     let Some(mu_idx) = cfg.providers.iter().position(|p| p.muse) else { return };
     let pr = &mut cfg.providers[mu_idx];
@@ -103,5 +103,10 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     if clear_account {
         let _ = remove_account();
         pr.muse_account = None;
+    }
+    // The plan's allowance, as muse-cli cached it.
+    let u = &feed.usage;
+    if pr.muse_account.is_some() || !u.muse.bars.is_empty() || !u.muse.error.is_empty() {
+        feed.limits(ui, 4, &u.muse_plan, &crate::usage::muse_bars(u), u.muse.fetched, &u.muse.error);
     }
 }

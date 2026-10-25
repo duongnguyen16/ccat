@@ -398,7 +398,7 @@ pub fn ag_view(u: &Usage, accounts: &[antigravity::Account], view: &str, group: 
 
 /// What a Claude or ChatGPT section shows: once the week is used up only the weekly bar (the week decides), and
 /// per-model weekly bars (Fable) only when `models`.
-fn tidy(bars: &[Bar], models: bool) -> Vec<Bar> {
+pub(crate) fn tidy(bars: &[Bar], models: bool) -> Vec<Bar> {
     let week = |b: &Bar| b.label == "Weekly (7 day)";
     let week_out = bars.iter().any(|b| week(b) && b.out());
     bars.iter().filter(|b| week(b) || (!week_out && (models || b.window != WEEK))).cloned().collect()
@@ -1187,12 +1187,7 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
         out.push(Section { src: Src::Ollama, title: "Ollama", which: 3, bars: u.ollama.bars.clone(), errors: [u.ollama.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.ollama.error.is_empty() });
     }
     if u.muse_on && (!u.muse.bars.is_empty() || !u.muse.error.is_empty()) {
-        let mut bars = u.muse.bars.clone();
-        for bar in &mut bars {
-            bar.part.clear();
-            if bar.label.starts_with("Tokens (") { bar.label = "Additional tokens".into(); }
-        }
-        out.push(Section { src: Src::Muse, title: "MuseAI", which: 4, bars, errors: [u.muse.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.muse.error.is_empty() });
+        out.push(Section { src: Src::Muse, title: "MuseAI", which: 4, bars: muse_bars(u), errors: [u.muse.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.muse.error.is_empty() });
     }
     if !accounts.is_empty() {
         let mine = accounts.iter().filter(|a| cfg.usage_view.is_empty() || a.email == cfg.usage_view);
@@ -1205,6 +1200,16 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
     }
     let keep = shown(cfg, cfg.usage_view_mode, Src::ALL.map(|s| out.iter().any(|x| x.src == s)));
     keep.iter().filter_map(|s| out.iter().position(|x| x.src == *s).map(|i| out.swap_remove(i))).collect()
+}
+
+/// MuseAI's bars as shown: no plan parts, the extra allowance as "Additional tokens".
+pub(crate) fn muse_bars(u: &Usage) -> Vec<Bar> {
+    let mut bars = u.muse.bars.clone();
+    for bar in &mut bars {
+        bar.part.clear();
+        if bar.label.starts_with("Tokens (") { bar.label = "Additional tokens".into(); }
+    }
+    bars
 }
 
 /// The window height the sections need, in points: the same sums the layout below adds up.
@@ -1261,6 +1266,17 @@ fn rows(bars: &[Bar]) -> Vec<&[Bar]> {
     out
 }
 
+/// (fill, track) of a bar: each fill sits on a dark track of its own hue; greyed out when `stale`.
+fn tone(b: &Bar, now: u64, stale: bool, p: &crate::Pal) -> (egui::Color32, egui::Color32) {
+    match b.level(now) {
+        _ if stale => (p.border_strong, p.sunken),
+        Level::Full => (RED, RED_TRACK),
+        Level::Warn => (ORANGE, ORANGE_TRACK),
+        Level::Low => (PURPLE, PURPLE_TRACK),
+        Level::Ok => (GREEN, GREEN_TRACK),
+    }
+}
+
 /// One row: its label, then its bars side by side (one bar: the whole width, its use beside the label; several: a
 /// line under each with its plan and use), each with its reset below.
 fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool, reset_with_percent: bool) {
@@ -1282,14 +1298,7 @@ fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool, reset_with_pe
     let pt = ui.painter();
     let cols: Vec<egui::Rect> = (0..bars.len()).map(|i| egui::Rect::from_min_size(rect.min + egui::vec2(i as f32 * (col + gap), 0.0), egui::vec2(col, BAR_H))).collect();
     for (b, r) in bars.iter().zip(&cols) {
-        // Each fill sits on a dark track of its own hue.
-        let (fill_color, track) = match b.level(now) {
-            _ if stale => (p.border_strong, p.sunken),
-            Level::Full => (RED, RED_TRACK),
-            Level::Warn => (ORANGE, ORANGE_TRACK),
-            Level::Low => (PURPLE, PURPLE_TRACK),
-            Level::Ok => (GREEN, GREEN_TRACK),
-        };
+        let (fill_color, track) = tone(b, now, stale, p);
         pt.rect_filled(*r, 2.0, track);
         let fill = r.width() * (b.used.clamp(0.0, 100.0) / 100.0) as f32;
         if fill > 0.0 {
@@ -1334,6 +1343,167 @@ fn bar_row(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool, reset_with_pe
         }
     };
     line(ui, RESET_H, &|b: &Bar| (reset(b), if reset_with_percent { format!("{:.0}%", b.used) } else { String::new() }), 11.5, p.subtle);
+}
+
+// ---------------------------------------------------------------- Settings: limits blocks
+
+/// What the provider pages draw their limits from: the `usage.json` Settings last read (the tray and popup write it)
+/// and which reloads are running.
+pub(crate) struct Feed {
+    pub usage: Usage,
+    stamp: Option<std::time::SystemTime>,
+    polled: std::time::Instant,
+    busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; 5],
+}
+
+impl Feed {
+    pub(crate) fn new() -> Self {
+        Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default() }
+    }
+
+    /// Re-reads `usage.json` when someone wrote it (the other process, or a reload here); looked at once a second.
+    pub(crate) fn poll(&mut self) {
+        if self.polled.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.polled = std::time::Instant::now();
+        let stamp = usage_stamp();
+        if stamp != self.stamp {
+            (self.stamp, self.usage) = (stamp, load_usage());
+        }
+    }
+
+    /// A provider's block, headed "Your usage limits" with its plan, when it was updated and a reload (`which` as in
+    /// `spawn_refresh`); a failed fetch shows its error over the last bars, greyed out.
+    pub(crate) fn limits(&self, ui: &mut egui::Ui, which: usize, plan: &str, bars: &[Bar], fetched: u64, error: &str) {
+        let (p, now) = (crate::pal(ui), now());
+        ui.add_space(14.0);
+        row(ui, SECTION_H, |ui| {
+            ui.label(egui::RichText::new("Your usage limits").family(crate::anthropic()).size(16.0).color(p.fg));
+            if !plan.is_empty() {
+                ui.label(egui::RichText::new(plan).size(13.0).color(p.muted));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.busy[which].load(std::sync::atomic::Ordering::SeqCst) {
+                    ui.add_sized([28.0, 28.0], egui::Spinner::new().size(14.0));
+                } else if crate::icon_btn(ui, crate::Icon::Reload).on_hover_text("Reload now").clicked() {
+                    spawn_refresh(which, Some(self.busy[which].clone()), ui.ctx());
+                }
+                ui.label(egui::RichText::new(updated(fetched, now)).size(11.5).color(p.subtle));
+            });
+        });
+        if !error.is_empty() {
+            row(ui, ERROR_H, |ui| ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(12.0).color(p.danger)).truncate()).on_hover_text(error));
+        }
+        limit_rows(ui, bars, now, !error.is_empty(), false);
+    }
+}
+
+/// A small block under an account row: no header, indented, `off` (a disabled account) and failed fetches greyed out.
+pub(crate) fn account_limits(ui: &mut egui::Ui, bars: &[Bar], error: &str, off: bool) {
+    let (p, now) = (crate::pal(ui), now());
+    ui.horizontal_top(|ui| {
+        ui.add_space(crate::settings::providers::INDENT);
+        ui.vertical(|ui| {
+            if !error.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(11.5).color(p.danger)).truncate()).on_hover_text(error);
+            }
+            limit_rows(ui, bars, now, off || !error.is_empty(), true);
+            ui.add_space(10.0);
+        });
+    });
+}
+
+/// "Updated 3m ago".
+fn updated(t: u64, now: u64) -> String {
+    if t == 0 { "Not updated yet".into() } else { format!("Updated {}", ago(t, now)) }
+}
+
+/// A block's bars in reading order: the 5-hour ones, the weekly ones (under a "Weekly limits" caption), then the rest
+/// (a month, a balance) as plain rows.
+fn limit_groups(bars: &[Bar]) -> [Vec<&Bar>; 3] {
+    let pick = |f: &dyn Fn(&Bar) -> bool| bars.iter().filter(|b| f(b)).collect();
+    [pick(&|b| b.window == FIVE_HOURS), pick(&|b| b.window == WEEK), pick(&|b| b.window != FIVE_HOURS && b.window != WEEK)]
+}
+
+/// A row's name as Claude's own page words it: "Session (5hr)" → "Current session", "Weekly (7 day)" → "All models",
+/// "Weekly Fable" → "Fable"; Antigravity's "Gemini · Weekly (7 day)" → "Gemini" (its weekly rows sit under the caption).
+fn limit_name(label: &str) -> String {
+    if let Some((group, what)) = label.split_once(" · ") {
+        return if what.starts_with("Weekly") { group.into() } else { format!("{group} · {}", limit_name(what).to_lowercase()) };
+    }
+    match label {
+        "Session (5hr)" | "Session" => "Current session".into(),
+        "Weekly (7 day)" => "All models".into(),
+        l => l.strip_prefix("Weekly ").unwrap_or(l).into(),
+    }
+}
+
+/// "15% used"; a balance row (no window, a `part` such as "$12.40") says its part instead.
+fn used_text(b: &Bar) -> String {
+    if b.window == 0 && !b.part.is_empty() { b.part.clone() } else { format!("{:.0}% used", b.used) }
+}
+
+/// The grey line under a row's name: the provider's own words, else when the window resets; nothing for a row with
+/// no window at all (a balance).
+fn reset_line(b: &Bar, now: u64) -> String {
+    if !b.reset_label.is_empty() {
+        b.reset_label.clone()
+    } else if b.window == 0 {
+        String::new()
+    } else {
+        reset_text(b.resets, now, b.reset_pct)
+    }
+}
+
+fn limit_rows(ui: &mut egui::Ui, bars: &[Bar], now: u64, stale: bool, compact: bool) {
+    let p = crate::pal(ui);
+    if bars.is_empty() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("No usage yet").size(11.5).color(p.subtle));
+        return;
+    }
+    let groups = limit_groups(bars);
+    for (n, (caption, group)) in [("", &groups[0]), ("Weekly limits", &groups[1]), ("", &groups[2])].into_iter().filter(|(_, g)| !g.is_empty()).enumerate() {
+        ui.add_space(if compact { 6.0 } else { 10.0 });
+        if !caption.is_empty() {
+            let (size, color) = if compact { (12.0, p.muted) } else { (15.0, p.fg) };
+            ui.label(egui::RichText::new(caption).family(crate::anthropic()).size(size).color(color));
+        } else if n > 0 {
+            ui.add_space(4.0);
+        }
+        for b in group {
+            limit_row(ui, b, now, stale, compact);
+        }
+    }
+}
+
+/// One limit: its name with the reset under it, a wide rounded bar, "15% used".
+fn limit_row(ui: &mut egui::Ui, b: &Bar, now: u64, stale: bool, compact: bool) {
+    let p = crate::pal(ui);
+    let (h, name_w, pct_w, bar_h, (big, small)): (f32, f32, f32, f32, (f32, f32)) = if compact { (40.0, 170.0, 78.0, 8.0, (12.5, 11.0)) } else { (52.0, 210.0, 92.0, 10.0, (14.0, 12.0)) };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let name_w = name_w.min(rect.width() * 0.38);
+    let ink = if stale { p.muted } else { p.fg };
+    let (reset, mid) = (reset_line(b, now), rect.center().y);
+    // ponytail: a name or reset too long for its column is clipped, not ellipsised
+    let left = ui.painter().with_clip_rect(rect.with_max_x(rect.left() + name_w));
+    let at = |y: f32| egui::pos2(rect.left(), y);
+    if reset.is_empty() {
+        left.text(at(mid), egui::Align2::LEFT_CENTER, limit_name(&b.label), egui::FontId::proportional(big), ink);
+    } else {
+        left.text(at(mid - big * 0.6), egui::Align2::LEFT_CENTER, limit_name(&b.label), egui::FontId::proportional(big), ink);
+        left.text(at(mid + small * 0.9), egui::Align2::LEFT_CENTER, reset, egui::FontId::proportional(small), p.subtle);
+    }
+    ui.painter().text(egui::pos2(rect.right(), mid), egui::Align2::RIGHT_CENTER, used_text(b), egui::FontId::proportional(big), ink);
+    let track = egui::Rect::from_x_y_ranges((rect.left() + name_w + 12.0)..=(rect.right() - pct_w - 12.0), (mid - bar_h / 2.0)..=(mid + bar_h / 2.0));
+    let (fill_color, track_color) = tone(b, now, stale, p);
+    ui.painter().rect_filled(track, bar_h / 2.0, track_color);
+    // A sliver of use still shows as a pill, not a hairline.
+    let fill = if b.used > 0.0 { (track.width() * (b.used.clamp(0.0, 100.0) / 100.0) as f32).max(bar_h).min(track.width()) } else { 0.0 };
+    if fill > 0.0 {
+        ui.painter().rect_filled(egui::Rect::from_min_size(track.min, egui::vec2(fill, bar_h)), bar_h / 2.0, fill_color);
+    }
 }
 
 // ---------------------------------------------------------------- analytics
@@ -2064,6 +2234,22 @@ fn orange_badge(ui: &mut egui::Ui, text: &str) -> egui::Response {
     resp
 }
 
+/// `refresh` on its own thread (`which`: 0 Claude, 1 Antigravity, 2 ChatGPT, 3 Ollama, 4 MuseAI forces that source, else
+/// only what is due), `busy` up while it runs (already up: nothing starts); repaints `ctx` after.
+fn spawn_refresh(which: usize, busy: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, ctx: &egui::Context) {
+    if busy.as_ref().is_some_and(|f| f.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+        return;
+    }
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        refresh(which == 0, which == 1, which == 2, which == 3, which == 4);
+        if let Some(f) = busy {
+            f.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        ctx.request_repaint();
+    });
+}
+
 struct Popup {
     cfg: crate::Config,
     loaded: Value,
@@ -2094,18 +2280,7 @@ struct Popup {
 impl Popup {
     /// A refresh in the background; `which` < Src::ALL.len() = specific source, or Src::ALL.len() for all due on opening.
     fn reload(&self, which: usize, ctx: &egui::Context) {
-        let flag = (which < Src::ALL.len()).then(|| self.busy[which].clone());
-        if flag.as_ref().is_some_and(|f| f.swap(true, std::sync::atomic::Ordering::SeqCst)) {
-            return;
-        }
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            refresh(which == 0, which == 1, which == 2, which == 3, which == 4);
-            if let Some(f) = flag {
-                f.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-            ctx.request_repaint();
-        });
+        spawn_refresh(which, (which < Src::ALL.len()).then(|| self.busy[which].clone()), ctx);
     }
 
     /// Tiers with requests held at their usage limits, in tier order: (UI name, what they wait for).
@@ -2566,6 +2741,34 @@ mod tests {
         assert!(reset_text(now + 7 * 86_400, now, None).contains("/"));
         assert_eq!(reset_text(0, now, None), "Starts when used");
         assert_eq!(utc_parts(0), (4, 0, 0), "1970-01-01 was a Thursday");
+    }
+
+    #[test]
+    fn limits_blocks_group_name_and_word_their_rows() {
+        let bar = |label: &str, window, used| Bar { label: label.into(), window, used, ..Default::default() };
+        let bars = [
+            bar("Weekly (7 day)", WEEK, 5.0),
+            bar("Additional tokens", 0, 40.0),
+            bar("Session (5hr)", FIVE_HOURS, 15.4),
+            bar("Weekly Fable", WEEK, 0.0),
+            bar("Monthly", 30 * 86_400, 80.0),
+        ];
+        let [five, week, rest] = limit_groups(&bars);
+        let labels = |g: &[&Bar]| g.iter().map(|b| b.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&five), ["Session (5hr)"]);
+        assert_eq!(labels(&week), ["Weekly (7 day)", "Weekly Fable"], "their order kept");
+        assert_eq!(labels(&rest), ["Additional tokens", "Monthly"], "no window, or another one: plain rows last");
+        let names: Vec<String> = bars.iter().map(|b| limit_name(&b.label)).collect();
+        assert_eq!(names, ["All models", "Additional tokens", "Current session", "Fable", "Monthly"]);
+        assert_eq!((limit_name("Gemini · Session (5hr)"), limit_name("Gemini · Weekly (7 day)")), ("Gemini · current session".into(), "Gemini".into()));
+        assert_eq!((used_text(&bars[2]), used_text(&bars[3])), ("15% used".into(), "0% used".into()));
+        let credits = Bar { label: "Credits".into(), part: "$12.40".into(), ..Default::default() };
+        assert_eq!((used_text(&credits), reset_line(&credits, 1)), ("$12.40".into(), String::new()), "a balance has no window to reset");
+        assert_eq!(reset_line(&Bar { reset_label: "Resets Sun".into(), ..bar("x", 0, 0.0) }, 1), "Resets Sun");
+        assert_eq!(reset_line(&bar("Session (5hr)", FIVE_HOURS, 1.0), 1), "Starts when used");
+        assert_eq!(tone(&bar("x", FIVE_HOURS, 100.0), 1, false, &crate::DARK).0, RED, "level colours as in the tray");
+        assert_eq!(tone(&bar("x", FIVE_HOURS, 100.0), 1, true, &crate::DARK), (crate::DARK.border_strong, crate::DARK.sunken), "a failed fetch greys it");
+        assert_eq!((updated(0, 500), updated(440, 500), updated(500, 500)), ("Not updated yet".into(), "Updated 1m ago".into(), "Updated just now".into()));
     }
 
     #[test]

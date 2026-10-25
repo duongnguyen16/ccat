@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config) {
+pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config, feed: &crate::usage::Feed) {
     let p = pal(ui);
     let Some(g) = cfg.providers.iter().position(|p| p.chatgpt) else { return };
     let pr = &mut cfg.providers[g];
@@ -58,6 +58,13 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     }
     if let Some(e) = ed.fetch_errs.get(&pr.name) {
         note(ui, e, p.danger);
+    }
+    // One allowance, not one per account: usage is asked with the first Codex login that answers (see `fetch_chatgpt`).
+    let u = &feed.usage;
+    if u.chatgpt_on {
+        feed.limits(ui, 2, &u.chatgpt_plan, &crate::usage::tidy(&u.chatgpt.bars, false), u.chatgpt.fetched, &u.chatgpt.error);
+        note(ui, "One allowance for the Codex login ccat asks with, not one per account.", p.subtle);
+        ui.add_space(8.0);
     }
     let mut remove = None;
     let mut resync = false;

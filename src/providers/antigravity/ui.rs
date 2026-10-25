@@ -22,7 +22,7 @@ fn start_login(ctx: &egui::Context) -> Result<LoginJob<Account>, String> {
     Ok(LoginJob { url, cancel, rx })
 }
 
-pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config) {
+pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config, feed: &crate::usage::Feed) {
     let p = pal(ui);
     let Some(a) = cfg.providers.iter().position(|p| p.antigravity) else { return };
     let pr = &mut cfg.providers[a];
@@ -92,6 +92,10 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
                 badge(ui, plan_label(&acc.plan), on);
             });
         });
+        // This account's own quota, every model group.
+        let source = feed.usage.antigravity.get(&acc.email);
+        let bars = source.map_or_else(Vec::new, |s| crate::usage::ag_bars(&[(&*acc, s)], ""));
+        crate::usage::account_limits(ui, &bars, source.map_or("", |s| &s.error), acc.disabled);
     }
     if let Some(n) = remove {
         pr.accounts.remove(n);

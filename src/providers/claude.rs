@@ -127,8 +127,9 @@ pub(crate) fn fetch_claude(token: &str) -> Result<Vec<Bar>, (String, u64)> {
 
 // ---------------------------------------------------------------- settings page
 
-/// Settings → Claude: Claude Code's own login can't be turned off, only offered (or not) as a choice.
-pub(crate) fn page(ui: &mut eframe::egui::Ui, cfg: &mut crate::Config) {
+/// Settings → Claude: Claude Code's own login can't be turned off, only offered (or not) as a choice; under it the
+/// plan's usage limits.
+pub(crate) fn page(ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed) {
     use crate::settings::providers::{head, name, note};
     let p = crate::pal(ui);
     head(ui, |ui| {
@@ -142,6 +143,10 @@ pub(crate) fn page(ui: &mut eframe::egui::Ui, cfg: &mut crate::Config) {
         name(ui, "Claude Code (Original)", on);
     });
     note(ui, "Claude Code's own login. Off: Claude models leave the model pickers (Default stays) and are skipped as fallbacks. A tier already on Claude keeps working.", p.subtle);
+    let u = &feed.usage;
+    if !u.plan.is_empty() || !u.claude.bars.is_empty() || !u.claude.error.is_empty() {
+        feed.limits(ui, 0, &u.plan, &crate::usage::tidy(&u.claude.bars, cfg.show_fable), u.claude.fetched, &u.claude.error);
+    }
 }
 
 #[cfg(test)]
