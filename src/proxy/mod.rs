@@ -6,6 +6,7 @@
 //! official routes only ever carry the caller's own credentials, so they don't.
 
 mod breaker;
+mod compress;
 pub(crate) mod http;
 pub(crate) mod sse;
 
@@ -49,6 +50,8 @@ pub struct Proxy {
     pub fail_on_limit: Arc<AtomicBool>,
     /// Skip fallbacks that are custom endpoints (a paid API key); a tier's primary always runs. Switchable too.
     pub no_paid_fallback: Arc<AtomicBool>,
+    /// Clean the tool results of requests that go to third-party routes (never Claude); switchable too.
+    pub compress_tool_results: Arc<AtomicBool>,
     ctx: Arc<Ctx>,
 }
 
@@ -187,6 +190,7 @@ pub(crate) struct Ctx {
     pub(crate) ratio: Mutex<HashMap<&'static str, f64>>,
     pub(crate) fail_on_limit: Arc<AtomicBool>,
     pub(crate) no_paid_fallback: Arc<AtomicBool>,
+    pub(crate) compress_tool_results: Arc<AtomicBool>,
     /// Providers that keep failing are skipped for a while (see `breaker`).
     pub(crate) breaker: breaker::Breaker,
     /// What this session's tiers are doing, written to its live file (see `live`).
@@ -246,6 +250,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
     let routes = Arc::new(RwLock::new(routes));
     let fail_on_limit = Arc::new(AtomicBool::new(false));
     let no_paid_fallback = Arc::new(AtomicBool::new(false));
+    let compress_tool_results = Arc::new(AtomicBool::new(false));
     let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -272,6 +277,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         ratio: Mutex::new(HashMap::new()),
         fail_on_limit: fail_on_limit.clone(),
         no_paid_fallback: no_paid_fallback.clone(),
+        compress_tool_results: compress_tool_results.clone(),
         breaker: Default::default(),
         live: Default::default(),
         wake: AtomicU64::new(0),
@@ -284,7 +290,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
             std::thread::spawn(move || serve(conn, &ctx));
         }
     });
-    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, ctx: handle })
+    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results, ctx: handle })
 }
 
 // ---------------------------------------------------------------- request dispatch
@@ -321,6 +327,8 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             // agent pauses at a usage limit instead of stopping.
             let hold = !ctx.fail_on_limit.load(Ordering::Relaxed);
             let mut held: Option<Held> = None;
+            // The request with its tool results cleaned, for the third-party tries; built once (see `compress`).
+            let mut cleaned: Option<(Req, Value)> = None;
             let mut passes = 0u32;
             loop {
                 // Resolved on every pass: a route changed in Settings reaches a request already waiting.
@@ -330,6 +338,16 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                     return denied(&mut s);
                 }
                 let tries = pick_tries(chain, authed, ctx.no_paid_fallback.load(Ordering::Relaxed), &ctx.breaker);
+                if cleaned.is_none() && ctx.compress_tool_results.load(Ordering::Relaxed) && tries.iter().any(|(u, _)| *u != Upstream::Official) {
+                    let mut b = body.clone();
+                    let saved = compress::tool_results(&mut b);
+                    if saved > 0 {
+                        common::log(&format!("{asked} [{tier}]: cleaned tool output, {saved} bytes saved"));
+                    }
+                    // Serialized either way, so the same history is the same bytes whether or not this turn saved anything.
+                    let raw = b.to_string().into_bytes();
+                    cleaned = Some((Req { method: req.method.clone(), path: req.path.clone(), headers: req.headers.clone(), body: raw }, b));
+                }
                 let mut fails = Vec::new();
                 for (n, (u, m)) in tries.iter().enumerate() {
                     let last = n + 1 == tries.len();
@@ -337,7 +355,12 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                         common::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
                     }
                     let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
-                    let result = run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, may_fail);
+                    // Claude always gets Claude Code's own bytes.
+                    let (rq, bd) = match &cleaned {
+                        Some((r, b)) if *u != Upstream::Official => (r, b),
+                        _ => (&req, &body),
+                    };
+                    let result = run(&mut s, ctx, rq, bd, &asked, u, m, tier, counted, may_fail);
                     // Only a 5xx (or a timeout / connection error, which come back as 502) counts against the provider.
                     match &result {
                         Err(f) if f.status >= 500 => ctx.breaker.fail(&format!("{u:?}")),
@@ -634,6 +657,7 @@ pub(crate) mod tests {
             ratio: Mutex::new(HashMap::new()),
             fail_on_limit: Default::default(),
             no_paid_fallback: Default::default(),
+            compress_tool_results: Default::default(),
             breaker: Default::default(),
             live: Default::default(),
             wake: AtomicU64::new(0),
@@ -1066,6 +1090,50 @@ Content-Length: {}
             }
         });
         (url, seen)
+    }
+
+    #[test]
+    fn compression_cleans_third_party_requests_and_never_claudes() {
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (claude, claude_seen) = fake_anthropic();
+        let (other, other_seen) = fake_anthropic();
+        *FAKE_API.lock().unwrap() = Some(claude);
+        let routes = vec![
+            route("opus", &["claude-opus-5-5"], Upstream::Official, "claude-opus-5-5"),
+            route("sonnet", &["m@sonnet"], ep("Other", other), "vendor/m"),
+        ];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let dirty = "\\u001b[32m   Compiling\\u001b[0m foo   \\n\\n\\n\\n\\n\\n    Finished";
+        let body = |model: &str| format!(r#"{{"model": "{model}", "max_tokens": 9, "messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"e","is_error":true,"content":"{dirty}"}}]}}]}}"#);
+        let send = |model: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let res = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(body(model)).unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+        };
+        let results = |seen: &Seen| -> Vec<String> {
+            let v: Value = serde_json::from_slice(&seen.lock().unwrap().pop().unwrap().0).unwrap();
+            v["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["content"].as_str().unwrap().to_string()).collect()
+        };
+        let cleaned = "   Compiling foo\n\n    Finished";
+
+        send("m@sonnet");
+        assert_eq!(results(&other_seen), [dirty_text(dirty), dirty_text(dirty)], "off: untouched");
+        proxy.compress_tool_results.store(true, Ordering::Relaxed);
+        send("m@sonnet");
+        assert_eq!(results(&other_seen), [cleaned.to_string(), dirty_text(dirty)], "on: a third-party route gets clean output, an error result stays");
+        send("m@sonnet");
+        let first = other_seen.lock().unwrap().last().map(|r| r.0.clone());
+        send("m@sonnet");
+        assert_eq!(first, other_seen.lock().unwrap().last().map(|r| r.0.clone()), "the same history is the same bytes every turn");
+        other_seen.lock().unwrap().clear();
+
+        send("claude-opus-5-5");
+        let (raw, _) = claude_seen.lock().unwrap().pop().unwrap();
+        assert_eq!(String::from_utf8(raw).unwrap(), body("claude-opus-5-5"), "Claude gets the very same bytes, flag on");
+    }
+
+    fn dirty_text(json_escaped: &str) -> String {
+        serde_json::from_str(&format!("\"{json_escaped}\"")).unwrap()
     }
 
     /// The official route sends Claude Code's request on exactly as it came: same bytes when nothing needs changing,

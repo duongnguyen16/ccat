@@ -96,6 +96,9 @@ struct Config {
     /// Routed requests never fall back to a custom endpoint (a paid API key); a tier's own primary still runs.
     /// Off by default.
     no_paid_fallback: bool,
+    /// Routed requests to third-party models get their tool results cleaned (ANSI, progress redraws, repeated
+    /// lines); never Claude. Off by default.
+    compress_tool_results: bool,
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
     show_fable: bool,
@@ -174,6 +177,7 @@ struct Launch {
     bypass: bool,
     fail_on_limit: bool,
     no_paid_fallback: bool,
+    compress_tool_results: bool,
 }
 
 /// Whether a launch goes through ccat's local proxy: anything but every tier on Claude with no fallback. Plain
@@ -755,6 +759,12 @@ fn no_paid_switch(ui: &mut egui::Ui, cfg: &mut Config) {
         .on_hover_text("A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT, MuseAI) and Ollama stay eligible. Routed sessions only.");
 }
 
+/// "Compress tool output (third-party models)", shared by both Settings copies.
+fn compress_switch(ui: &mut egui::Ui, cfg: &mut Config) {
+    switch(ui, &mut cfg.compress_tool_results, "Compress tool output (third-party models)")
+        .on_hover_text("Lossless cleanup of tool output before it goes to a third-party model: ANSI colours, progress-bar redraws, trailing spaces, runs of identical lines. Never on Claude, never on error results. Routed sessions only.");
+}
+
 /// Toggle switch + label; the whole row is the hit target.
 fn switch(ui: &mut egui::Ui, on: &mut bool, text: &str) -> egui::Response {
     let p = pal(ui);
@@ -1056,7 +1066,7 @@ impl App {
         self.cfg.recents.insert(0, self.folder.clone());
         self.cfg.recents.truncate(12);
         let (tiers, providers, claude_models) = (self.cfg.tiers.clone(), self.cfg.providers.clone(), self.cfg.claude_models.clone());
-        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback });
+        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback, compress_tool_results: self.cfg.compress_tool_results });
         ui.send_viewport_cmd(ViewportCommand::Close);
     }
 
@@ -1283,6 +1293,8 @@ impl App {
             self.cfg.fail_on_limit = !wait;
             ui.add_space(6.0);
             ui.horizontal(|ui| no_paid_switch(ui, &mut self.cfg));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| compress_switch(ui, &mut self.cfg));
             ui.add_space(10.0);
             usage::display_block(ui, &mut self.cfg);
         });
@@ -1753,7 +1765,7 @@ fn retarget(routes: &mut [proxy::Route], tiers: &[Route; 4], providers: &[Provid
 /// Watches the config while a routed session runs: a model switched in ccat (launcher or Settings) reaches this
 /// session's next request.
 fn follow_config(px: &proxy::Proxy) {
-    let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone(), px.no_paid_fallback.clone());
+    let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone(), px.no_paid_fallback.clone(), px.compress_tool_results.clone());
     let stamp = || fs::metadata(config_path()).and_then(|m| m.modified()).ok();
     let usage_stamp = || fs::metadata(config_path().with_file_name("usage.json")).and_then(|m| m.modified()).ok();
     let px = px.clone();
@@ -1785,6 +1797,7 @@ fn follow_config(px: &proxy::Proxy) {
             *chatgpt_models.write().unwrap() = gpt.map(|p| p.chatgpt_models.clone()).unwrap_or_default();
             fail_on_limit.store(cfg.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
             no_paid_fallback.store(cfg.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
+            compress_tool_results.store(cfg.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
             for (old, new) in routes.read().unwrap().iter().zip(&next) {
                 if (&old.upstream, &old.model, &old.fallbacks) != (&new.upstream, &new.model, &new.fallbacks) {
                     common::log(&format!("{} now runs {} on {:?}", old.tier, new.model, new.upstream)); // Debug names the provider, never its key
@@ -1837,6 +1850,7 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
                     *px.disabled.write().unwrap() = off_accounts(&l.providers);
                     px.fail_on_limit.store(l.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
                     px.no_paid_fallback.store(l.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
+                    px.compress_tool_results.store(l.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
                     // A request held at a usage limit can wait for hours: Claude Code mustn't give up on it after its
                     // usual 10 minutes. A timeout the user set stays.
                     if std::env::var_os("API_TIMEOUT_MS").is_none() {
@@ -2456,7 +2470,7 @@ mod tests {
     fn live_mixed_tiers() {
         let cfg = live_config();
         let tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
-        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false };
+        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false };
         let dir = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &dir).unwrap();
         assert!(p.routed && !p.env.iter().any(|(k, _)| *k == "ANTHROPIC_AUTH_TOKEN"), "official tiers keep the Claude login");
@@ -2503,7 +2517,7 @@ mod tests {
         let mut cfg = live_config();
         cfg.tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         save(&cfg, &serde_json::Value::Null).unwrap();
-        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false };
+        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false };
         let work = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &work).unwrap();
         let ask = || {
