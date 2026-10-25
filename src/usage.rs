@@ -20,7 +20,7 @@ pub const SETTINGS_FLAG: &str = "--ccat-settings";
 /// Set on a tray started by Restart: it waits for the old one to let go of the single-tray mutex.
 const RESTART_ENV: &str = "CCAT_TRAY_RESTART";
 
-/// The tray's Reload: each Antigravity account's plan asked again (in parallel), Codex's ChatGPT login re-read, then
+/// The tray's Reload: each Antigravity account's plan asked again (in parallel), then
 /// every usage source fetched. Running sessions follow the saved config.
 fn reload_all() {
     let (mut cfg, loaded) = crate::load();
@@ -34,9 +34,6 @@ fn reload_all() {
                 });
             }
         });
-    }
-    if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
-        crate::chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
     }
     let _ = crate::save(&cfg, &loaded);
     refresh(true, true, true, true, true);
@@ -942,7 +939,8 @@ pub fn run_tray() {
         let cfg = read_config();
         let accounts: Vec<antigravity::Account> = cfg.providers.iter().filter(|p| p.antigravity).flat_map(|p| p.accounts.clone()).collect();
         let ag = ag_view(u, &accounts, &cfg.usage_view, &cfg.ag_group);
-        let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on, !ag.is_empty(), ollama_active(&cfg), u.muse_on]);
+        // ChatGPT in Official mode answers with no numbers (see `fetch_chatgpt`): nothing to show a dial for.
+        let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty() || u.chatgpt.fetched == 0), !ag.is_empty(), ollama_active(&cfg), u.muse_on]);
         let size = win::icon_size();
         let icon = Icon::from_rgba(icon_pixels(size, &icon_dials(u, &src, &ag), win::light_taskbar(), now()), size, size).ok();
         (icon, tooltip(u, &src, &ag))
@@ -2099,7 +2097,7 @@ enum Tab {
 }
 
 /// A row of options in a sunken track, the chosen one raised. Returns whether the choice changed.
-pub(super) fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+pub(crate) fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
     segmented_layout(ui, cur, items, false)
 }
 

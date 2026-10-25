@@ -144,7 +144,7 @@ pub(crate) fn response_input(req: &Value, wrap: bool) -> Vec<Value> {
     out
 }
 
-/// Client tools as function tools (or inside one namespace when the API refused them bare); a web-search server tool as
+/// Client tools as function tools (inside one namespace on the official route, which takes them no other way); a web-search server tool as
 /// `web_search`; other server tools have no equivalent and are dropped.
 pub(crate) fn response_tools(req: &Value, wrap: bool) -> Vec<Value> {
     let tools = client_tools(req).as_array().cloned().unwrap_or_default();
@@ -168,29 +168,41 @@ pub(crate) fn response_tools(req: &Value, wrap: bool) -> Vec<Value> {
 
 /// The Responses request, built from scratch so no field of Claude Code's can leak through (the plan route rejects a
 /// list of them). Always `store: false` and `stream: true`; never a `service_tier` (fast mode is off on purpose).
-pub(crate) fn responses_body(req: &Value, model: &str, meta: Option<&chatgpt::ChatgptModel>, hints: &Hints, pool: &chatgpt::Pool, codex: bool) -> Value {
-    // What the official route refused is learned per process, but only that route is affected by it.
-    let wrap = pool.wrap.load(Ordering::Relaxed) && !codex;
+pub(crate) fn responses_body(req: &Value, model: &str, meta: Option<&chatgpt::ChatgptModel>, hints: &Hints, pool: &chatgpt::Pool, legacy: bool) -> Value {
+    // Official: function tools only inside a namespace, from the first request. Legacy (Codex) takes them bare.
+    let wrap = !legacy;
     let instructions = system_parts(req).iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n\n");
     let mut body = json!({
         "model": model, "instructions": instructions, "input": response_input(req, wrap), "store": false, "stream": true,
         "include": ["reasoning.encrypted_content"], "reasoning": { "effort": wanted_effort(req, meta), "summary": "auto" },
     });
-    let tools = response_tools(req, wrap);
+    let mut tools = response_tools(req, wrap);
     if !tools.is_empty() {
-        body["tools"] = json!(tools);
         let choice = &req["tool_choice"];
         body["tool_choice"] = match choice["type"].as_str() {
             Some("any") => json!("required"),
+            // ponytail: OpenAI's docs show no namespaced form of a forced function (`{type, name}` only), so on the
+            // official route the namespace is narrowed to the forced tool and the choice is `required`: same effect, no
+            // shape the API may refuse. Legacy takes the plain form.
+            Some("tool") if wrap => {
+                let only = |t: &Value| t["name"] == choice["name"];
+                let found = tools.iter().any(|t| t["type"] == "namespace" && t["tools"].as_array().is_some_and(|f| f.iter().any(only)));
+                if found {
+                    tools.retain(|t| t["type"] == "namespace");
+                    tools[0]["tools"] = json!(tools[0]["tools"].as_array().into_iter().flatten().filter(|t| only(t)).collect::<Vec<_>>());
+                }
+                json!("required")
+            }
             Some("tool") => json!({ "type": "function", "name": choice["name"] }),
             Some("none") => json!("none"),
             _ => json!("auto"),
         };
+        body["tools"] = json!(tools);
     }
-    if codex || !pool.no_cache_key.load(Ordering::Relaxed) {
+    if legacy || !pool.no_cache_key.load(Ordering::Relaxed) {
         body["prompt_cache_key"] = json!(hints.session);
     }
-    if codex {
+    if legacy {
         // The Codex client sends replayed items without their ids.
         for item in body["input"].as_array_mut().into_iter().flatten().filter(|i| i["type"] == "reasoning") {
             item.as_object_mut().map(|o| o.remove("id"));
@@ -223,13 +235,15 @@ pub(crate) fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &V
             });
             break;
         };
-        let payload = responses_body(body, model, meta.as_ref(), &hints, pool, acc.codex());
+        // The mode is read once per attempt: body, route and tool names must agree even if Settings flips it meanwhile.
+        let legacy = pool.legacy();
+        let payload = responses_body(body, model, meta.as_ref(), &hints, pool, legacy);
         // (what an unsupported_capability named, seconds to block the account, the failure)
-        let (refused, block, failure) = match pool.open(&acc, &payload, &hints.session) {
+        let (refused, block, failure) = match pool.open(&acc, &payload, &hints.session, legacy) {
             Err(d) => (d.param, d.block, d.failure),
             Ok(reader) => {
                 let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
-                tx.wrap = pool.wrap.load(Ordering::Relaxed) && !acc.codex();
+                tx.wrap = !legacy;
                 match tx.run_responses(reader) {
                     Ok(()) => {
                         let msg = tx.message();
@@ -250,12 +264,9 @@ pub(crate) fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &V
             }
         };
         common::log(&format!("{model} via {}: {} {}", acc.email, failure.status, failure.message));
-        // An optional field the plan route doesn't take: drop it for the rest of this process and try again.
-        let has_fns = payload["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "function"));
+        // An optional field the official API doesn't take: drop it for the rest of this process and try again.
         let flag = match refused.as_str() {
-            _ if acc.codex() => None,
-            p if p.contains("tools") && has_fns => Some(&pool.wrap),
-            p if p.contains("prompt_cache_key") => Some(&pool.no_cache_key),
+            p if !legacy && p.contains("prompt_cache_key") => Some(&pool.no_cache_key),
             _ => None,
         };
         if let Some(f) = flag.filter(|f| !f.load(Ordering::Relaxed)) {

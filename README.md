@@ -52,6 +52,7 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 - **Account pool with failover.** Add as many Google accounts as you like. Requests stick to one account and move to the next when Google reports quota exhaustion. Quota is tracked per model family (Gemini, Claude, GPT), so an account out of Claude quota still serves Gemini. Retry delays are read from Google's error.
 - **A provider per tier, switchable while it runs.** Fable, Opus, Sonnet and Haiku each pick their own `provider / model`: for example Fable and Opus on your official Claude login, Sonnet on Antigravity, Haiku on OpenRouter. Change a tier under **Settings → Models & tiers** and running sessions use it from their next request. Each tier can also have an ordered **fallback chain**, tried in turn when its provider is down or out of quota. A whole setup of the four tiers is a **configuration**: switch, duplicate, rename, import or delete them from the button above the tiers (in the launcher and in Settings); each is a small file in `%APPDATA%\ccat\profiles\`. Claude tiers keep Claude Code's own login and plan limits; the local proxy only forwards them. The provider pages (**Settings → Claude**, **Antigravity**, **ChatGPT**, **Ollama**, **MuseAI** and each endpoint) have an on/off switch: off hides it from the pickers and stops routing to it, live in running sessions.
 - **Routing safeguards.** **Settings → Routing** has *Wait out usage limits* (when every route and fallback of a request is at its limit, the request waits instead of failing; Esc still cancels) and *Never fall back to a paid API key* (custom endpoints are skipped as fallbacks; a tier's own first choice still runs). A circuit breaker skips a provider for 30 s after 3 consecutive 5xx or timeouts, then lets one request probe it; 429s never trip it, and if every route is skipped all of them are tried.
+- **Compact earlier on non-Claude models.** A tier shown under a Claude name gets that model's context window (often 1M), so Claude Code would only auto-compact near ~967k tokens and long sessions turn slow. **Settings → Routing** sets a size (default 200k, 128k to 400k, off with the switch) that ccat passes as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to routed sessions with such a tier. It applies at launch only, and your own `CLAUDE_CODE_AUTO_COMPACT_WINDOW` wins.
 - **Token saving.** **Settings → Token saving** has an opt-in *Compress tool output (third-party models)*: a lossless cleanup of Bash/PowerShell command output only (ANSI colours, progress redraws rendered like a terminal, trailing spaces, runs of identical lines). It is deterministic, so provider prompt caches keep hitting, and it never touches Claude, error results or file reads.
 - **Claude names for any model.** A non-official tier can be presented to Claude Code under a Claude model name. Claude Code then applies that model's catalog entry (context window, thinking), while the request still goes to the real model.
 - **Faithful translation.** Streaming and non-streaming Messages ↔ Cloud Code `streamGenerateContent`, thinking blocks and their signatures (safe across model switches and resumed sessions), and tool schemas normalized to what every Antigravity model family accepts.
@@ -72,7 +73,7 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Claude** (official)                      | Your normal Claude Code login. A tier left at Claude with Claude Code's pick changes nothing; all four there is plain `claude`.                                                                                     |
 | **Google Antigravity**                     | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs.            |
-| **ChatGPT**                                | Your ChatGPT Plus/Pro plan behind Claude Code: the GPT models Codex uses, signed in the way Codex signs in. See [ChatGPT](#chatgpt) and [ccat vs Codex](#ccat-vs-codex).                                         |
+| **ChatGPT**                                | Your ChatGPT Plus/Pro plan behind Claude Code: the GPT models Codex uses, through ccat's own Sign in with ChatGPT, in Official or Codex (Legacy) mode. See [ChatGPT](#chatgpt) and [ccat vs Codex](#ccat-vs-codex).                                         |
 | **Ollama**                                 | Run local models (Qwen, Llama, DeepSeek) through Ollama. ccat translates Anthropic Messages to Ollama's native `/api/chat` with a fixed 64k `num_ctx` and `keep_alive` 30m (the OpenAI-compatible API ignores both), effort mapped to low/medium/high thinking (models without thinking support are retried without it), and tool support. No key needed for a local Ollama. |
 | **MuseAI**                                 | Sign in with your MuseAI account in Chrome (the **+** under **Settings → MuseAI**). ccat bridges Anthropic Messages to Meta's Hatch VM Gateway with isolated sessions and buffered replies. |
 | **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. Claude Code's per-request billing line is stripped from the system prompt so the endpoint's prompt cache sees a stable prefix. |
@@ -81,11 +82,23 @@ Providers are connections: add, rename, turn off and delete them in **Settings**
 
 ## ChatGPT
 
-Use your ChatGPT plan, not an API key, for the GPT models. ccat shares **Codex CLI's login**: sign in with `codex login` (the **+** under **Settings → ChatGPT** opens a terminal for it) and that account shows up in ccat, with its plan. ccat reads Codex's `~/.codex/auth.json` fresh on every request and never refreshes, writes or signs it out — Codex keeps it fresh whenever it runs.
+Use your ChatGPT plan, not an API key, for the GPT models. ccat signs in **by itself**, with OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source): the **+** under **Settings → ChatGPT** opens your browser, you approve once, and ccat keeps and refreshes its own tokens (in `%APPDATA%\ccat\chatgpt`, never in `config.json`). It does not read or touch Codex CLI's `~/.codex` files, and your Codex login is not affected. If a sign-in is revoked or expires, ccat says so instead of retrying.
 
-Why not a sign-in of ccat's own: a second sign-in with Codex's login client makes OpenAI revoke the earlier sessions, which signs you out of Codex on every device. Sharing the one session avoids that. Requests go to the Codex backend (`chatgpt.com/backend-api/codex`), the way Codex CLI sends them; OpenAI doesn't officially support that for other apps, so it may change. If the login is revoked or expires, ccat says so ("run `codex login`") instead of retrying.
+One sign-in serves both modes, picked with the **Official / Codex (Legacy)** switch on the same page (followed live by running sessions):
 
-Usage: the ChatGPT section of the usage window shows the session (5 h) and weekly limits of that login, the same numbers Codex shows. **Manage usage** opens [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage).
+| | Official | Codex (Legacy) |
+| --- | --- | --- |
+| Endpoint | `api.openai.com/v1/responses`, documented by OpenAI for this sign-in | `chatgpt.com/backend-api/codex/responses`, the way Codex CLI sends requests; undocumented, so it may change |
+| Limits | Counts toward the per-app cap you set in ChatGPT settings → Usage | Your plan's own 5-hour and weekly limits |
+| Usage numbers in ccat | None: the usage window says so and links to [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage) | The session (5 h) and weekly bars, as Codex shows them |
+| Tools | Sent inside a namespace (the official route requires it) | Plain function tools, as Codex sends them |
+| Large requests | Sent as they are | zstd-compressed above 256 KiB, as Codex does |
+
+ccat first tries the same sign-in on the Codex backend. If that backend refuses it, the account shows **Codex (Legacy) needs its own sign-in**; the optional **Sign in for Codex (Legacy)** then signs in with Codex's own client. That second sign-in works only in Legacy mode, and OpenAI may sign Codex CLI out on your other devices when it is used, so it is never started unless you click it. Official mode keeps working with the first sign-in either way.
+
+Accounts an older ccat copied from Codex CLI stay in the list as **Codex CLI (legacy import)** but have no token any more; sign in with ChatGPT to replace them. A config with a Codex-client sign-in starts in Legacy mode; a new one, or one with only those leftover imports, in Official.
+
+Both modes send the Claude Code session as the cache key (`session-id`, `thread-id`, `prompt_cache_key`), so a session's turns share a prompt cache, and a conversation the model finds too long is answered as Claude Code's own "prompt is too long" so it compacts and goes on.
 
 ## ccat vs Codex
 
@@ -93,7 +106,7 @@ What Codex (the CLI / app) offers on a ChatGPT plan, and where ccat stands on ea
 
 | Capability                         |        Codex         |  ccat (Claude Code)  | Notes                                                                                   |
 | ---------------------------------- | :------------------: | :------------------: | --------------------------------------------------------------------------------------- |
-| GPT models on your ChatGPT plan    |          ✅          |          ✅          | Same list as Codex's model catalogue, display names included                            |
+| GPT models on your ChatGPT plan    |          ✅          |          ✅          | The list your account gets, display names included                                      |
 | Reasoning effort                   | ✅ low … max, ultra  |   ✅ low … max       | Claude Code's `/effort` maps 1:1; no effort = the model's Codex default. *Ultra* (Codex's own task delegation) isn't sent |
 | Fast mode (priority tier)          |          ✅          |          ➖          | Off on purpose: ccat never asks for the priority tier                                   |
 | Web search                         |          ✅          |          ✅          | Claude Code's `WebSearch` runs as the Responses `web_search` tool, with citations         |
@@ -101,7 +114,7 @@ What Codex (the CLI / app) offers on a ChatGPT plan, and where ccat stands on ea
 | Image generation                   |          ✅          |          ❌          | Not bridged yet                                                                          |
 | Reasoning carried across turns     |          ✅          |          ✅          | Encrypted reasoning is replayed; it never leaks to Anthropic routes                      |
 | Prompt caching                     |          ✅          |          ✅          | Keyed on the Claude Code session                                                         |
-| Usage limits (5 h / weekly)        |          ✅          |          ✅          | Usage window and tray dial                                                               |
+| Usage limits (5 h / weekly)        |          ✅          |   ✅ Legacy only     | Usage window and tray dial in Codex (Legacy) mode; Official has no numbers                                                            |
 | Fallback when ChatGPT is limited   |          ❌          |          ✅          | Fallbacks to Claude, Antigravity or any endpoint per tier                               |
 | Agent harness                      |     Codex agent      |    ✅ Claude Code    | Skills, hooks, plugins, subagents, MCP, plan mode                                        |
 | `AGENTS.md`, sandbox, approvals    |          ✅          |          ➖          | Claude Code's `CLAUDE.md`, permission modes and *Bypass permissions*                     |
