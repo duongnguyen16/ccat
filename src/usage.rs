@@ -189,7 +189,7 @@ pub fn parse_time(s: &str) -> u64 {
 }
 
 /// Days since 1970-01-01 of a date (Howard Hinnant's days_from_civil).
-fn civil_days(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn civil_days(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -198,7 +198,7 @@ fn civil_days(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// The date of a day number (civil_from_days).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -211,7 +211,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// The local calendar day of a unix time, as a day number.
-fn local_day(t: u64) -> i64 {
+pub(crate) fn local_day(t: u64) -> i64 {
     let (y, m, d) = local_date(t);
     civil_days(y, m, d)
 }
@@ -1130,7 +1130,7 @@ fn shrink(rgba: &[u8], w: usize, h: usize, to: usize) -> egui::ColorImage {
     egui::ColorImage::new([to, to], pixels)
 }
 
-fn icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
+pub(crate) fn icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
     let src = crate::app_icon();
     ctx.load_texture("ccat-icon", shrink(&src.rgba, src.width as usize, src.height as usize, 96), egui::TextureOptions::LINEAR)
 }
@@ -1566,7 +1566,7 @@ struct Stats {
     cells: HashMap<(i64, usize), u64>,
 }
 
-fn tokens_path() -> PathBuf {
+pub(crate) fn tokens_path() -> PathBuf {
     crate::config_path().with_file_name("tokens.jsonl")
 }
 
@@ -1742,19 +1742,36 @@ fn shade(i: usize, p: &crate::Pal) -> egui::Color32 {
 }
 
 /// "Oct 4" for a day number.
-fn day_label(day: i64) -> String {
+pub(crate) fn day_label(day: i64) -> String {
     let (_, m, d) = civil_from_days(day);
     let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m as usize).clamp(1, 12) - 1];
     format!("{month} {d}")
 }
 
-/// Stacked bars, one per day, with the day's breakdown on hover.
-fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
+/// What `bar_chart` draws: `count` stacked bars, `names.len()` stack layers, `value(bar, layer)` high.
+pub(crate) struct Bars<'a> {
+    pub count: usize,
+    pub names: &'a [String],
+    pub value: &'a dyn Fn(usize, usize) -> f64,
+    /// Axis and tooltip numbers.
+    pub fmt: &'a dyn Fn(f64) -> String,
+    /// A bar's label under the axis (only every `every`th, from `first`) and its tooltip heading.
+    pub label: &'a dyn Fn(usize) -> String,
+    pub title: &'a dyn Fn(usize) -> String,
+    pub every: usize,
+    pub first: usize,
+    pub color: &'a dyn Fn(usize, &crate::Pal) -> egui::Color32,
+}
+
+/// Stacked bars with a bar's breakdown on hover.
+pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
     let p = crate::pal(ui);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
-    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(34.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
-    let day_total = |d: i64| (0..st.keys.len()).map(|i| st.cells.get(&(d, i)).copied().unwrap_or(0)).sum::<u64>();
-    let max = (0..st.days).map(day_total).max().unwrap_or(0).max(1) as f64;
+    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(40.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
+    let keys = bars.names.len();
+    let bar_total = |d: usize| (0..keys).map(|i| (bars.value)(d, i)).sum::<f64>();
+    let max = (0..bars.count).map(bar_total).fold(0.0, f64::max);
+    let max = if max > 0.0 { max } else { 1.0 };
     // A round step: 1, 2 or 5 × 10^n, about four lines high.
     let raw = max / 4.0;
     let mag = 10f64.powf(raw.log10().floor());
@@ -1763,51 +1780,70 @@ fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
     let pt = ui.painter();
     let y_of = |v: f64| plot.bottom() - (v / top) as f32 * plot.height();
     let mut v = 0.0;
-    while v <= top + 0.5 {
+    while v <= top + step * 0.01 {
         let y = y_of(v);
         if v > 0.0 {
             pt.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, p.border));
         }
-        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt_tokens(v), egui::FontId::proportional(10.5), p.subtle);
+        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, (bars.fmt)(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    let slot = plot.width() / st.days as f32;
-    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as i64).clamp(0, st.days - 1));
-    // About four day labels, whatever the range.
-    let every = match st.days { 7 => 1, 30 => 7, _ => 14 };
-    for d in 0..st.days {
+    let slot = plot.width() / bars.count.max(1) as f32;
+    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count - 1));
+    for d in 0..bars.count {
         let x = plot.left() + slot * (d as f32 + 0.19);
         let mut base = 0.0;
-        for i in 0..st.keys.len() {
-            let n = st.cells.get(&(d, i)).copied().unwrap_or(0) as f64;
-            if n == 0.0 {
-                continue;
-            }
+        // Only the bar's outer ends are rounded: the segments meet square, with no gap.
+        let layers: Vec<usize> = (0..keys).filter(|&i| (bars.value)(d, i) > 0.0).collect();
+        for (pos, &i) in layers.iter().enumerate() {
+            let n = (bars.value)(d, i);
             let bar = egui::Rect::from_min_max(egui::pos2(x, y_of(base + n)), egui::pos2(x + slot * 0.62, y_of(base)));
-            let c = shade(i, p);
-            pt.rect_filled(bar, 1.5, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
+            let c = (bars.color)(i, p);
+            let (top, bottom) = (if pos + 1 == layers.len() { 2 } else { 0 }, if pos == 0 { 2 } else { 0 });
+            let radius = egui::CornerRadius { nw: top, ne: top, sw: bottom, se: bottom };
+            pt.rect_filled(bar, radius, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
             base += n;
         }
-        if d % every == 2 % every {
-            pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, day_label(st.first + d), egui::FontId::proportional(10.5), p.subtle);
+        if d % bars.every == bars.first % bars.every {
+            pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, (bars.label)(d), egui::FontId::proportional(10.5), p.subtle);
         }
     }
     if let Some(d) = hover {
-        let rows: Vec<(usize, u64)> = (0..st.keys.len()).filter_map(|i| st.cells.get(&(d, i)).map(|&n| (i, n))).filter(|(_, n)| *n > 0).collect();
+        let rows: Vec<(usize, f64)> = (0..keys).map(|i| (i, (bars.value)(d, i))).filter(|(_, n)| *n > 0.0).collect();
         resp.on_hover_ui_at_pointer(|ui| {
-            ui.label(egui::RichText::new(day_label(st.first + d)).strong().color(p.fg));
+            ui.label(egui::RichText::new((bars.title)(d)).strong().color(p.fg));
             if rows.is_empty() {
                 ui.label(egui::RichText::new("Nothing").color(p.subtle));
             }
             for (i, n) in rows {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 3.5, shade(i, p));
-                    ui.label(format!("{}: {}", st.keys[i].0, fmt_tokens(n as f64)));
+                    ui.painter().circle_filled(dot.center(), 3.5, (bars.color)(i, p));
+                    ui.label(format!("{}: {}", bars.names[i], (bars.fmt)(n)));
                 });
             }
         });
     }
+}
+
+/// The tray's and provider pages' chart: tokens per day, one layer per model or provider.
+fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
+    let names: Vec<String> = st.keys.iter().map(|k| k.0.clone()).collect();
+    let label = |d: usize| day_label(st.first + d as i64);
+    // About four day labels, whatever the range.
+    let every = match st.days { 7 => 1, 30 => 7, _ => 14 };
+    let bars = Bars {
+        count: st.days as usize,
+        names: &names,
+        value: &|d, i| st.cells.get(&(d as i64, i)).copied().unwrap_or(0) as f64,
+        fmt: &fmt_tokens,
+        label: &label,
+        title: &label,
+        every,
+        first: 2,
+        color: &shade,
+    };
+    bar_chart(ui, height, &bars);
 }
 
 /// The legend: each key's share, tokens in and out; the biggest six unless `more`.
@@ -1909,25 +1945,65 @@ pub fn fmt_cost(v: f64) -> String {
     }
 }
 
-/// One finished request: (unix time, model, provider, tokens in and out, cost in USD).
-type Call = (u64, String, String, u64, f64);
+/// One finished request, as the proxy logged it. Old lines have no `ms`, `stop` or `acct`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Call {
+    pub t: u64,
+    pub tier: String,
+    pub provider: String,
+    /// The model, as `pretty_model` names it.
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// What the tokens would cost on the API (subscription plans don't bill per token).
+    pub cost: f64,
+    /// How long the request took, when the line says.
+    pub ms: Option<u64>,
+    pub stop: String,
+    pub acct: String,
+}
+
+impl Call {
+    /// One `tokens.jsonl` record; `None` for one without a time. Fields it doesn't know are ignored.
+    pub(crate) fn parse(v: &Value, pricing: &Pricing) -> Option<Call> {
+        let t = v["t"].as_u64()?;
+        let n = |k: &str| v[k].as_u64().unwrap_or(0);
+        let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
+        let raw = v["model"].as_str().unwrap_or("?");
+        let (input, output, cache_read, cache_write) = (n("input"), n("output"), n("cache_read"), n("cache_write"));
+        Some(Call {
+            t,
+            tier: s("tier", ""),
+            provider: s("provider", "?"),
+            model: pretty_model(raw),
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cost: model_cost(pricing, raw, input, output, cache_read, cache_write),
+            ms: v["ms"].as_u64(),
+            stop: s("stop", ""),
+            acct: s("acct", ""),
+        })
+    }
+
+    /// Everything the request moved.
+    pub(crate) fn tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
 
 /// The proxy's requests since `since`, oldest first.
 fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
     let mut calls: Vec<Call> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            let t = v["t"].as_u64().filter(|t| *t >= since)?;
-            let n = |k: &str| v[k].as_u64().unwrap_or(0);
-            let (inp, out, cr, cw) = (n("input"), n("output"), n("cache_read"), n("cache_write"));
-            let tokens = inp + cr + cw + out;
-            let m_raw = v["model"].as_str().unwrap_or("?");
-            let cost = model_cost(pricing, m_raw, inp, out, cr, cw);
-            Some((t, pretty_model(m_raw), v["provider"].as_str().unwrap_or("?").to_string(), tokens, cost))
-        })
+        .filter_map(|v| Call::parse(&v, pricing))
+        .filter(|c| c.t >= since)
         .collect();
-    calls.sort_by_key(|c| c.0);
+    calls.sort_by_key(|c| c.t);
     calls
 }
 
@@ -1936,23 +2012,23 @@ fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
 fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
     let (start, w, n) = span;
     let key = |c: &Call| match by {
-        1 => c.1.clone(),
-        2 => c.2.clone(),
+        1 => c.model.clone(),
+        2 => c.provider.clone(),
         _ => "Total".to_string(),
     };
     let mut keys: Vec<(String, f64)> = Vec::new();
     let mut cells: Vec<(usize, String, f64)> = Vec::new();
-    for c in calls.iter().filter(|c| c.0 >= start && c.0 < start + w * n as u64) {
+    for c in calls.iter().filter(|c| c.t >= start && c.t < start + w * n as u64) {
         let (k, v) = (key(c), match metric {
             1 => 1.0,
-            2 => c.4,
-            _ => c.3 as f64,
+            2 => c.cost,
+            _ => c.tokens() as f64,
         });
         match keys.iter_mut().find(|x| x.0 == k) {
             Some(x) => x.1 += v,
             None => keys.push((k.clone(), v)),
         }
-        cells.push((((c.0 - start) / w) as usize, k, v));
+        cells.push((((c.t - start) / w) as usize, k, v));
     }
     keys.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let names: Vec<String> = keys.into_iter().map(|k| k.0).collect();
@@ -2019,7 +2095,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
         _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
     };
     let clip = pt.with_clip_rect(plot);
-    let running = |name: &str| calls.iter().rev().take_while(|c| c.0 + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.1 } else { &c.2 }) == name);
+    let running = |name: &str| calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { &c.provider }) == name);
     // Biggest first, so the smaller ones are drawn over it and stay visible.
     for (i, s) in series.iter().enumerate() {
         let c = hue(i, p);
@@ -2123,7 +2199,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
 }
 
 /// Live's colours: one clearly different hue per key, so a moving layer is easy to tell; the rest share a grey.
-fn hue(i: usize, p: &crate::Pal) -> egui::Color32 {
+pub(crate) fn hue(i: usize, p: &crate::Pal) -> egui::Color32 {
     [0x3c6fd6, 0xe08a2e, 0x3fa85f, 0x9a6ce0, 0x2ab3b0, 0xd65c8f].get(i).map_or(p.subtle, |&v| crate::hex(v))
 }
 

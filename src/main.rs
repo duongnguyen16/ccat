@@ -767,87 +767,35 @@ fn pick_row(ui: &mut egui::Ui, checked: bool, text: &str, mono: bool, tag: &str)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Btn {
-    Min,
-    Close,
+/// The launcher's minimize button: a thin dash that fills on hover.
+fn win_btn(ui: &mut egui::Ui) -> egui::Response {
+    icon_btn(ui, Icon::Minimize)
 }
 
-fn win_btn(ui: &mut egui::Ui, kind: Btn) -> egui::Response {
-    if kind == Btn::Min {
-        return icon_btn(ui, Icon::Minimize);
-    }
-    let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 34.0), Sense::click());
-    let (bg, fg) = match (resp.hovered(), kind) {
-        (true, Btn::Close) => (p.danger, Color32::WHITE),
-        (true, _) => (p.hover, p.fg),
-        _ => (Color32::TRANSPARENT, p.muted),
-    };
-    ui.painter().rect_filled(rect, 0.0, bg);
-    let (c, s, d) = (rect.center(), Stroke::new(1.0, fg), 4.5);
-    match kind {
-        Btn::Close => {
-            ui.painter().line_segment([c + vec2(-d, -d), c + vec2(d, d)], s);
-            ui.painter().line_segment([c + vec2(d, -d), c + vec2(-d, d)], s);
-        }
-        Btn::Min => {
-            ui.painter().line_segment([c + vec2(-d, 0.0), c + vec2(d, 0.0)], s);
-        }
-    }
-    resp
-}
-
-/// Chrome for a frameless window, `buttons` laid out right-to-left; returns the clicked titlebar button.
-/// Untitled (the launcher): no bar, margins around the body, and the height follows the content, so there is no dead
-/// space at the bottom. Titled (Settings): a bar with the title on the left and a rule under it, the body filling the
-/// rest edge to edge, and the size left to the user.
-fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mut egui::Ui)) -> Option<Btn> {
-    let titled = !title.is_empty();
+/// Chrome for the frameless launcher: no title bar, margins around the body, and the height follows the content, so
+/// there is no dead space at the bottom.
+fn window(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     const PAD: i8 = 14;
-    const BAR: f32 = 40.0;
     let p = pal(ui);
-    let mut clicked = None;
-    if titled {
-        egui::Panel::top(egui::Id::new(("titlebar", title)))
-            .exact_size(BAR)
-            .frame(egui::Frame::new().fill(p.bg))
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for &b in buttons {
-                            if win_btn(ui, b).clicked() {
-                                clicked = Some(b);
-                            }
-                        }
-                        let rest = ui.available_rect_before_wrap();
-                        if ui.interact(rest, ui.id().with("drag"), Sense::drag()).drag_started() {
-                            ui.send_viewport_cmd(ViewportCommand::StartDrag);
-                        }
-                        ui.painter().text(rest.left_center() + vec2(18.0, 0.0), Align2::LEFT_CENTER, title, FontId::new(18.0, serif()), p.fg);
-                    });
-                });
-            });
-    }
-    let margin = if titled { egui::Margin::ZERO } else { egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD } };
+    let margin = egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD };
     let mut used = 0.0;
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
         used = ui.scope(body).response.rect.height();
     });
-
+    // Not resizable, so the window simply follows its content.
     let screen = ui.ctx().content_rect();
-    if !titled {
-        // Not resizable, so the window simply follows its content.
-        let want = (4.0 + PAD as f32 + used).ceil();
-        if (screen.height() - want).abs() > 1.0 {
-            ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
-        }
+    let want = (4.0 + PAD as f32 + used).ceil();
+    if (screen.height() - want).abs() > 1.0 {
+        ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
     }
-    ui.ctx()
-        .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("outline")))
-        .rect_stroke(screen, 0.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
-    clicked
+    outline(ui);
+}
+
+/// The thin border a frameless window draws round itself.
+fn outline(ui: &egui::Ui) {
+    let (p, ctx) = (pal(ui), ui.ctx());
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("outline")))
+        .rect_stroke(ctx.content_rect(), 0.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
 }
 
 /// Toggle switch + label; the whole row is the hit target.
@@ -1154,7 +1102,7 @@ impl App {
             }
             ui.add(egui::Image::new(self.logo.as_ref().unwrap()).fit_to_exact_size(vec2(30.0, 30.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if win_btn(ui, Btn::Min).on_hover_text("Minimize").clicked() {
+                if win_btn(ui).on_hover_text("Minimize").clicked() {
                     ui.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
                 if icon_btn(ui, Icon::Settings).on_hover_text("Settings").clicked() {
@@ -1318,7 +1266,7 @@ impl eframe::App for App {
         if !self.profile.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
             ui.send_viewport_cmd(ViewportCommand::Close);
         }
-        window(ui, "", &[], |ui| self.launch_tab(ui, frame));
+        window(ui, |ui| self.launch_tab(ui, frame));
         let typing = ui.ctx().egui_wants_keyboard_input();
         if !typing && !self.profile.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
             self.launch(ui);

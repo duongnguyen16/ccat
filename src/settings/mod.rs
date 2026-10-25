@@ -3,10 +3,13 @@
 //! frame it is made, so running ccat sessions follow within seconds, and what another process saves shows up here.
 //! One window at a time: asking again brings the open one to the front (`open_settings`).
 
+mod glyph;
+mod insights;
 pub(crate) mod providers;
 
 use crate::providers::{antigravity, chatgpt, claude, endpoint, museai, ollama, Kind};
-use crate::{pal, popup_frame, switch, usage, Btn, Config, Disk, TierEditor};
+use crate::{pal, popup_frame, switch, usage, Config, Disk, TierEditor};
+use glyph::Glyph;
 use eframe::egui::{self, vec2, Align, Align2, FontId, Key, Layout, RichText, Sense, TextEdit};
 use providers::ProvidersEditor;
 use std::time::Duration;
@@ -14,8 +17,12 @@ use std::time::Duration;
 /// The window's title, which is also how a second request finds the first (see `win::raise`).
 pub(crate) const TITLE: &str = "ccat Settings";
 const NAV_W: f32 = 220.0;
-/// The widest the page's text and rows go, however wide the window.
+/// The widest the page's text and rows go, however wide the window; the tables of Analytics and History get more.
 const PANE_W: f32 = 720.0;
+const WIDE_W: f32 = 980.0;
+/// The window's top strip, free of content: it drags the window, and the close button sits in its corner.
+const TOP_STRIP: f32 = 44.0;
+const CLOSE: f32 = 28.0;
 /// The tier editor's width: its selectors read better narrower than the pane.
 const TIERS_W: f32 = 560.0;
 /// Kept free at the pane's right, so switches and percentages never touch the scrollbar.
@@ -28,6 +35,8 @@ enum Page {
     Tokens,
     Display,
     About,
+    Analytics,
+    History,
     Claude,
     Antigravity,
     ChatGpt,
@@ -42,6 +51,7 @@ enum Page {
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
     General,
+    Insights,
     Providers,
 }
 
@@ -50,25 +60,35 @@ struct Item {
     group: Group,
     page: Page,
     label: String,
+    glyph: Glyph,
     /// The provider is turned off.
     off: bool,
 }
 
 /// The sidebar's entries for `cfg`: the settings pages, then Claude, the built-in providers and each endpoint.
 fn items(cfg: &Config) -> Vec<Item> {
-    let general = |page, label: &str| Item { group: Group::General, page, label: label.into(), off: false };
-    let mut v = vec![general(Page::Models, "Models & tiers"), general(Page::Routing, "Routing"), general(Page::Tokens, "Token saving"), general(Page::Display, "Display"), general(Page::About, "About")];
-    let provider = |page, label: &str, off| Item { group: Group::Providers, page, label: label.into(), off };
-    v.push(provider(Page::Claude, "Claude", cfg.claude_off));
-    for (kind, page) in [(Kind::Antigravity, Page::Antigravity), (Kind::ChatGpt, Page::ChatGpt), (Kind::Ollama, Page::Ollama), (Kind::Muse, Page::Muse)] {
+    let item = |group, page, label: &str, glyph, off| Item { group, page, label: label.into(), glyph, off };
+    let general = |page, label: &str, glyph| item(Group::General, page, label, glyph, false);
+    let mut v = vec![
+        general(Page::Models, "Models & tiers", Glyph::Sliders),
+        general(Page::Routing, "Routing", Glyph::Route),
+        general(Page::Tokens, "Token saving", Glyph::Leaf),
+        general(Page::Display, "Display", Glyph::Monitor),
+        general(Page::About, "About", Glyph::Info),
+        item(Group::Insights, Page::Analytics, "Analytics", Glyph::Bars, false),
+        item(Group::Insights, Page::History, "History", Glyph::Clock, false),
+    ];
+    let provider = |page, label: &str, glyph, off| item(Group::Providers, page, label, glyph, off);
+    v.push(provider(Page::Claude, "Claude", Glyph::Claude, cfg.claude_off));
+    for (kind, page, glyph) in [(Kind::Antigravity, Page::Antigravity, Glyph::Antigravity), (Kind::ChatGpt, Page::ChatGpt, Glyph::ChatGpt), (Kind::Ollama, Page::Ollama, Glyph::Ollama), (Kind::Muse, Page::Muse, Glyph::Muse)] {
         if let Some(p) = cfg.providers.iter().find(|p| p.kind() == kind) {
-            v.push(provider(page, &p.name, p.disabled));
+            v.push(provider(page, &p.name, glyph, p.disabled));
         }
     }
     for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::Endpoint) {
-        v.push(provider(Page::Endpoint(i), &p.name, p.disabled));
+        v.push(provider(Page::Endpoint(i), &p.name, Glyph::Link, p.disabled));
     }
-    v.push(provider(Page::Add, "+ Add endpoint", false));
+    v.push(provider(Page::Add, "+ Add endpoint", Glyph::Plus, false));
     v
 }
 
@@ -296,7 +316,7 @@ fn setting_row(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, contr
 }
 
 /// A sidebar row: the selected one is a filled, rounded row.
-fn nav_item(ui: &mut egui::Ui, text: &str, selected: bool, off: bool) -> egui::Response {
+fn nav_item(ui: &mut egui::Ui, text: &str, glyph: Glyph, selected: bool, off: bool) -> egui::Response {
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if selected {
@@ -306,7 +326,9 @@ fn nav_item(ui: &mut egui::Ui, text: &str, selected: bool, off: bool) -> egui::R
     }
     let color = if selected || !off { p.fg } else { p.muted };
     let right = if off { 38.0 } else { 10.0 };
-    ui.painter().with_clip_rect(rect.with_max_x(rect.right() - right)).text(rect.left_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), color);
+    // The icon and the label share the row's centre line, whatever the font's metrics.
+    glyph::paint(ui.painter(), rect.left_center() + vec2(20.0, 0.0), glyph, color);
+    ui.painter().with_clip_rect(rect.with_max_x(rect.right() - right)).text(rect.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), color);
     if off {
         ui.painter().text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, "off", FontId::proportional(11.0), p.subtle);
     }
@@ -326,11 +348,15 @@ struct Settings {
     providers: ProvidersEditor,
     /// `usage.json` as the provider pages' limits blocks show it.
     feed: usage::Feed,
+    /// The Analytics and History pages' log and filters.
+    insights: insights::Insights,
+    /// The logo at the top of the sidebar, loaded on first draw.
+    logo: Option<egui::TextureHandle>,
 }
 
 impl Settings {
     fn new(cfg: Config, loaded: serde_json::Value) -> Self {
-        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new() }
+        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new(), insights: insights::Insights::new(), logo: None }
     }
 
     /// Takes in what another process saved (the launcher, a second Settings, a session's model switch), unless
@@ -368,18 +394,30 @@ impl Settings {
             .resizable(false)
             .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 12, right: 12, top: 14, bottom: 8 }))
             .show(ui, |ui| self.sidebar(ui));
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 32, right: 24, top: 18, bottom: 8 })).show(ui, |ui| self.pane(ui, frame));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 32, right: 24, top: 0, bottom: 8 })).show(ui, |ui| {
+            // The strip above the page drags the window; the close button floats over its right end.
+            let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), TOP_STRIP), Sense::hover());
+            drag_window(ui, strip, "pane-drag");
+            self.pane(ui, frame);
+        });
+        close_button(ui);
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui);
+        // The logo: the window has no title bar, so this corner drags it.
+        let logo = self.logo.get_or_insert_with(|| usage::icon_texture(ui.ctx())).clone();
+        let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        egui::Image::new(&logo).fit_to_exact_size(vec2(28.0, 28.0)).paint_at(ui, egui::Rect::from_min_size(strip.min + vec2(6.0, 0.0), vec2(28.0, 28.0)));
+        drag_window(ui, strip, "logo-drag");
+        ui.add_space(12.0);
         ui.add(TextEdit::singleline(&mut self.query).hint_text("Search").desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 6)));
         let all = items(&self.cfg);
         let mut go = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let shown = filter(&all, &self.query);
-            for (group, caption) in [(Group::General, "General"), (Group::Providers, "Providers")] {
+            for (group, caption) in [(Group::General, "General"), (Group::Insights, "Insights"), (Group::Providers, "Providers")] {
                 let mine: Vec<&&Item> = shown.iter().filter(|i| i.group == group).collect();
                 if mine.is_empty() {
                     continue;
@@ -388,7 +426,7 @@ impl Settings {
                 ui.label(RichText::new(caption).size(11.5).color(p.subtle));
                 ui.add_space(2.0);
                 for it in mine {
-                    if nav_item(ui, &it.label, it.page == self.page, it.off).clicked() {
+                    if nav_item(ui, &it.label, it.glyph, it.page == self.page, it.off).clicked() {
                         go = Some(it.page.clone());
                     }
                 }
@@ -411,7 +449,8 @@ impl Settings {
             }
         }
         egui::ScrollArea::vertical().id_salt(format!("{:?}", self.page)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width((ui.available_width() - SCROLL_GAP).min(PANE_W));
+            let wide = matches!(self.page, Page::Analytics | Page::History);
+            ui.set_max_width((ui.available_width() - SCROLL_GAP).min(if wide { WIDE_W } else { PANE_W }));
             match self.page.clone() {
                 Page::Models => self.models(ui, frame),
                 Page::Routing => self.routing(ui),
@@ -421,6 +460,8 @@ impl Settings {
                     group(ui, |ui, g| usage::display_block(ui, g, &mut self.cfg));
                 }
                 Page::About => self.about(ui),
+                Page::Analytics => self.insights.analytics(ui),
+                Page::History => self.insights.history(ui),
                 Page::Claude => claude::page(ui, &mut self.cfg, &self.feed),
                 Page::Antigravity => antigravity::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::ChatGpt => chatgpt::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
@@ -547,9 +588,9 @@ impl eframe::App for Settings {
                 self.query.clear();
             }
         }
-        if crate::window(ui, "Settings", &[Btn::Close], |ui| self.layout(ui, frame)) == Some(Btn::Close) {
-            ui.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+        // No title bar: the layout draws the logo, the drag strips and the close button itself.
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal(ui).bg)).show(ui, |ui| self.layout(ui, frame));
+        crate::outline(ui);
         resize_zones(ui);
         if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
             self.save();
@@ -561,6 +602,34 @@ impl eframe::App for Settings {
                 usage::refresh_chatgpt();
             });
         }
+    }
+}
+
+/// `rect` drags the window (the title bar's job, which Settings does not have).
+fn drag_window(ui: &mut egui::Ui, rect: egui::Rect, id: &str) {
+    if ui.interact(rect, ui.id().with(id), Sense::drag()).drag_started() {
+        ui.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+/// The close button: a round target with a thin X, floating at the window's top-right corner over whatever scrolls
+/// under it.
+fn close_button(ui: &mut egui::Ui) {
+    let p = pal(ui);
+    let area = egui::Area::new(egui::Id::new("settings-close")).order(egui::Order::Foreground).anchor(Align2::RIGHT_TOP, vec2(-10.0, 8.0)).show(ui.ctx(), |ui| {
+        let (rect, resp) = ui.allocate_exact_size(vec2(CLOSE, CLOSE), Sense::click());
+        if resp.hovered() {
+            ui.painter().circle_filled(rect.center(), CLOSE / 2.0, p.hover);
+        }
+        let (c, d, color) = (rect.center(), 4.5, if resp.hovered() { p.fg } else { p.muted });
+        let stroke = egui::Stroke::new(1.2, color);
+        ui.painter().line_segment([c + vec2(-d, -d), c + vec2(d, d)], stroke);
+        ui.painter().line_segment([c + vec2(d, -d), c + vec2(-d, d)], stroke);
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close"));
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+    if area.inner.clicked() {
+        ui.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 
@@ -726,9 +795,10 @@ mod tests {
         assert_eq!(labels(&filter(&all, "tier")), ["Models & tiers"]);
         assert!(filter(&all, "zzz").is_empty());
         let names: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(names[..5], ["Models & tiers", "Routing", "Token saving", "Display", "About"]);
-        assert_eq!(names[5..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "+ Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!(names[..7], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Analytics", "History"]);
+        assert_eq!(names[7..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "+ Add endpoint"], "Claude, the built-ins, then endpoints by name");
         assert_eq!(Page::parse("models", &cfg), Some(Page::Models), "the first word of a label is enough");
+        assert_eq!((Page::parse("analytics", &cfg), Page::parse("History", &cfg)), (Some(Page::Analytics), Some(Page::History)));
         assert_eq!(Page::parse("openrouter", &cfg), Some(Page::Endpoint(4)));
         assert_eq!(Page::parse("add", &cfg), None);
     }

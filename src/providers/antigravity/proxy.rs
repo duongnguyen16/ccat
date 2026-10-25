@@ -3,7 +3,7 @@
 
 use crate::common::{self, Failure};
 use crate::providers::antigravity::{self, family};
-use crate::proxy::http::{record, respond, respond_error};
+use crate::proxy::http::{record, respond, respond_error, Meta};
 use crate::proxy::sse::{blocks, client_tools, tag, tool_result_text, untag, Stop, Tx};
 use crate::proxy::{system_parts, web_search, Ctx, Fail, SEARCH_MODEL};
 use serde_json::{json, Map, Value};
@@ -66,6 +66,7 @@ pub(crate) fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, m
         return Ok(());
     }
     let model = if web_search(req).is_some() && family(&model) != "gemini" { SEARCH_MODEL.to_string() } else { model };
+    let started = std::time::Instant::now();
     let stream = req["stream"].as_bool().unwrap_or(false);
     let (cca, beta) = build(req, &model, ctx);
     let mut last = None;
@@ -84,7 +85,7 @@ pub(crate) fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, m
                 let msg = tx.message();
                 let prompt = tx.usage.0;
                 drop(tx);
-                record(tier, "Antigravity", &model, &msg["usage"]);
+                record(tier, "Antigravity", &model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: &ctx.pool.alias(i) });
                 // Search answers carry Google's page text, which the request never had: they'd skew the ratio.
                 if web_search(req).is_none() {
                     ctx.learn(family(&model), req, prompt);

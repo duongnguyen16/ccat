@@ -4,7 +4,7 @@
 
 use crate::common::{self, Failure};
 use crate::providers::antigravity::proxy::messages;
-use crate::proxy::http::{record, respond, respond_error, Req};
+use crate::proxy::http::{record, respond, respond_error, Meta, Req};
 use crate::proxy::sse::{Stop, Tx};
 use crate::proxy::{Ctx, Fail, SEARCH_MODEL};
 use serde_json::{json, Value};
@@ -583,6 +583,7 @@ pub(crate) fn ollama_messages(
         }
     }
 
+    let started = std::time::Instant::now();
     let mut payload = crate::providers::ollama::chat_body(body, model, true);
     if NO_THINK.lock().unwrap().contains(model) {
         payload.as_object_mut().map(|o| o.remove("think"));
@@ -616,7 +617,7 @@ pub(crate) fn ollama_messages(
             let msg = tx.message();
             let prompt = tx.usage.0;
             drop(tx);
-            record(tier, crate::providers::OLLAMA_NAME, model, &msg["usage"]);
+            record(tier, crate::providers::OLLAMA_NAME, model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: "" });
             ctx.learn("ollama", body, prompt);
             if !stream {
                 respond(s, 200, &msg, "");
