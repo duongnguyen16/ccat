@@ -568,6 +568,8 @@ impl Disk {
 struct Pal {
     bg: Color32,
     surface: Color32,
+    /// A settings card's fill: lifted a little off `bg`, which the light theme's `surface` is not.
+    card: Color32,
     hover: Color32,
     sunken: Color32,
     border: Color32,
@@ -577,6 +579,17 @@ struct Pal {
     subtle: Color32,
     accent: Color32,
     danger: Color32,
+    /// Settings: the fill of a text field or a selector, a button, and a button's hover.
+    field: Color32,
+    btn: Color32,
+    btn_hover: Color32,
+    /// A primary button's fill, a segmented control's raised segment, and a dropdown's floating panel and its rows.
+    strong: Color32,
+    pill: Color32,
+    pop: Color32,
+    item: Color32,
+    /// The check mark of a chosen item, and a focused field's outline.
+    blue: Color32,
 }
 
 const fn hex(v: u32) -> Color32 {
@@ -584,14 +597,18 @@ const fn hex(v: u32) -> Color32 {
 }
 
 const DARK: Pal = Pal {
-    bg: hex(0x1a1a19), surface: hex(0x212120), hover: hex(0x2b2b29), sunken: hex(0x161615),
+    bg: hex(0x1a1a19), surface: hex(0x212120), card: hex(0x212120), hover: hex(0x2b2b29), sunken: hex(0x161615),
     border: hex(0x302f2d), border_strong: hex(0x454440), fg: hex(0xf0eee6), muted: hex(0xa8a59c),
     subtle: hex(0x8a8780), accent: hex(0xd97757), danger: hex(0xe5726a),
+    field: hex(0x2c2b29), btn: hex(0x363532), btn_hover: hex(0x403f3b), strong: hex(0x4a4944), pill: hex(0x45443f),
+    pop: hex(0x2a2a28), item: hex(0x3a3936), blue: hex(0x5b9cf5),
 };
 const LIGHT: Pal = Pal {
-    bg: hex(0xffffff), surface: hex(0xffffff), hover: hex(0xedebe5), sunken: hex(0xfaf9f7),
+    bg: hex(0xffffff), surface: hex(0xffffff), card: hex(0xf5f3ee), hover: hex(0xedebe5), sunken: hex(0xfaf9f7),
     border: hex(0xe6e4de), border_strong: hex(0xd2cfc7), fg: hex(0x191817), muted: hex(0x63605a),
     subtle: hex(0x6e6b63), accent: hex(0xbd5d3c), danger: hex(0xc0392b),
+    field: hex(0xebe8e1), btn: hex(0xe4e1d9), btn_hover: hex(0xd9d6cd), strong: hex(0xcfcbc1), pill: hex(0xffffff),
+    pop: hex(0xffffff), item: hex(0xefece6), blue: hex(0x2f6fd6),
 };
 
 fn pal(ui: &egui::Ui) -> &'static Pal {
@@ -687,119 +704,98 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.5).color(p.subtle));
 }
 
+/// A thin down chevron centred on `c`.
+fn chevron(ui: &egui::Ui, c: egui::Pos2, color: Color32) {
+    ui.painter().add(egui::Shape::line(vec![c + vec2(-4.5, -2.0), c + vec2(0.0, 2.5), c + vec2(4.5, -2.0)], Stroke::new(1.4, color)));
+}
+
+/// A check mark centred on `c`.
+fn check(ui: &egui::Ui, c: egui::Pos2, color: Color32) {
+    ui.painter().add(egui::Shape::line(vec![c + vec2(-5.0, 0.5), c + vec2(-1.8, 3.8), c + vec2(5.0, -3.5)], Stroke::new(1.8, color)));
+}
+
+/// A selector field: a rounded fill, the value on the left, a chevron on the right; no border. `mono` sets the value in
+/// the monospace font (model ids), `muted` in the placeholder's grey.
+fn field_btn(ui: &mut egui::Ui, width: f32, text: &str, mono: bool, muted: bool) -> egui::Response {
+    let p = pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, ui.spacing().interact_size.y), Sense::click());
+    let fill = if resp.hovered() || resp.has_focus() { p.btn } else { p.field };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    let (font, color) = match (mono, muted) {
+        (_, true) => (FontId::proportional(13.0), p.subtle),
+        (true, _) => (FontId::monospace(12.0), p.fg),
+        _ => (FontId::proportional(13.0), p.fg),
+    };
+    let text_rect = rect.shrink2(vec2(12.0, 0.0));
+    ui.painter().with_clip_rect(text_rect.with_max_x(text_rect.max.x - 20.0)).text(text_rect.left_center(), Align2::LEFT_CENTER, text, font, color);
+    chevron(ui, egui::pos2(rect.right() - 16.0, rect.center().y), p.muted);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Full-width select-looking button: value on the left, chevron on the right.
 fn picker_btn(ui: &mut egui::Ui, width: f32, text: &str, placeholder: bool) -> egui::Response {
-    let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
-    let w = ui.style().interact(&resp);
-    ui.painter().rect(rect, 6.0, p.sunken, w.bg_stroke, StrokeKind::Inside);
-    let (font, color) = if placeholder { (FontId::proportional(13.0), p.subtle) } else { (FontId::monospace(12.0), p.fg) };
-    let text_rect = rect.shrink2(vec2(10.0, 0.0));
-    ui.painter().with_clip_rect(text_rect.with_max_x(text_rect.max.x - 14.0)).text(text_rect.left_center(), Align2::LEFT_CENTER, text, font, color);
-    ui.painter().text(text_rect.right_center(), Align2::RIGHT_CENTER, "⏷", FontId::proportional(10.0), p.subtle);
-    resp
+    field_btn(ui, width, text, !placeholder, placeholder)
 }
 
-/// Frameless list row for the model picker.
+/// A floating list's panel: rounded, lifted off the page, a soft shadow, no border.
+fn popup_frame(p: &Pal) -> egui::Frame {
+    egui::Frame::new()
+        .fill(p.pop)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(8))
+        .shadow(egui::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(90) })
+}
+
+/// Frameless list row of a floating list: the chosen one (and the hovered one) on a lighter rounded fill, the chosen
+/// one with a blue check on the right, after the `tag`.
 fn pick_row(ui: &mut egui::Ui, checked: bool, text: &str, mono: bool, tag: &str) -> egui::Response {
     let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
-    if resp.hovered() || resp.has_focus() {
-        ui.painter().rect_filled(rect, 5.0, p.hover);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    if checked || resp.hovered() || resp.has_focus() {
+        ui.painter().rect_filled(rect, 7.0, p.item);
     }
-    let r = rect.shrink2(vec2(8.0, 0.0));
-    if checked {
-        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, "✔", FontId::proportional(11.0), p.accent);
-    }
+    let r = rect.shrink2(vec2(10.0, 0.0));
     let font = if mono { FontId::monospace(12.0) } else { FontId::proportional(13.0) };
-    ui.painter().with_clip_rect(r.with_max_x(r.max.x - 60.0)).text(r.left_center() + vec2(18.0, 0.0), Align2::LEFT_CENTER, text, font, p.fg);
+    let reserved = if tag.is_empty() { 26.0 } else { 72.0 };
+    ui.painter().with_clip_rect(r.with_max_x(r.max.x - reserved)).text(r.left_center(), Align2::LEFT_CENTER, text, font, p.fg);
     if !tag.is_empty() {
-        ui.painter().text(r.right_center(), Align2::RIGHT_CENTER, tag, FontId::proportional(11.0), p.subtle);
+        ui.painter().text(r.right_center() - vec2(24.0, 0.0), Align2::RIGHT_CENTER, tag, FontId::proportional(11.0), p.subtle);
     }
-    resp
+    if checked {
+        check(ui, egui::pos2(r.right() - 6.0, r.center().y), p.blue);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Btn {
-    Min,
-    Close,
+/// The launcher's minimize button: a thin dash that fills on hover.
+fn win_btn(ui: &mut egui::Ui) -> egui::Response {
+    icon_btn(ui, Icon::Minimize)
 }
 
-fn win_btn(ui: &mut egui::Ui, kind: Btn) -> egui::Response {
-    if kind == Btn::Min {
-        return icon_btn(ui, Icon::Minimize);
-    }
-    let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 34.0), Sense::click());
-    let (bg, fg) = match (resp.hovered(), kind) {
-        (true, Btn::Close) => (p.danger, Color32::WHITE),
-        (true, _) => (p.hover, p.fg),
-        _ => (Color32::TRANSPARENT, p.muted),
-    };
-    ui.painter().rect_filled(rect, 0.0, bg);
-    let (c, s, d) = (rect.center(), Stroke::new(1.0, fg), 4.5);
-    match kind {
-        Btn::Close => {
-            ui.painter().line_segment([c + vec2(-d, -d), c + vec2(d, d)], s);
-            ui.painter().line_segment([c + vec2(d, -d), c + vec2(-d, d)], s);
-        }
-        Btn::Min => {
-            ui.painter().line_segment([c + vec2(-d, 0.0), c + vec2(d, 0.0)], s);
-        }
-    }
-    resp
-}
-
-/// Chrome for a frameless window, `buttons` laid out right-to-left; returns the clicked titlebar button.
-/// Untitled (the launcher): no bar, margins around the body, and the height follows the content, so there is no dead
-/// space at the bottom. Titled (Settings): a bar with the title on the left and a rule under it, the body filling the
-/// rest edge to edge, and the size left to the user.
-fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mut egui::Ui)) -> Option<Btn> {
-    let titled = !title.is_empty();
+/// Chrome for the frameless launcher: no title bar, margins around the body, and the height follows the content, so
+/// there is no dead space at the bottom.
+fn window(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     const PAD: i8 = 14;
-    const BAR: f32 = 40.0;
     let p = pal(ui);
-    let mut clicked = None;
-    if titled {
-        egui::Panel::top(egui::Id::new(("titlebar", title)))
-            .exact_size(BAR)
-            .frame(egui::Frame::new().fill(p.bg))
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for &b in buttons {
-                            if win_btn(ui, b).clicked() {
-                                clicked = Some(b);
-                            }
-                        }
-                        let rest = ui.available_rect_before_wrap();
-                        if ui.interact(rest, ui.id().with("drag"), Sense::drag()).drag_started() {
-                            ui.send_viewport_cmd(ViewportCommand::StartDrag);
-                        }
-                        ui.painter().text(rest.left_center() + vec2(18.0, 0.0), Align2::LEFT_CENTER, title, FontId::new(18.0, serif()), p.fg);
-                    });
-                });
-            });
-    }
-    let margin = if titled { egui::Margin::ZERO } else { egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD } };
+    let margin = egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD };
     let mut used = 0.0;
     egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
         used = ui.scope(body).response.rect.height();
     });
-
+    // Not resizable, so the window simply follows its content.
     let screen = ui.ctx().content_rect();
-    if !titled {
-        // Not resizable, so the window simply follows its content.
-        let want = (4.0 + PAD as f32 + used).ceil();
-        if (screen.height() - want).abs() > 1.0 {
-            ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
-        }
+    let want = (4.0 + PAD as f32 + used).ceil();
+    if (screen.height() - want).abs() > 1.0 {
+        ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
     }
-    ui.ctx()
-        .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("outline")))
-        .rect_stroke(screen, 0.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
-    clicked
+    outline(ui);
+}
+
+/// The thin border a frameless window draws round itself.
+fn outline(ui: &egui::Ui) {
+    let (p, ctx) = (pal(ui), ui.ctx());
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("outline")))
+        .rect_stroke(ctx.content_rect(), 0.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
 }
 
 /// Toggle switch + label; the whole row is the hit target.
@@ -841,10 +837,11 @@ enum Icon {
     Minimize,
 }
 
-/// 28×28 icon button, drawn with strokes (no icon font): fill only on hover.
+/// 28×28 icon button, drawn with strokes (no icon font): fill only on hover (the style's, so rounder in Settings).
 fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+    let size = 28.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let hot = resp.hovered() || resp.has_focus();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), match icon {
         Icon::New => "New", Icon::Delete => "Delete", Icon::GitHub => "GitHub", Icon::Reload => "Reload",
@@ -852,7 +849,8 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     }));
     let danger = matches!(icon, Icon::Delete);
     if hot {
-        ui.painter().rect_filled(rect, 6.0, p.hover);
+        let w = &ui.visuals().widgets;
+        ui.painter().rect_filled(rect, w.hovered.corner_radius, w.hovered.weak_bg_fill);
     }
     let color = match (hot, danger) {
         _ if matches!(icon, Icon::Save) => p.accent,
@@ -1104,7 +1102,7 @@ impl App {
             }
             ui.add(egui::Image::new(self.logo.as_ref().unwrap()).fit_to_exact_size(vec2(30.0, 30.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if win_btn(ui, Btn::Min).on_hover_text("Minimize").clicked() {
+                if win_btn(ui).on_hover_text("Minimize").clicked() {
                     ui.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
                 if icon_btn(ui, Icon::Settings).on_hover_text("Settings").clicked() {
@@ -1268,7 +1266,7 @@ impl eframe::App for App {
         if !self.profile.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
             ui.send_viewport_cmd(ViewportCommand::Close);
         }
-        window(ui, "", &[], |ui| self.launch_tab(ui, frame));
+        window(ui, |ui| self.launch_tab(ui, frame));
         let typing = ui.ctx().egui_wants_keyboard_input();
         if !typing && !self.profile.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
             self.launch(ui);
@@ -1324,7 +1322,7 @@ impl TierEditor {
         self.pick.is_some() || self.bar.active()
     }
 
-    fn rows(&mut self, ui: &mut egui::Ui, cfg: &mut Config) {
+    fn rows(&mut self, ui: &mut egui::Ui, g: &mut crate::settings::Cards, cfg: &mut Config) {
         let p = pal(ui);
         self.at.clear();
         if self.live.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(1)) {
@@ -1340,11 +1338,7 @@ impl TierEditor {
         let tiers = &mut cfg.tiers;
         let mut saved: Vec<(String, String)> = Vec::new();
         for (t, (tier, _, env)) in TIERS.iter().enumerate() {
-            if t > 0 {
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(2.0);
-            }
+            g.item(ui, |ui| {
             let family: Vec<String> = claude.iter().filter(|m| m.contains(TIERS[t].1)).cloned().collect();
             let r = &mut tiers[t];
             // Name, and Spoofing when the model isn't a Claude one already.
@@ -1422,6 +1416,7 @@ impl TierEditor {
             }
             (r.provider, r.model) = chain[0].clone();
             r.fallbacks = chain[1..].iter().map(|(provider, model)| Fallback { provider: provider.clone(), model: model.clone() }).collect();
+            });
         }
         // A typed id stays on offer under its provider.
         for (provider, model) in saved {
@@ -1490,7 +1485,7 @@ impl TierEditor {
         let mut open = None;
         ui.horizontal(|ui| {
             ui.add_space(GUTTER);
-            let at = ui.add_sized([16.0, 26.0], egui::Label::new(RichText::new(label).size(12.5).color(p.subtle))).rect;
+            let at = ui.add_sized([16.0, ui.spacing().interact_size.y], egui::Label::new(RichText::new(label).size(12.5).color(p.subtle))).rect;
             self.at.push((t, row, at));
             let resp = picker_btn(ui, w - GUTTER - ui.spacing().item_spacing.x, text, placeholder);
             if resp.clicked() {
@@ -1526,7 +1521,9 @@ impl TierEditor {
             .pivot(pivot)
             .constrain(true)
             .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                popup_frame(p).show(ui, |ui| {
+                    settings::style(ui);
+                    ui.visuals_mut().extreme_bg_color = p.item;
                     ui.set_width(anchor.width() - 16.0);
                     let te = ui.add(TextEdit::singleline(&mut self.query).hint_text("Search for models, or type an id").desired_width(f32::INFINITY));
                     if self.focus {
@@ -1537,14 +1534,14 @@ impl TierEditor {
                     ui.add_space(4.0);
                     let mut first: Option<&Choice> = None;
                     egui::ScrollArea::vertical().max_height(list_h).show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         for (group, choices) in groups {
                             let shown: Vec<&Choice> = choices.iter().filter(|c| q.is_empty() || c.text.to_lowercase().contains(&q) || c.model.to_lowercase().contains(&q) || c.tag == "custom").collect();
                             if shown.is_empty() {
                                 continue;
                             }
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(group).size(11.0).color(p.subtle));
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(group).size(11.5).color(p.subtle));
                             for c in shown {
                                 first.get_or_insert(c);
                                 let checked = (c.provider.as_str(), c.model.as_str()) == cur;

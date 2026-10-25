@@ -1,7 +1,8 @@
 //! Settings → MuseAI: its on/off switch and the signed-in account (a cookie login in Chrome).
 
 use super::{active_account, remove_account, Account, Login};
-use crate::settings::providers::{badge, count, head, name, note, row, trash, LoginJob, ProvidersEditor, INDENT};
+use crate::settings::providers::{badge, count, head, name, note, row, trash, LoginJob, ProvidersEditor};
+use crate::settings::group;
 use crate::{icon_btn, model_count, pal, switch, Config, Icon};
 use eframe::egui::{self, Layout, RichText};
 use std::sync::{
@@ -37,6 +38,15 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
         }
         name(ui, &title, on);
     });
+    let u = &feed.usage;
+    // The plan's allowance, as muse-cli cached it.
+    let limits = pr.muse_account.is_some() || !u.muse.bars.is_empty() || !u.muse.error.is_empty();
+    group(ui, |ui, g| {
+        feed.analytics(ui, g, &title);
+        if limits {
+            g.item(ui, |ui| feed.limits(ui, 4, &u.muse_plan, &crate::usage::muse_bars(u), u.muse.fetched, &u.muse.error));
+        }
+    });
     let n = model_count(pr);
     row(ui, |ui, _| {
         ed.fetch_btn(ui, pr);
@@ -52,17 +62,16 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
                 Err(e) => ed.muse_err = e,
             }
         }
-        count(ui, n);
+        count(ui, "Accounts", n);
     });
     if let Some(job) = &ed.muse_login {
         ui.horizontal(|ui| {
-            ui.add_space(INDENT);
             ui.spinner();
             ui.label(RichText::new("Finish signing in in Chrome…").size(11.5).color(p.subtle));
-            if ui.button("Copy link").clicked() {
+            if crate::settings::button(ui, "Copy link").clicked() {
                 ui.ctx().copy_text(job.url.clone());
             }
-            if ui.button("Cancel").clicked() {
+            if crate::settings::button(ui, "Cancel").clicked() {
                 job.cancel.store(true, Ordering::Relaxed);
             }
         });
@@ -76,26 +85,27 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
 
     let mut clear_account = false;
     if let Some(acc) = &mut pr.muse_account {
-        row(ui, |ui, hot| {
-            let mut on = !acc.disabled;
-            if switch(ui, &mut on, "").on_hover_text("Off: the proxy doesn't use this account.").changed() {
-                acc.disabled = !on;
-            }
-            if trash(ui, hot, "Remove this account (clears login)") {
-                clear_account = true;
-            }
-            ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add_space(INDENT);
-                let alias = if acc.viewer_id.is_empty() || acc.viewer_id == "Active session" {
-                    "Active session".to_string()
-                } else {
-                    format!("Account {}", acc.viewer_id)
-                };
-                ui.label(RichText::new(&alias).size(12.5).color(if on { p.fg } else { p.muted }));
-                let tier_badge = if acc.tier.is_empty() { "Free plan" } else { &acc.tier };
-                badge(ui, tier_badge, on);
+        group(ui, |ui, g| g.item(ui, |ui| {
+            row(ui, |ui, hot| {
+                let mut on = !acc.disabled;
+                if switch(ui, &mut on, "").on_hover_text("Off: the proxy doesn't use this account.").changed() {
+                    acc.disabled = !on;
+                }
+                if trash(ui, hot, "Remove this account (clears login)") {
+                    clear_account = true;
+                }
+                ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
+                    let alias = if acc.viewer_id.is_empty() || acc.viewer_id == "Active session" {
+                        "Active session".to_string()
+                    } else {
+                        format!("Account {}", acc.viewer_id)
+                    };
+                    ui.label(RichText::new(&alias).size(12.5).color(if on { p.fg } else { p.muted }));
+                    let tier_badge = if acc.tier.is_empty() { "Free plan" } else { &acc.tier };
+                    badge(ui, tier_badge, on);
+                });
             });
-        });
+        }));
     } else if ed.muse_login.is_none() {
         note(ui, "No MuseAI account yet. Use + to sign in.", p.subtle);
     }
@@ -103,10 +113,5 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     if clear_account {
         let _ = remove_account();
         pr.muse_account = None;
-    }
-    // The plan's allowance, as muse-cli cached it.
-    let u = &feed.usage;
-    if pr.muse_account.is_some() || !u.muse.bars.is_empty() || !u.muse.error.is_empty() {
-        feed.limits(ui, 4, &u.muse_plan, &crate::usage::muse_bars(u), u.muse.fetched, &u.muse.error);
     }
 }

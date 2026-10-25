@@ -7,7 +7,7 @@ pub(crate) use ui::page;
 
 use crate::common::{self, Failure};
 use crate::usage::{Bar, WEEK};
-use crate::proxy::http::{record, respond, respond_error, Req};
+use crate::proxy::http::{record, respond, respond_error, Meta, Req};
 use crate::proxy::sse::{Stop, Tx};
 use crate::proxy::{Ctx, Fail};
 use native::{fail, Gateway};
@@ -394,6 +394,7 @@ pub(crate) fn muse_messages(
         respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
         return Ok(());
     }
+    let started = std::time::Instant::now();
     let stream = body["stream"].as_bool().unwrap_or(false);
 
     let payload = crate::providers::museai::chat_body(body, model, true);
@@ -416,7 +417,7 @@ pub(crate) fn muse_messages(
             let msg = tx.message();
             let prompt = tx.usage.0;
             drop(tx);
-            record(tier, crate::providers::MUSE_NAME, model, &msg["usage"]);
+            record(tier, crate::providers::MUSE_NAME, model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: "" });
             ctx.learn("muse", body, prompt);
             if !stream {
                 respond(s, 200, &msg, "");

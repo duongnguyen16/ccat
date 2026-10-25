@@ -30,8 +30,8 @@ pub(crate) fn fetch_models(url: &str, key: &str) -> Result<Vec<String>, String> 
 
 /// Settings → a custom endpoint (`cfg.providers[i]`): its name (rename, delete), the on/off switch, URL and key, and
 /// the model list. Rename and delete come back as an `Act` for the editor to carry out.
-pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, i: usize) -> Option<crate::settings::providers::Act> {
-    use crate::settings::providers::{count, field, head, name, note, row, Act};
+pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed, i: usize) -> Option<crate::settings::providers::Act> {
+    use crate::settings::{group, providers::{count, field, head, name, note, row, Act}};
     use crate::{icon_btn, switch, Icon};
     use eframe::egui::{Key, Layout, TextEdit};
     let p = crate::pal(ui);
@@ -76,16 +76,19 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
     if renaming && !ed.rename_err.is_empty() {
         note(ui, &ed.rename_err, p.danger);
     }
+    group(ui, |ui, g| feed.analytics(ui, g, &title));
     let pr = &mut cfg.providers[i];
     row(ui, |ui, _| {
         ed.fetch_btn(ui, pr);
-        count(ui, n);
+        count(ui, "Models", n);
     });
     if let Some(e) = ed.fetch_errs.get(&pr.name) {
         note(ui, e, p.danger);
     }
-    field(ui, "URL", &mut pr.url, eframe::egui::Id::new(("ccat-url", i)), false, "https://api.example.com");
-    field(ui, "API key", &mut pr.key, eframe::egui::Id::new(("ccat-key", i)), true, "");
+    group(ui, |ui, g| {
+        g.item(ui, |ui| field(ui, "URL", &mut pr.url, eframe::egui::Id::new(("ccat-url", i)), false, "https://api.example.com"));
+        g.item(ui, |ui| field(ui, "API key", &mut pr.key, eframe::egui::Id::new(("ccat-key", i)), true, ""));
+    });
     act
 }
 

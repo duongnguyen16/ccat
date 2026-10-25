@@ -209,12 +209,18 @@ pub fn green(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode { crate::hex(0x4cc38a) } else { crate::hex(0x1f8f5f) }
 }
 
+/// A menu row's height, corner radius and hover fill: `big` (the Settings window) is roomier and rounder.
+fn row_look(p: &crate::Pal, big: bool) -> (f32, f32, Color32) {
+    if big { (28.0, 7.0, p.item) } else { (24.0, 5.0, p.hover) }
+}
+
 /// A menu entry: text on the left, a fill on hover.
-fn item(ui: &mut egui::Ui, text: &str, enabled: bool, danger: bool) -> bool {
+fn item(ui: &mut egui::Ui, text: &str, enabled: bool, danger: bool, big: bool) -> bool {
     let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), if enabled { Sense::click() } else { Sense::hover() });
+    let (h, radius, hover) = row_look(p, big);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), if enabled { Sense::click() } else { Sense::hover() });
     if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, p.hover);
+        ui.painter().rect_filled(rect, radius, hover);
     }
     let color = match (enabled, danger) {
         (false, _) => p.subtle.gamma_multiply(0.6),
@@ -243,19 +249,30 @@ impl Bar {
         let p = pal(ui);
         let (folder, ctx) = (dir(), ui.ctx().clone());
         let mut anchor = egui::Rect::NOTHING;
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_size(vec2(ui.available_width(), 26.0));
+        // The Settings window's style makes buttons taller: the button and its menu follow.
+        let h = ui.spacing().interact_size.y;
+        let big = h >= 30.0;
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_size(vec2(ui.available_width(), h));
             title(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let galley = ui.painter().layout_no_wrap(cfg.profile.clone(), FontId::proportional(13.0), p.fg);
-                let w = (galley.size().x + 52.0).min(ui.available_width()).min(280.0);
-                let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click());
+                let w = (galley.size().x + if big { 58.0 } else { 52.0 }).min(ui.available_width()).min(280.0);
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
                 let st = ui.style().interact(&resp);
-                ui.painter().rect(rect, 6.0, p.sunken, if self.menu { ui.visuals().widgets.active.bg_stroke } else { st.bg_stroke }, StrokeKind::Inside);
+                if big {
+                    ui.painter().rect_filled(rect, 7.0, if resp.hovered() || self.menu { p.btn } else { p.field });
+                } else {
+                    ui.painter().rect(rect, 6.0, p.sunken, if self.menu { ui.visuals().widgets.active.bg_stroke } else { st.bg_stroke }, StrokeKind::Inside);
+                }
                 ui.painter().circle_filled(rect.left_center() + vec2(12.0, 0.0), 3.5, green(ui));
                 let text = rect.shrink2(vec2(10.0, 0.0));
                 ui.painter().with_clip_rect(text.with_min_x(text.min.x + 14.0).with_max_x(text.max.x - 14.0)).text(text.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, &cfg.profile, FontId::proportional(13.0), p.fg);
-                ui.painter().text(text.right_center(), Align2::RIGHT_CENTER, "⏷", FontId::proportional(10.0), p.subtle);
+                if big {
+                    crate::chevron(ui, egui::pos2(rect.right() - 16.0, rect.center().y), p.muted);
+                } else {
+                    ui.painter().text(text.right_center(), Align2::RIGHT_CENTER, "⏷", FontId::proportional(10.0), p.subtle);
+                }
                 if resp.on_hover_text("Configurations: named sets of the four tiers").clicked() {
                     self.menu = !self.menu;
                 }
@@ -276,8 +293,10 @@ impl Bar {
                 .pivot(Align2::RIGHT_TOP)
                 .constrain(true)
                 .show(&ctx, |ui| {
-                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
-                        ui.set_width(250.0);
+                    let frame = if big { crate::popup_frame(p) } else { egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(6)) };
+                    frame.show(ui, |ui| {
+                        ui.set_width(if big { 270.0 } else { 250.0 });
+                        let (rh, radius, hover) = row_look(p, big);
                         ui.spacing_mut().item_spacing.y = 1.0;
                         ui.add_space(2.0);
                         ui.label(RichText::new("Configurations").size(11.0).color(p.subtle));
@@ -285,11 +304,11 @@ impl Bar {
                         egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                             for n in &all {
                                 let applied = *n == cfg.profile;
-                                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+                                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), rh), Sense::click());
                                 if resp.hovered() {
-                                    ui.painter().rect_filled(rect, 5.0, p.hover);
+                                    ui.painter().rect_filled(rect, radius, hover);
                                 }
-                                let r = rect.shrink2(vec2(8.0, 0.0));
+                                let r = rect.shrink2(vec2(if big { 12.0 } else { 8.0 }, 0.0));
                                 let mut right = r.max.x;
                                 if applied {
                                     ui.painter().text(r.left_center(), Align2::LEFT_CENTER, "✔", FontId::proportional(11.0), green(ui));
@@ -307,15 +326,15 @@ impl Bar {
                         });
                         sep(ui);
                         for (text, a) in [("Duplicate…", Act::Duplicate), ("Rename…", Act::Rename), ("New configuration", Act::New), ("Import configuration…", Act::Import)] {
-                            if item(ui, text, true, false) {
+                            if item(ui, text, true, false, big) {
                                 act = Some(a);
                             }
                         }
                         sep(ui);
-                        if item(ui, "Show in Explorer", true, false) {
+                        if item(ui, "Show in Explorer", true, false, big) {
                             act = Some(Act::Reveal);
                         }
-                        if item(ui, "Delete", all.len() > 1, true) {
+                        if item(ui, "Delete", all.len() > 1, true, big) {
                             act = Some(Act::Delete);
                         }
                     });
@@ -328,7 +347,7 @@ impl Bar {
         if let Some(a) = act {
             self.run(a, cfg, frame, &folder);
         }
-        self.dialogs(&ctx, p, cfg, &folder);
+        self.dialogs(&ctx, p, cfg, &folder, big);
     }
 
     /// Edits so far are written first, so switching away never loses them.
@@ -367,7 +386,7 @@ impl Bar {
     }
 
     /// The name / confirm / error dialog, if one is open.
-    fn dialogs(&mut self, ctx: &egui::Context, p: &crate::Pal, cfg: &mut Config, folder: &Path) {
+    fn dialogs(&mut self, ctx: &egui::Context, p: &crate::Pal, cfg: &mut Config, folder: &Path, big: bool) {
         let Some(dialog) = self.dialog.take() else { return };
         let all = names(folder);
         let (mut ok, mut cancel) = (false, false);
@@ -378,6 +397,9 @@ impl Bar {
         };
         let m = egui::Modal::new(egui::Id::new("profile-dialog")).show(ctx, |ui| {
             ui.set_width(280.0);
+            if big {
+                crate::settings::style(ui);
+            }
             let title = match &dialog {
                 Dialog::Duplicate => "Duplicate configuration".to_string(),
                 Dialog::Rename => "Rename configuration".to_string(),
@@ -413,7 +435,7 @@ impl Bar {
                     Dialog::Error(_) => ("OK", p.fg, true),
                     _ => ("OK", p.fg, check.is_ok()),
                 };
-                let go = egui::Button::new(RichText::new(label).color(if matches!(dialog, Dialog::Delete) { Color32::WHITE } else { p.bg }).strong()).fill(fill).stroke(Stroke::NONE).min_size(vec2(72.0, 28.0));
+                let go = egui::Button::new(RichText::new(label).color(if matches!(dialog, Dialog::Delete) { Color32::WHITE } else { p.bg }).strong()).fill(fill).stroke(Stroke::NONE).min_size(vec2(72.0, if big { 30.0 } else { 28.0 }));
                 ok |= ui.add_enabled(enabled, go).clicked();
                 if !matches!(dialog, Dialog::Error(_)) {
                     cancel |= ui.add(egui::Button::new(RichText::new("Cancel").color(p.muted)).frame(false)).clicked();

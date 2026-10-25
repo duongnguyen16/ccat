@@ -15,8 +15,6 @@ use std::{
 };
 
 const ROW: f32 = 28.0;
-/// How far the rows under a provider (accounts, URL and key, notes) are pushed in.
-pub(crate) const INDENT: f32 = 16.0;
 
 /// A model list: the ids, and (ChatGPT only) what is known of each.
 type Fetched = Result<(Vec<String>, Vec<chatgpt::ChatgptModel>), String>;
@@ -155,11 +153,12 @@ pub(crate) fn name(ui: &mut egui::Ui, text: &str, on: bool) {
     });
 }
 
-/// The toolbar's left end: how many models the provider offers.
-pub(crate) fn count(ui: &mut egui::Ui, n: usize) {
+/// The section header's left end: its title, then how many models the provider offers in grey.
+pub(crate) fn count(ui: &mut egui::Ui, title: &str, n: usize) {
     let p = pal(ui);
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-        let text = if n == 0 { "No models yet. Fetch the list with the button on the right.".to_string() } else { format!("{n} models") };
+        ui.label(RichText::new(title).size(14.5).color(p.fg));
+        let text = if n == 0 { "· No models yet — fetch the list".to_string() } else { format!("· {n} model{}", if n == 1 { "" } else { "s" }) };
         ui.label(RichText::new(text).size(12.0).color(p.subtle));
     });
 }
@@ -211,19 +210,15 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, on: bool) -> Option<egui::Res
     Some(resp)
 }
 
-/// A line of small text under a row, lined up with the names.
+/// A line of small text under a row or a card, on the same left edge as what it sits in.
 pub(crate) fn note(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT);
-        ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
-    });
+    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
 }
 
 /// `label` and a text field; a secret shows as dots unless it has the keyboard.
 pub(crate) fn field(ui: &mut egui::Ui, label: &str, text: &mut String, id: egui::Id, secret: bool, hint: &str) {
     let p = pal(ui);
     ui.horizontal(|ui| {
-        ui.add_space(INDENT);
         let (rect, _) = ui.allocate_exact_size(vec2(52.0, 24.0), Sense::hover());
         ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, FontId::proportional(11.5), p.subtle);
         let masked = secret && !ui.memory(|m| m.has_focus(id));

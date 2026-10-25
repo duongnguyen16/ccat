@@ -3,7 +3,7 @@
 
 use crate::common::{self, Failure};
 use crate::providers::chatgpt::{self};
-use crate::proxy::http::{record, respond, respond_error, Req};
+use crate::proxy::http::{record, respond, respond_error, Meta, Req};
 use crate::proxy::sse::{blocks, client_tools, tool_result_text, Stop, Tx};
 use crate::proxy::{system_parts, web_search, Ctx, Fail};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -220,6 +220,7 @@ pub(crate) fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &V
         respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
         return Ok(());
     }
+    let started = std::time::Instant::now();
     let pool = &ctx.gpt;
     let stream = body["stream"].as_bool().unwrap_or(false);
     let meta = pool.models.read().unwrap().iter().find(|m| m.slug == model).cloned();
@@ -249,7 +250,8 @@ pub(crate) fn chatgpt_messages(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &V
                         let msg = tx.message();
                         let prompt = tx.usage.0;
                         drop(tx);
-                        record(tier, "ChatGPT", model, &msg["usage"]);
+                        let acct = if acc.email.is_empty() { acc.key.chars().take(8).collect() } else { acc.email.split('@').next().unwrap_or_default().to_string() };
+                        record(tier, "ChatGPT", model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: &acct });
                         if web_search(body).is_none() {
                             ctx.learn("gpt", body, prompt);
                         }

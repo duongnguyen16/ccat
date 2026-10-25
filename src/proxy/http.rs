@@ -205,6 +205,9 @@ impl Meter {
     }
 
     pub(crate) fn take(&mut self, v: &Value) {
+        if let Some(stop) = v["delta"]["stop_reason"].as_str().or_else(|| v["stop_reason"].as_str()) {
+            self.usage.insert("stop_reason".into(), json!(stop)); // read back by `record`
+        }
         let u = if v["message"]["usage"].is_object() { &v["message"]["usage"] } else { &v["usage"] };
         for (k, n) in u.as_object().into_iter().flatten().filter(|(_, n)| n.is_u64()) {
             if self.usage.get(k).and_then(Value::as_u64) < n.as_u64() {
@@ -223,19 +226,44 @@ impl Meter {
     }
 }
 
-/// One line per answered request in `tokens.jsonl` next to the config: when, which tier and provider, which model,
-/// and the tokens. Only routed launches pass through the proxy, so only they are counted. (Kept for future builds.)
-pub(crate) fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
+/// What `record` adds to a request's tokens: when it started, why it stopped (when known) and which pooled account
+/// served it ("" for none).
+pub(crate) struct Meta<'a> {
+    pub started: std::time::Instant,
+    pub stop: Option<&'a str>,
+    pub acct: &'a str,
+}
+
+/// One `tokens.jsonl` line: when, which tier and provider, which model, the tokens, and (since the Analytics and History
+/// pages) `ms` the request took, `pid` of this proxy, `stop` reason and `acct`. The last two are left out when unknown;
+/// older lines have none of them, so readers treat all four as optional.
+fn entry(t: u64, tier: &str, provider: &str, model: &str, usage: &Value, meta: &Meta) -> Value {
+    let n = |k: &str| usage[k].as_u64().unwrap_or(0);
+    let mut line = json!({ "t": t, "tier": tier, "provider": provider, "model": model, "input": n("input_tokens"), "output": n("output_tokens"),
+                           "cache_read": n("cache_read_input_tokens"), "cache_write": n("cache_creation_input_tokens"),
+                           "ms": meta.started.elapsed().as_millis() as u64, "pid": std::process::id() });
+    if let Some(stop) = meta.stop.or_else(|| usage["stop_reason"].as_str()).filter(|s| !s.is_empty()) {
+        line["stop"] = json!(stop);
+    }
+    if !meta.acct.is_empty() {
+        line["acct"] = json!(meta.acct);
+    }
+    line
+}
+
+/// One line per answered request in `tokens.jsonl` next to the config (see `entry`). Only routed launches pass
+/// through the proxy, so only they are counted.
+pub(crate) fn record(tier: &str, provider: &str, model: &str, usage: &Value, meta: Meta) {
     let n = |k: &str| usage[k].as_u64().unwrap_or(0);
     if cfg!(test) || n("input_tokens") + n("output_tokens") + n("cache_read_input_tokens") == 0 {
         return;
     }
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let line = json!({ "t": t, "tier": tier, "provider": provider, "model": model, "input": n("input_tokens"), "output": n("output_tokens"),
-                       "cache_read": n("cache_read_input_tokens"), "cache_write": n("cache_creation_input_tokens") });
+    let line = entry(t, tier, provider, model, usage, &meta);
     let path = common::log_path().with_file_name("tokens.jsonl");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(format!("{line}\n").as_bytes()); // one write per line: several sessions can append at once
+        let _ = f.write_all(format!("{line}
+").as_bytes()); // one write per line: several sessions can append at once
     }
 }
 
@@ -244,6 +272,7 @@ pub(crate) fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
 /// provider, model) the answer's token usage goes to the token log.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: Fail) -> Result<(), Failure> {
+    let started = std::time::Instant::now();
     let mut b = ureq::http::Request::builder().method(req.method.as_str()).uri(format!("{base}{}", req.path));
     for (k, v) in &req.headers {
         let hop = matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding" | "accept-encoding" | "x-ccat-token");
@@ -307,7 +336,7 @@ pub(crate) fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &
     }
     let _ = s.write_all(b"0\r\n\r\n");
     if let (Some(m), Some((tier, provider, model))) = (tokens, meter) {
-        record(tier, provider, model, &m.finish());
+        record(tier, provider, model, &m.finish(), Meta { started, stop: None, acct: "" });
     }
     Ok(())
 }
@@ -334,5 +363,21 @@ mod tests {
         let mut m = Meter::default();
         m.feed(br#"{"type":"message","usage":{"input_tokens":5,"output_tokens":7}}"#);
         assert_eq!(m.finish()["output_tokens"], 7, "a non-streamed message");
+    }
+
+    #[test]
+    fn a_token_line_carries_duration_stop_and_account_only_when_known() {
+        let meta = Meta { started: std::time::Instant::now(), stop: None, acct: "" };
+        let mut m = Meter { sse: true, ..Default::default() };
+        m.feed(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}
+");
+        let line = entry(5, "opus", "Claude", "m", &m.finish(), &meta);
+        assert_eq!((line["output"].as_u64(), line["stop"].as_str(), line["t"].as_u64()), (Some(9), Some("tool_use"), Some(5)));
+        assert!(line["ms"].is_u64() && line["pid"].as_u64() == Some(u64::from(std::process::id())));
+        assert!(line.get("acct").is_none(), "no account: no field");
+        let line = entry(5, "opus", "ChatGPT", "m", &json!({"output_tokens": 1}), &Meta { acct: "work", stop: Some("end_turn"), ..meta });
+        assert_eq!((line["acct"].as_str(), line["stop"].as_str()), (Some("work"), Some("end_turn")));
+        let line = entry(5, "opus", "ChatGPT", "m", &json!({"output_tokens": 1}), &meta);
+        assert!(line.get("stop").is_none(), "an unknown stop reason is left out");
     }
 }

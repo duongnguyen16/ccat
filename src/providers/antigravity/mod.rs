@@ -443,6 +443,11 @@ impl Pool {
         self.accounts.read().unwrap().clone()
     }
 
+    /// The part of account `i`'s email before the @: how the token log names the account that served a request.
+    pub fn alias(&self, i: usize) -> String {
+        self.accounts().get(i).map_or(String::new(), |a| a.email.split('@').next().unwrap_or_default().to_string())
+    }
+
     /// Accounts signed in while the session runs join after the others; those it already has are skipped.
     /// ponytail: appended, not ranked by plan: the account in use keeps winning, so its prompt cache stays warm.
     /// The next launch sorts them.

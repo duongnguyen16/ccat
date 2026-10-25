@@ -189,7 +189,7 @@ pub fn parse_time(s: &str) -> u64 {
 }
 
 /// Days since 1970-01-01 of a date (Howard Hinnant's days_from_civil).
-fn civil_days(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn civil_days(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -198,7 +198,7 @@ fn civil_days(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// The date of a day number (civil_from_days).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -211,7 +211,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// The local calendar day of a unix time, as a day number.
-fn local_day(t: u64) -> i64 {
+pub(crate) fn local_day(t: u64) -> i64 {
     let (y, m, d) = local_date(t);
     civil_days(y, m, d)
 }
@@ -1130,7 +1130,7 @@ fn shrink(rgba: &[u8], w: usize, h: usize, to: usize) -> egui::ColorImage {
     egui::ColorImage::new([to, to], pixels)
 }
 
-fn icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
+pub(crate) fn icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
     let src = crate::app_icon();
     ctx.load_texture("ccat-icon", shrink(&src.rgba, src.width as usize, src.height as usize, 96), egui::TextureOptions::LINEAR)
 }
@@ -1361,11 +1361,54 @@ pub(crate) struct Feed {
     stamp: Option<std::time::SystemTime>,
     polled: std::time::Instant,
     busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; 5],
+    /// Per provider: its token stats, the `tokens.jsonl` stamp and day they were read at, and when that was last looked at.
+    stats: std::cell::RefCell<HashMap<String, (Stats, Option<std::time::SystemTime>, i64, std::time::Instant)>>,
 }
 
 impl Feed {
     pub(crate) fn new() -> Self {
-        Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default() }
+        Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default(), stats: Default::default() }
+    }
+
+    /// A provider page's tokens card (an item of `g`): its tokens per day by model over the last `DAYS`, counted from `tokens.jsonl`
+    /// records whose provider is `provider`. The file is looked at every 3 seconds and read again only when it changed.
+    pub(crate) fn analytics(&self, ui: &mut egui::Ui, g: &mut crate::settings::Cards, provider: &str) {
+        let (p, today) = (crate::pal(ui), local_day(now()));
+        // The range is shared by the provider pages and lasts as long as this window.
+        let range_id = egui::Id::new("tokens-range-days");
+        let mut days = ui.data(|d| d.get_temp::<i64>(range_id)).unwrap_or(DAYS);
+        let key = format!("{provider}|{days}");
+        let mut cache = self.stats.borrow_mut();
+        if cache.get(&key).is_none_or(|e| e.3.elapsed() > Duration::from_secs(3)) {
+            let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
+            if cache.get(&key).is_none_or(|e| e.1 != stamp || e.2 != today) {
+                let text = fs::read_to_string(tokens_path()).unwrap_or_default();
+                cache.insert(key.clone(), (load_stats(&text, true, today, days, Some(provider)), stamp, today, std::time::Instant::now()));
+            } else if let Some(e) = cache.get_mut(&key) {
+                e.3 = std::time::Instant::now();
+            }
+        }
+        let st = &cache[&key].0;
+        g.item(ui, |ui| {
+            row(ui, SECTION_H.max(34.0), |ui| {
+                ui.label(egui::RichText::new("Tokens by model").family(crate::anthropic()).size(16.0).color(p.fg));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if segmented_lg(ui, &mut days, &[(7, "7d"), (30, "30d"), (90, "90d")]) {
+                        ui.data_mut(|d| d.insert_temp(range_id, days));
+                    }
+                });
+            });
+            if st.keys.is_empty() {
+                ui.label(egui::RichText::new("No usage through ccat yet").size(11.5).color(p.subtle));
+                return;
+            }
+            chart(ui, st, 120.0);
+            ui.add_space(8.0);
+            let id = ui.id().with(("more-models", provider));
+            let mut more = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            legend(ui, st, &mut more);
+            ui.data_mut(|d| d.insert_temp(id, more));
+        });
     }
 
     /// Re-reads `usage.json` when someone wrote it (the other process, or a reload here); looked at once a second.
@@ -1384,7 +1427,6 @@ impl Feed {
     /// `spawn_refresh`); a failed fetch shows its error over the last bars, greyed out.
     pub(crate) fn limits(&self, ui: &mut egui::Ui, which: usize, plan: &str, bars: &[Bar], fetched: u64, error: &str) {
         let (p, now) = (crate::pal(ui), now());
-        ui.add_space(14.0);
         row(ui, SECTION_H, |ui| {
             ui.label(egui::RichText::new("Your usage limits").family(crate::anthropic()).size(16.0).color(p.fg));
             if !plan.is_empty() {
@@ -1406,19 +1448,13 @@ impl Feed {
     }
 }
 
-/// A small block under an account row: no header, indented, `off` (a disabled account) and failed fetches greyed out.
+/// A small block under an account row, in the account's card: no header, `off` (a disabled account) and failed fetches greyed out.
 pub(crate) fn account_limits(ui: &mut egui::Ui, bars: &[Bar], error: &str, off: bool) {
     let (p, now) = (crate::pal(ui), now());
-    ui.horizontal_top(|ui| {
-        ui.add_space(crate::settings::providers::INDENT);
-        ui.vertical(|ui| {
-            if !error.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(11.5).color(p.danger)).truncate()).on_hover_text(error);
-            }
-            limit_rows(ui, bars, now, off || !error.is_empty(), true);
-            ui.add_space(10.0);
-        });
-    });
+    if !error.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(11.5).color(p.danger)).truncate()).on_hover_text(error);
+    }
+    limit_rows(ui, bars, now, off || !error.is_empty(), true);
 }
 
 /// "Updated 3m ago".
@@ -1524,11 +1560,13 @@ struct Stats {
     keys: Vec<(String, u64, u64)>,
     /// The first day shown (a day number; see `civil_days`).
     first: i64,
+    /// How many days from `first` (the range picked).
+    days: i64,
     /// (day - first, key index) → tokens.
     cells: HashMap<(i64, usize), u64>,
 }
 
-fn tokens_path() -> PathBuf {
+pub(crate) fn tokens_path() -> PathBuf {
     crate::config_path().with_file_name("tokens.jsonl")
 }
 
@@ -1669,14 +1707,15 @@ pub fn fmt_tokens(n: f64) -> String {
     format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
 }
 
-fn load_stats(text: &str, by_model: bool, today: i64) -> Stats {
-    let first = today - DAYS + 1;
-    let mut st = Stats { first, ..Default::default() };
+/// `provider`: only the records of that provider (a provider page's own usage), else all of them.
+fn load_stats(text: &str, by_model: bool, today: i64, days: i64, provider: Option<&str>) -> Stats {
+    let first = today - days + 1;
+    let mut st = Stats { first, days, ..Default::default() };
     let mut totals: HashMap<String, (u64, u64)> = HashMap::new();
     let mut by_day: Vec<(i64, String, u64)> = Vec::new();
     for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
         let day = local_day(v["t"].as_u64().unwrap_or(0));
-        if day < first || day > today {
+        if day < first || day > today || provider.is_some_and(|p| v["provider"].as_str() != Some(p)) {
             continue;
         }
         let n = |k: &str| v[k].as_u64().unwrap_or(0);
@@ -1703,19 +1742,36 @@ fn shade(i: usize, p: &crate::Pal) -> egui::Color32 {
 }
 
 /// "Oct 4" for a day number.
-fn day_label(day: i64) -> String {
+pub(crate) fn day_label(day: i64) -> String {
     let (_, m, d) = civil_from_days(day);
     let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m as usize).clamp(1, 12) - 1];
     format!("{month} {d}")
 }
 
-/// Stacked bars, one per day, with the day's breakdown on hover.
-fn chart(ui: &mut egui::Ui, st: &Stats) {
+/// What `bar_chart` draws: `count` stacked bars, `names.len()` stack layers, `value(bar, layer)` high.
+pub(crate) struct Bars<'a> {
+    pub count: usize,
+    pub names: &'a [String],
+    pub value: &'a dyn Fn(usize, usize) -> f64,
+    /// Axis and tooltip numbers.
+    pub fmt: &'a dyn Fn(f64) -> String,
+    /// A bar's label under the axis (only every `every`th, from `first`) and its tooltip heading.
+    pub label: &'a dyn Fn(usize) -> String,
+    pub title: &'a dyn Fn(usize) -> String,
+    pub every: usize,
+    pub first: usize,
+    pub color: &'a dyn Fn(usize, &crate::Pal) -> egui::Color32,
+}
+
+/// Stacked bars with a bar's breakdown on hover.
+pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
     let p = crate::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::hover());
-    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(34.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
-    let day_total = |d: i64| (0..st.keys.len()).map(|i| st.cells.get(&(d, i)).copied().unwrap_or(0)).sum::<u64>();
-    let max = (0..DAYS).map(day_total).max().unwrap_or(0).max(1) as f64;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(40.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
+    let keys = bars.names.len();
+    let bar_total = |d: usize| (0..keys).map(|i| (bars.value)(d, i)).sum::<f64>();
+    let max = (0..bars.count).map(bar_total).fold(0.0, f64::max);
+    let max = if max > 0.0 { max } else { 1.0 };
     // A round step: 1, 2 or 5 × 10^n, about four lines high.
     let raw = max / 4.0;
     let mag = 10f64.powf(raw.log10().floor());
@@ -1724,49 +1780,70 @@ fn chart(ui: &mut egui::Ui, st: &Stats) {
     let pt = ui.painter();
     let y_of = |v: f64| plot.bottom() - (v / top) as f32 * plot.height();
     let mut v = 0.0;
-    while v <= top + 0.5 {
+    while v <= top + step * 0.01 {
         let y = y_of(v);
         if v > 0.0 {
             pt.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, p.border));
         }
-        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt_tokens(v), egui::FontId::proportional(10.5), p.subtle);
+        pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, (bars.fmt)(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    let slot = plot.width() / DAYS as f32;
-    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as i64).clamp(0, DAYS - 1));
-    for d in 0..DAYS {
+    let slot = plot.width() / bars.count.max(1) as f32;
+    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count - 1));
+    for d in 0..bars.count {
         let x = plot.left() + slot * (d as f32 + 0.19);
         let mut base = 0.0;
-        for i in 0..st.keys.len() {
-            let n = st.cells.get(&(d, i)).copied().unwrap_or(0) as f64;
-            if n == 0.0 {
-                continue;
-            }
+        // Only the bar's outer ends are rounded: the segments meet square, with no gap.
+        let layers: Vec<usize> = (0..keys).filter(|&i| (bars.value)(d, i) > 0.0).collect();
+        for (pos, &i) in layers.iter().enumerate() {
+            let n = (bars.value)(d, i);
             let bar = egui::Rect::from_min_max(egui::pos2(x, y_of(base + n)), egui::pos2(x + slot * 0.62, y_of(base)));
-            let c = shade(i, p);
-            pt.rect_filled(bar, 1.5, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
+            let c = (bars.color)(i, p);
+            let (top, bottom) = (if pos + 1 == layers.len() { 2 } else { 0 }, if pos == 0 { 2 } else { 0 });
+            let radius = egui::CornerRadius { nw: top, ne: top, sw: bottom, se: bottom };
+            pt.rect_filled(bar, radius, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
             base += n;
         }
-        if d % 7 == 2 {
-            pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, day_label(st.first + d), egui::FontId::proportional(10.5), p.subtle);
+        if d % bars.every == bars.first % bars.every {
+            pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, (bars.label)(d), egui::FontId::proportional(10.5), p.subtle);
         }
     }
     if let Some(d) = hover {
-        let rows: Vec<(usize, u64)> = (0..st.keys.len()).filter_map(|i| st.cells.get(&(d, i)).map(|&n| (i, n))).filter(|(_, n)| *n > 0).collect();
+        let rows: Vec<(usize, f64)> = (0..keys).map(|i| (i, (bars.value)(d, i))).filter(|(_, n)| *n > 0.0).collect();
         resp.on_hover_ui_at_pointer(|ui| {
-            ui.label(egui::RichText::new(day_label(st.first + d)).strong().color(p.fg));
+            ui.label(egui::RichText::new((bars.title)(d)).strong().color(p.fg));
             if rows.is_empty() {
                 ui.label(egui::RichText::new("Nothing").color(p.subtle));
             }
             for (i, n) in rows {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 3.5, shade(i, p));
-                    ui.label(format!("{}: {}", st.keys[i].0, fmt_tokens(n as f64)));
+                    ui.painter().circle_filled(dot.center(), 3.5, (bars.color)(i, p));
+                    ui.label(format!("{}: {}", bars.names[i], (bars.fmt)(n)));
                 });
             }
         });
     }
+}
+
+/// The tray's and provider pages' chart: tokens per day, one layer per model or provider.
+fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
+    let names: Vec<String> = st.keys.iter().map(|k| k.0.clone()).collect();
+    let label = |d: usize| day_label(st.first + d as i64);
+    // About four day labels, whatever the range.
+    let every = match st.days { 7 => 1, 30 => 7, _ => 14 };
+    let bars = Bars {
+        count: st.days as usize,
+        names: &names,
+        value: &|d, i| st.cells.get(&(d as i64, i)).copied().unwrap_or(0) as f64,
+        fmt: &fmt_tokens,
+        label: &label,
+        title: &label,
+        every,
+        first: 2,
+        color: &shade,
+    };
+    bar_chart(ui, height, &bars);
 }
 
 /// The legend: each key's share, tokens in and out; the biggest six unless `more`.
@@ -1781,7 +1858,7 @@ fn legend(ui: &mut egui::Ui, st: &Stats, more: &mut bool) {
             // Numbers first, from the right; the name takes what's left and is cut short if it must be.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let share = (input + output) as f64 / total as f64 * 100.0;
-                ui.add_sized([42.0, 18.0], egui::Label::new(egui::RichText::new(format!("{share:.1}%")).size(12.0).color(p.fg)));
+                ui.allocate_ui_with_layout(egui::vec2(42.0, 18.0), egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{share:.1}%")).size(12.0).color(p.fg)));
                 ui.label(egui::RichText::new(format!("{} in · {} out", fmt_tokens(*input as f64), fmt_tokens(*output as f64))).size(11.5).color(p.muted));
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::Label::new(egui::RichText::new(name).size(12.5).color(p.fg)).truncate()).on_hover_text(name);
@@ -1868,25 +1945,65 @@ pub fn fmt_cost(v: f64) -> String {
     }
 }
 
-/// One finished request: (unix time, model, provider, tokens in and out, cost in USD).
-type Call = (u64, String, String, u64, f64);
+/// One finished request, as the proxy logged it. Old lines have no `ms`, `stop` or `acct`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Call {
+    pub t: u64,
+    pub tier: String,
+    pub provider: String,
+    /// The model, as `pretty_model` names it.
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// What the tokens would cost on the API (subscription plans don't bill per token).
+    pub cost: f64,
+    /// How long the request took, when the line says.
+    pub ms: Option<u64>,
+    pub stop: String,
+    pub acct: String,
+}
+
+impl Call {
+    /// One `tokens.jsonl` record; `None` for one without a time. Fields it doesn't know are ignored.
+    pub(crate) fn parse(v: &Value, pricing: &Pricing) -> Option<Call> {
+        let t = v["t"].as_u64()?;
+        let n = |k: &str| v[k].as_u64().unwrap_or(0);
+        let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
+        let raw = v["model"].as_str().unwrap_or("?");
+        let (input, output, cache_read, cache_write) = (n("input"), n("output"), n("cache_read"), n("cache_write"));
+        Some(Call {
+            t,
+            tier: s("tier", ""),
+            provider: s("provider", "?"),
+            model: pretty_model(raw),
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cost: model_cost(pricing, raw, input, output, cache_read, cache_write),
+            ms: v["ms"].as_u64(),
+            stop: s("stop", ""),
+            acct: s("acct", ""),
+        })
+    }
+
+    /// Everything the request moved.
+    pub(crate) fn tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
 
 /// The proxy's requests since `since`, oldest first.
 fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
     let mut calls: Vec<Call> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            let t = v["t"].as_u64().filter(|t| *t >= since)?;
-            let n = |k: &str| v[k].as_u64().unwrap_or(0);
-            let (inp, out, cr, cw) = (n("input"), n("output"), n("cache_read"), n("cache_write"));
-            let tokens = inp + cr + cw + out;
-            let m_raw = v["model"].as_str().unwrap_or("?");
-            let cost = model_cost(pricing, m_raw, inp, out, cr, cw);
-            Some((t, pretty_model(m_raw), v["provider"].as_str().unwrap_or("?").to_string(), tokens, cost))
-        })
+        .filter_map(|v| Call::parse(&v, pricing))
+        .filter(|c| c.t >= since)
         .collect();
-    calls.sort_by_key(|c| c.0);
+    calls.sort_by_key(|c| c.t);
     calls
 }
 
@@ -1895,23 +2012,23 @@ fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
 fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
     let (start, w, n) = span;
     let key = |c: &Call| match by {
-        1 => c.1.clone(),
-        2 => c.2.clone(),
+        1 => c.model.clone(),
+        2 => c.provider.clone(),
         _ => "Total".to_string(),
     };
     let mut keys: Vec<(String, f64)> = Vec::new();
     let mut cells: Vec<(usize, String, f64)> = Vec::new();
-    for c in calls.iter().filter(|c| c.0 >= start && c.0 < start + w * n as u64) {
+    for c in calls.iter().filter(|c| c.t >= start && c.t < start + w * n as u64) {
         let (k, v) = (key(c), match metric {
             1 => 1.0,
-            2 => c.4,
-            _ => c.3 as f64,
+            2 => c.cost,
+            _ => c.tokens() as f64,
         });
         match keys.iter_mut().find(|x| x.0 == k) {
             Some(x) => x.1 += v,
             None => keys.push((k.clone(), v)),
         }
-        cells.push((((c.0 - start) / w) as usize, k, v));
+        cells.push((((c.t - start) / w) as usize, k, v));
     }
     keys.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let names: Vec<String> = keys.into_iter().map(|k| k.0).collect();
@@ -1978,7 +2095,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
         _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
     };
     let clip = pt.with_clip_rect(plot);
-    let running = |name: &str| calls.iter().rev().take_while(|c| c.0 + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.1 } else { &c.2 }) == name);
+    let running = |name: &str| calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { &c.provider }) == name);
     // Biggest first, so the smaller ones are drawn over it and stay visible.
     for (i, s) in series.iter().enumerate() {
         let c = hue(i, p);
@@ -2082,7 +2199,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
 }
 
 /// Live's colours: one clearly different hue per key, so a moving layer is easy to tell; the rest share a grey.
-fn hue(i: usize, p: &crate::Pal) -> egui::Color32 {
+pub(crate) fn hue(i: usize, p: &crate::Pal) -> egui::Color32 {
     [0x3c6fd6, 0xe08a2e, 0x3fa85f, 0x9a6ce0, 0x2ab3b0, 0xd65c8f].get(i).map_or(p.subtle, |&v| crate::hex(v))
 }
 
@@ -2107,24 +2224,30 @@ enum Tab {
 
 /// A row of options in a sunken track, the chosen one raised. Returns whether the choice changed.
 pub(crate) fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_layout(ui, cur, items, false)
+    segmented_layout(ui, cur, items, false, false)
+}
+
+/// `segmented`, the Settings window's size: taller, larger text, wider segments.
+pub(crate) fn segmented_lg<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
+    segmented_layout(ui, cur, items, false, true)
 }
 
 pub(super) fn segmented_full_width<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)]) -> bool {
-    segmented_layout(ui, cur, items, true)
+    segmented_layout(ui, cur, items, true, false)
 }
 
-fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)], full_width: bool) -> bool {
+fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: &[(T, &str)], full_width: bool, lg: bool) -> bool {
     if items.is_empty() {
         return false;
     }
     let p = crate::pal(ui);
-    let font = egui::FontId::proportional(11.5);
-    let pad = if full_width { 6.0 } else { 9.0 };
-    let cell = (ui.available_width() - 4.0) / items.len() as f32;
+    // The Settings size has no borders and a track that is only a fill; the raised segment is a clearly lighter pill.
+    let (font, track, pill, inset, min_h) = if lg { (egui::FontId::proportional(13.0), 8.0, 6.0, 2.0, 30.0) } else { (egui::FontId::proportional(11.5), 6.0, 5.0, 2.0, 24.0) };
+    let pad = if lg { 12.0 } else if full_width { 6.0 } else { 9.0 };
+    let cell = (ui.available_width() - 2.0 * inset) / items.len() as f32;
     let multiline = items.iter().any(|(_, t)| t.contains('\n'));
     let natural: Vec<_> = items.iter().map(|(_, t)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.fg).size().x).collect();
-    let scale = ((ui.available_width() - 4.0) / natural.iter().map(|w| w + 18.0).sum::<f32>()).min(1.0);
+    let scale = ((ui.available_width() - 2.0 * inset) / natural.iter().map(|w| w + 18.0).sum::<f32>()).min(1.0);
     let galleys: Vec<_> = items.iter().zip(natural).map(|((_, t), width)| {
         let width = if full_width { (cell - 2.0 * pad).max(1.0) } else if multiline { ((width + 18.0) * scale - 18.0).max(1.0) } else { f32::INFINITY };
         let mut job = egui::text::LayoutJob::simple(t.to_string(), font.clone(), p.fg, width);
@@ -2132,20 +2255,20 @@ fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: 
         job.wrap.max_rows = 2;
         ui.painter().layout_job(job)
     }).collect();
-    let w = if full_width { ui.available_width() } else { galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 4.0 };
-    let h = galleys.iter().map(|g| g.size().y + 8.0).fold(24.0, f32::max);
+    let w = if full_width { ui.available_width() } else { galleys.iter().map(|g| g.size().x + 2.0 * pad).sum::<f32>() + 2.0 * inset };
+    let h = galleys.iter().map(|g| g.size().y + 8.0).fold(min_h, f32::max);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 6.0, p.sunken);
-    let mut x = rect.left() + 2.0;
+    ui.painter().rect_filled(rect, track, if lg { p.field } else { p.sunken });
+    let mut x = rect.left() + inset;
     let mut changed = false;
     for ((v, text), g) in items.iter().zip(galleys) {
         let width = if full_width { cell } else { g.size().x + 2.0 * pad };
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), egui::vec2(width, rect.height() - 4.0));
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + inset), egui::vec2(width, rect.height() - 2.0 * inset));
         let resp = ui.interact(seg, ui.id().with(("seg", x as i32)), egui::Sense::click());
         let on = *cur == *v;
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, *text));
         if on || resp.has_focus() {
-            ui.painter().rect_filled(seg, 5.0, p.hover);
+            ui.painter().rect_filled(seg, pill, if lg { p.pill } else { p.hover });
         }
         let color = if on || resp.hovered() { p.fg } else { p.muted };
         ui.painter().galley_with_override_text_color(seg.center() - g.rect.center().to_vec2(), g, color);
@@ -2162,12 +2285,12 @@ fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: 
 fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
     let p = crate::pal(ui);
     let g = ui.painter().layout_no_wrap(name.to_string(), egui::FontId::proportional(11.5), p.fg);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 28.0, 24.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 6.0, p.sunken);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(g.size().x + 32.0, 28.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 7.0, p.btn);
     ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, p.fg);
     let mut moved = 0;
     for (dir, on) in [(-1, left), (1, right)] {
-        let zone = egui::Rect::from_min_size(egui::pos2(if dir < 0 { rect.left() } else { rect.right() - 13.0 }, rect.top()), egui::vec2(13.0, 24.0));
+        let zone = egui::Rect::from_min_size(egui::pos2(if dir < 0 { rect.left() } else { rect.right() - 15.0 }, rect.top()), egui::vec2(15.0, 28.0));
         let resp = ui.interact(zone, ui.id().with((name, dir)), egui::Sense::click());
         let color = if !on { p.subtle.gamma_multiply(0.4) } else if resp.hovered() { p.fg } else { p.muted };
         let (c, d) = (zone.center(), dir as f32 * 2.5);
@@ -2179,35 +2302,24 @@ fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
     moved
 }
 
-/// A row's name in a fixed column, so the controls line up.
-fn label(ui: &mut egui::Ui, text: &str) {
-    let p = crate::pal(ui);
-    ui.allocate_ui(egui::vec2(66.0, 24.0), |ui| {
-        ui.set_min_width(66.0);
-        ui.label(egui::RichText::new(text).size(11.5).color(p.muted));
-    });
-}
-
 /// Settings → Display: which usage sources the Usage tab and the tray dial show, and in what order.
-pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
+pub(crate) fn display_block(ui: &mut egui::Ui, g: &mut crate::settings::Cards, cfg: &mut crate::Config) {
     use crate::ViewMode::{All, Follow};
-    ui.spacing_mut().item_spacing.y = 0.0;
+    use crate::settings::SETTING_W;
     let modes = [(All, "All"), (Follow, "Follow profile")];
-    for (name, mode) in [("Usage view", &mut cfg.usage_view_mode), ("Tray icon", &mut cfg.tray_mode)] {
-        ui.push_id(name, |ui| {
-            row(ui, 30.0, |ui| {
-                label(ui, name);
-                segmented(ui, mode, &modes);
-            })
-        });
-    }
-    row(ui, 30.0, |ui| {
-        label(ui, "Order");
+    g.setting_w(ui, "Usage view", "Which providers the usage window lists.", 260.0, |ui| {
+        ui.push_id("usage-view", |ui| segmented_lg(ui, &mut cfg.usage_view_mode, &modes));
+    });
+    g.setting_w(ui, "Tray icon", "Which providers the tray icon shows.", 260.0, |ui| {
+        ui.push_id("tray-mode", |ui| segmented_lg(ui, &mut cfg.tray_mode, &modes));
+    });
+    g.setting_w(ui, "Order", "Move a provider with its arrows.", 460.0, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let mut list = ordered(&cfg.source_order);
         let last = list.len() - 1;
         let mut swap = None;
-        for (i, s) in list.iter().enumerate() {
+        // Right to left, so the chips read in order.
+        for (i, s) in list.iter().enumerate().rev() {
             let m = chip(ui, s.name(), i > 0, i < last);
             if m != 0 {
                 swap = Some((i, (i as i32 + m) as usize));
@@ -2218,9 +2330,8 @@ pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
             cfg.source_order = list.iter().map(|s| s.name().to_string()).collect();
         }
     });
-    row(ui, 30.0, |ui| {
-        label(ui, "Claude");
-        crate::switch(ui, &mut cfg.show_fable, "Show Fable limit bar");
+    g.setting_w(ui, "Show Fable limit bar", "Claude's page and the usage window.", SETTING_W, |ui| {
+        crate::switch(ui, &mut cfg.show_fable, "");
     });
 }
 
@@ -2304,7 +2415,7 @@ impl Popup {
         let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
         if self.stats.as_ref().is_none_or(|(_, b, s)| *b != self.by_model || *s != stamp) {
             let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-            self.stats = Some((load_stats(&text, self.by_model, local_day(now())), self.by_model, stamp));
+            self.stats = Some((load_stats(&text, self.by_model, local_day(now()), DAYS, None), self.by_model, stamp));
         }
         &self.stats.as_ref().unwrap().0
     }
@@ -2469,7 +2580,7 @@ impl Popup {
             ui.add(egui::Label::new(egui::RichText::new("No tokens recorded yet. ccat counts the requests that go through its proxy: launches with a tier on another provider, or with a fallback.").size(11.5).color(p.subtle)).wrap());
             return;
         }
-        chart(ui, st);
+        chart(ui, st, 150.0);
         ui.add_space(8.0);
         legend(ui, st, &mut more);
         self.more = more;
@@ -3225,11 +3336,19 @@ mod tests {
         let today = local_day(t);
         let line = |dt: u64, model: &str, provider: &str, i: u64, o: u64| json!({ "t": t - dt, "tier": "opus", "provider": provider, "model": model, "input": i, "output": o, "cache_read": 1000, "cache_write": 0 }).to_string();
         let text = [line(0, "claude-opus-5-5", "Claude", 10, 5), line(0, "gemini-x", "Antigravity", 1, 1), line(86_400, "claude-opus-5-5", "Claude", 0, 100), line(40 * 86_400, "old", "Claude", 9, 9), "garbage".into()].join("\n");
-        let st = load_stats(&text, true, today);
+        let st = load_stats(&text, true, today, DAYS, None);
         assert_eq!(st.keys.iter().map(|k| (k.0.as_str(), k.1, k.2)).collect::<Vec<_>>(), [("Claude Opus 5.5", 2010, 105), ("Gemini X", 1001, 1)], "cache reads count as input; a 40-day-old line is out");
         assert_eq!(st.cells[&(DAYS - 1, 0)], 1015, "today's Opus: in + out");
-        let by_provider = load_stats(&text, false, today);
+        let by_provider = load_stats(&text, false, today, DAYS, None);
         assert_eq!(by_provider.keys[0].0, "Claude");
+        let ag = load_stats(&text, true, today, DAYS, Some("Antigravity"));
+        let week = load_stats(&text, true, today, 7, None);
+        assert_eq!((week.days, week.keys.len()), (7, 2), "7 days: the 40-day-old line is out, yesterday and today stay");
+        let wide = load_stats(&format!("{text}
+{}", line(60 * 86_400, "older", "Claude", 3, 3)), true, today, 90, None);
+        assert_eq!(wide.keys.len(), 4, "90 days reaches the 40-day-old line and the 60-day-old one");
+        assert_eq!(wide.cells[&(89, 0)], 1015, "today is the last day of any range");
+        assert_eq!(ag.keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["Gemini X"], "a provider page counts only its own records");
     }
 
 
