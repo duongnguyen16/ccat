@@ -130,13 +130,20 @@ fn paragraph(ui: &mut egui::Ui, head: &str, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.subtle)).wrap());
 }
 
+/// The usual width of a setting's control column.
+pub(crate) const SETTING_W: f32 = 200.0;
+
 /// One setting: its title and a grey description on the left, the control right-aligned, a thin rule under it.
 fn setting(ui: &mut egui::Ui, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
-    const CONTROL_W: f32 = 200.0;
+    setting_w(ui, title, desc, SETTING_W, control);
+}
+
+/// `setting` with a control column `control_w` wide.
+pub(crate) fn setting_w(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, control: impl FnOnce(&mut egui::Ui)) {
     const PAD: f32 = 14.0;
     let p = pal(ui);
     let w = ui.available_width();
-    let text_w = (w - CONTROL_W - 24.0).max(160.0);
+    let text_w = (w - control_w - 24.0).max(160.0);
     let t = ui.painter().layout(title.to_string(), FontId::proportional(14.0), p.fg, text_w);
     let d = (!desc.is_empty()).then(|| ui.painter().layout(desc.to_string(), FontId::proportional(12.0), p.subtle, text_w));
     let (th, dh) = (t.size().y, d.as_ref().map_or(0.0, |d| d.size().y + 3.0));
@@ -145,7 +152,7 @@ fn setting(ui: &mut egui::Ui, title: &str, desc: &str, control: impl FnOnce(&mut
     if let Some(d) = d {
         ui.painter().galley(rect.min + vec2(0.0, PAD + th + 3.0), d, p.subtle);
     }
-    let at = egui::Rect::from_min_max(egui::pos2(rect.right() - CONTROL_W, rect.top()), rect.right_bottom());
+    let at = egui::Rect::from_min_max(egui::pos2(rect.right() - control_w, rect.top()), rect.right_bottom());
     ui.scope_builder(egui::UiBuilder::new().max_rect(at).layout(Layout::right_to_left(Align::Center)), control);
     ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.border));
 }
@@ -290,10 +297,6 @@ impl Settings {
                     }
                 }
                 Page::Add => {}
-            }
-            if matches!(self.page, Page::Claude | Page::Antigravity | Page::ChatGpt | Page::Ollama | Page::Muse | Page::Endpoint(_)) {
-                ui.add_space(14.0);
-                crate::hint(ui, "Switches reach running ccat sessions within seconds.");
             }
             ui.add_space(20.0);
         });

@@ -1374,21 +1374,29 @@ impl Feed {
     /// records whose provider is `provider`. The file is looked at every 3 seconds and read again only when it changed.
     pub(crate) fn analytics(&self, ui: &mut egui::Ui, provider: &str) {
         let (p, today) = (crate::pal(ui), local_day(now()));
+        // The range is shared by the provider pages and lasts as long as this window.
+        let range_id = egui::Id::new("tokens-range-days");
+        let mut days = ui.data(|d| d.get_temp::<i64>(range_id)).unwrap_or(DAYS);
+        let key = format!("{provider}|{days}");
         let mut cache = self.stats.borrow_mut();
-        if cache.get(provider).is_none_or(|e| e.3.elapsed() > Duration::from_secs(3)) {
+        if cache.get(&key).is_none_or(|e| e.3.elapsed() > Duration::from_secs(3)) {
             let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
-            if cache.get(provider).is_none_or(|e| e.1 != stamp || e.2 != today) {
+            if cache.get(&key).is_none_or(|e| e.1 != stamp || e.2 != today) {
                 let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-                cache.insert(provider.to_string(), (load_stats(&text, true, today, Some(provider)), stamp, today, std::time::Instant::now()));
-            } else if let Some(e) = cache.get_mut(provider) {
+                cache.insert(key.clone(), (load_stats(&text, true, today, days, Some(provider)), stamp, today, std::time::Instant::now()));
+            } else if let Some(e) = cache.get_mut(&key) {
                 e.3 = std::time::Instant::now();
             }
         }
-        let st = &cache[provider].0;
+        let st = &cache[&key].0;
         crate::settings::card(ui, |ui| {
             row(ui, SECTION_H, |ui| {
                 ui.label(egui::RichText::new("Tokens by model").family(crate::anthropic()).size(16.0).color(p.fg));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("Last {DAYS} days")).size(11.5).color(p.subtle)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if segmented(ui, &mut days, &[(7, "7d"), (30, "30d"), (90, "90d")]) {
+                        ui.data_mut(|d| d.insert_temp(range_id, days));
+                    }
+                });
             });
             if st.keys.is_empty() {
                 ui.label(egui::RichText::new("No usage through ccat yet").size(11.5).color(p.subtle));
@@ -1552,6 +1560,8 @@ struct Stats {
     keys: Vec<(String, u64, u64)>,
     /// The first day shown (a day number; see `civil_days`).
     first: i64,
+    /// How many days from `first` (the range picked).
+    days: i64,
     /// (day - first, key index) → tokens.
     cells: HashMap<(i64, usize), u64>,
 }
@@ -1698,9 +1708,9 @@ pub fn fmt_tokens(n: f64) -> String {
 }
 
 /// `provider`: only the records of that provider (a provider page's own usage), else all of them.
-fn load_stats(text: &str, by_model: bool, today: i64, provider: Option<&str>) -> Stats {
-    let first = today - DAYS + 1;
-    let mut st = Stats { first, ..Default::default() };
+fn load_stats(text: &str, by_model: bool, today: i64, days: i64, provider: Option<&str>) -> Stats {
+    let first = today - days + 1;
+    let mut st = Stats { first, days, ..Default::default() };
     let mut totals: HashMap<String, (u64, u64)> = HashMap::new();
     let mut by_day: Vec<(i64, String, u64)> = Vec::new();
     for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
@@ -1744,7 +1754,7 @@ fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(34.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
     let day_total = |d: i64| (0..st.keys.len()).map(|i| st.cells.get(&(d, i)).copied().unwrap_or(0)).sum::<u64>();
-    let max = (0..DAYS).map(day_total).max().unwrap_or(0).max(1) as f64;
+    let max = (0..st.days).map(day_total).max().unwrap_or(0).max(1) as f64;
     // A round step: 1, 2 or 5 × 10^n, about four lines high.
     let raw = max / 4.0;
     let mag = 10f64.powf(raw.log10().floor());
@@ -1761,9 +1771,11 @@ fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
         pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt_tokens(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    let slot = plot.width() / DAYS as f32;
-    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as i64).clamp(0, DAYS - 1));
-    for d in 0..DAYS {
+    let slot = plot.width() / st.days as f32;
+    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as i64).clamp(0, st.days - 1));
+    // About four day labels, whatever the range.
+    let every = match st.days { 7 => 1, 30 => 7, _ => 14 };
+    for d in 0..st.days {
         let x = plot.left() + slot * (d as f32 + 0.19);
         let mut base = 0.0;
         for i in 0..st.keys.len() {
@@ -1776,7 +1788,7 @@ fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
             pt.rect_filled(bar, 1.5, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
             base += n;
         }
-        if d % 7 == 2 {
+        if d % every == 2 % every {
             pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, day_label(st.first + d), egui::FontId::proportional(10.5), p.subtle);
         }
     }
@@ -2208,35 +2220,24 @@ fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
     moved
 }
 
-/// A row's name in a fixed column, so the controls line up.
-fn label(ui: &mut egui::Ui, text: &str) {
-    let p = crate::pal(ui);
-    ui.allocate_ui(egui::vec2(66.0, 24.0), |ui| {
-        ui.set_min_width(66.0);
-        ui.label(egui::RichText::new(text).size(11.5).color(p.muted));
-    });
-}
-
 /// Settings → Display: which usage sources the Usage tab and the tray dial show, and in what order.
 pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
     use crate::ViewMode::{All, Follow};
-    ui.spacing_mut().item_spacing.y = 0.0;
+    use crate::settings::{setting_w, SETTING_W};
     let modes = [(All, "All"), (Follow, "Follow profile")];
-    for (name, mode) in [("Usage view", &mut cfg.usage_view_mode), ("Tray icon", &mut cfg.tray_mode)] {
-        ui.push_id(name, |ui| {
-            row(ui, 30.0, |ui| {
-                label(ui, name);
-                segmented(ui, mode, &modes);
-            })
-        });
-    }
-    row(ui, 30.0, |ui| {
-        label(ui, "Order");
+    setting_w(ui, "Usage view", "Which providers the usage window lists.", 260.0, |ui| {
+        ui.push_id("usage-view", |ui| segmented(ui, &mut cfg.usage_view_mode, &modes));
+    });
+    setting_w(ui, "Tray icon", "Which providers the tray icon shows.", 260.0, |ui| {
+        ui.push_id("tray-mode", |ui| segmented(ui, &mut cfg.tray_mode, &modes));
+    });
+    setting_w(ui, "Order", "Move a provider with its arrows.", 460.0, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let mut list = ordered(&cfg.source_order);
         let last = list.len() - 1;
         let mut swap = None;
-        for (i, s) in list.iter().enumerate() {
+        // Right to left, so the chips read in order.
+        for (i, s) in list.iter().enumerate().rev() {
             let m = chip(ui, s.name(), i > 0, i < last);
             if m != 0 {
                 swap = Some((i, (i as i32 + m) as usize));
@@ -2247,9 +2248,8 @@ pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
             cfg.source_order = list.iter().map(|s| s.name().to_string()).collect();
         }
     });
-    row(ui, 30.0, |ui| {
-        label(ui, "Claude");
-        crate::switch(ui, &mut cfg.show_fable, "Show Fable limit bar");
+    setting_w(ui, "Show Fable limit bar", "Claude's page and the usage window.", SETTING_W, |ui| {
+        crate::switch(ui, &mut cfg.show_fable, "");
     });
 }
 
@@ -2333,7 +2333,7 @@ impl Popup {
         let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
         if self.stats.as_ref().is_none_or(|(_, b, s)| *b != self.by_model || *s != stamp) {
             let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-            self.stats = Some((load_stats(&text, self.by_model, local_day(now()), None), self.by_model, stamp));
+            self.stats = Some((load_stats(&text, self.by_model, local_day(now()), DAYS, None), self.by_model, stamp));
         }
         &self.stats.as_ref().unwrap().0
     }
@@ -3254,12 +3254,18 @@ mod tests {
         let today = local_day(t);
         let line = |dt: u64, model: &str, provider: &str, i: u64, o: u64| json!({ "t": t - dt, "tier": "opus", "provider": provider, "model": model, "input": i, "output": o, "cache_read": 1000, "cache_write": 0 }).to_string();
         let text = [line(0, "claude-opus-5-5", "Claude", 10, 5), line(0, "gemini-x", "Antigravity", 1, 1), line(86_400, "claude-opus-5-5", "Claude", 0, 100), line(40 * 86_400, "old", "Claude", 9, 9), "garbage".into()].join("\n");
-        let st = load_stats(&text, true, today, None);
+        let st = load_stats(&text, true, today, DAYS, None);
         assert_eq!(st.keys.iter().map(|k| (k.0.as_str(), k.1, k.2)).collect::<Vec<_>>(), [("Claude Opus 5.5", 2010, 105), ("Gemini X", 1001, 1)], "cache reads count as input; a 40-day-old line is out");
         assert_eq!(st.cells[&(DAYS - 1, 0)], 1015, "today's Opus: in + out");
-        let by_provider = load_stats(&text, false, today, None);
+        let by_provider = load_stats(&text, false, today, DAYS, None);
         assert_eq!(by_provider.keys[0].0, "Claude");
-        let ag = load_stats(&text, true, today, Some("Antigravity"));
+        let ag = load_stats(&text, true, today, DAYS, Some("Antigravity"));
+        let week = load_stats(&text, true, today, 7, None);
+        assert_eq!((week.days, week.keys.len()), (7, 2), "7 days: the 40-day-old line is out, yesterday and today stay");
+        let wide = load_stats(&format!("{text}
+{}", line(60 * 86_400, "older", "Claude", 3, 3)), true, today, 90, None);
+        assert_eq!(wide.keys.len(), 4, "90 days reaches the 40-day-old line and the 60-day-old one");
+        assert_eq!(wide.cells[&(89, 0)], 1015, "today is the last day of any range");
         assert_eq!(ag.keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["Gemini X"], "a provider page counts only its own records");
     }
 

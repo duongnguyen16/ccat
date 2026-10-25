@@ -52,36 +52,37 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     feed.analytics(ui, &title);
     let n = model_count(pr);
     let mut start: Option<(Option<ChatgptAccount>, bool)> = None;
-    card(ui, |ui| {
-        row(ui, |ui, _| {
-            ed.fetch_btn(ui, pr);
-            let free = ed.gpt_login.is_none();
-            if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text("Sign in with ChatGPT (opens your browser)")).inner.clicked() {
-                start = Some((None, false));
-            }
-            count(ui, n);
-        });
-        if let Some(job) = &ed.gpt_login {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Finish signing in in your browser…").size(11.5).color(p.subtle));
-                if ui.button("Copy link").clicked() {
-                    ui.ctx().copy_text(job.url.clone());
-                }
-                if ui.button("Cancel").clicked() {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-            });
+    row(ui, |ui, _| {
+        ed.fetch_btn(ui, pr);
+        let free = ed.gpt_login.is_none();
+        if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text("Sign in with ChatGPT (opens your browser)")).inner.clicked() {
+            start = Some((None, false));
         }
-        if !ed.gpt_err.is_empty() {
-            note(ui, &ed.gpt_err, p.danger);
-        }
-        if let Some(e) = ed.fetch_errs.get(&pr.name) {
-            note(ui, e, p.danger);
-        }
+        count(ui, "Accounts", n);
     });
+    if let Some(job) = &ed.gpt_login {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Finish signing in in your browser…").size(11.5).color(p.subtle));
+            if ui.button("Copy link").clicked() {
+                ui.ctx().copy_text(job.url.clone());
+            }
+            if ui.button("Cancel").clicked() {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    if !ed.gpt_err.is_empty() {
+        note(ui, &ed.gpt_err, p.danger);
+    }
+    if let Some(e) = ed.fetch_errs.get(&pr.name) {
+        note(ui, e, p.danger);
+    }
     // Official or Codex (Legacy): followed live by the running sessions (see `Pool::set_legacy`).
     let mut legacy = pr.gpt_legacy();
+    let u = &feed.usage;
+    // Not a failure: the official sign-in's token doesn't read the numbers.
+    let no_numbers = u.chatgpt_on && !legacy && u.chatgpt.fetched > 0 && u.chatgpt.bars.is_empty() && u.chatgpt.error.is_empty();
     card(ui, |ui| {
         if segmented(ui, &mut legacy, &[(false, "Official"), (true, "Codex (Legacy)")]) {
             pr.chatgpt_legacy = Some(legacy);
@@ -97,22 +98,23 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
         } else {
             note(ui, "Official: api.openai.com, documented by OpenAI. Counts toward the cap you set for ccat in ChatGPT settings; no usage numbers here.", p.subtle);
         }
+        if no_numbers {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Usage numbers aren't available for the official sign-in; see").size(11.5).color(p.subtle));
+                link(ui, "chatgpt.com Settings → Usage", USAGE_PAGE, USAGE_PAGE);
+            });
+        } else if !pr.chatgpt_accounts.is_empty() {
+            ui.add_space(4.0);
+            link(ui, "Manage usage", USAGE_PAGE, USAGE_PAGE);
+        }
     });
     // One allowance, not one per account: usage is asked with the first stored token that answers (see `fetch_chatgpt`).
-    let u = &feed.usage;
-    if u.chatgpt_on {
+    if u.chatgpt_on && !no_numbers {
         card(ui, |ui| {
-            if !legacy && u.chatgpt.fetched > 0 && u.chatgpt.bars.is_empty() && u.chatgpt.error.is_empty() {
-                // Not a failure: the official sign-in's token doesn't read the numbers.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Usage numbers aren't available for the official sign-in; see").size(11.5).color(p.subtle));
-                    link(ui, "chatgpt.com Settings → Usage", USAGE_PAGE, USAGE_PAGE);
-                });
-            } else {
-                feed.limits(ui, 2, &u.chatgpt_plan, &crate::usage::tidy(&u.chatgpt.bars, false), u.chatgpt.fetched, &u.chatgpt.error);
-                ui.add_space(4.0);
-                note(ui, "One allowance for the login ccat asks with, not one per account.", p.subtle);
-            }
+            feed.limits(ui, 2, &u.chatgpt_plan, &crate::usage::tidy(&u.chatgpt.bars, false), u.chatgpt.fetched, &u.chatgpt.error);
+            ui.add_space(4.0);
+            note(ui, "One allowance for the login ccat asks with, not one per account.", p.subtle);
         });
     }
     let mut remove = None;
@@ -186,8 +188,6 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     }
     if pr.chatgpt_accounts.is_empty() && ed.gpt_login.is_none() {
         note(ui, "No ChatGPT account yet. + signs in with ChatGPT in your browser, once, for both modes.", p.subtle);
-    } else if !pr.chatgpt_accounts.is_empty() {
-        link(ui, "Manage usage", USAGE_PAGE, USAGE_PAGE);
     }
     if cfg.chatgpt_note == 1 {
         ui.add_space(10.0);

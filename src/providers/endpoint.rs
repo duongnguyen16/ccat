@@ -78,15 +78,13 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
     }
     feed.analytics(ui, &title);
     let pr = &mut cfg.providers[i];
-    card(ui, |ui| {
-        row(ui, |ui, _| {
-            ed.fetch_btn(ui, pr);
-            count(ui, n);
-        });
-        if let Some(e) = ed.fetch_errs.get(&pr.name) {
-            note(ui, e, p.danger);
-        }
+    row(ui, |ui, _| {
+        ed.fetch_btn(ui, pr);
+        count(ui, "Models", n);
     });
+    if let Some(e) = ed.fetch_errs.get(&pr.name) {
+        note(ui, e, p.danger);
+    }
     card(ui, |ui| {
         field(ui, "URL", &mut pr.url, eframe::egui::Id::new(("ccat-url", i)), false, "https://api.example.com");
         field(ui, "API key", &mut pr.key, eframe::egui::Id::new(("ccat-key", i)), true, "");

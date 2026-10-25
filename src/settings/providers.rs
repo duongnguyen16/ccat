@@ -153,11 +153,12 @@ pub(crate) fn name(ui: &mut egui::Ui, text: &str, on: bool) {
     });
 }
 
-/// The toolbar's left end: how many models the provider offers.
-pub(crate) fn count(ui: &mut egui::Ui, n: usize) {
+/// The section header's left end: its title, then how many models the provider offers in grey.
+pub(crate) fn count(ui: &mut egui::Ui, title: &str, n: usize) {
     let p = pal(ui);
     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-        let text = if n == 0 { "No models yet. Fetch the list with the button on the right.".to_string() } else { format!("{n} models") };
+        ui.label(RichText::new(title).size(14.5).color(p.fg));
+        let text = if n == 0 { "· No models yet — fetch the list".to_string() } else { format!("· {n} model{}", if n == 1 { "" } else { "s" }) };
         ui.label(RichText::new(text).size(12.0).color(p.subtle));
     });
 }

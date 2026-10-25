@@ -37,37 +37,35 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     });
     feed.analytics(ui, &title);
     let n = model_count(pr);
-    card(ui, |ui| {
-        row(ui, |ui, _| {
-            ed.fetch_btn(ui, pr);
-            let free = ed.login.is_none();
-            if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text("Add a Google account").clicked()).inner {
-                match start_login(ui.ctx()) {
-                    Ok(job) => (ed.login, ed.login_err) = (Some(job), String::new()),
-                    Err(e) => ed.login_err = e,
-                }
+    row(ui, |ui, _| {
+        ed.fetch_btn(ui, pr);
+        let free = ed.login.is_none();
+        if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text("Add a Google account").clicked()).inner {
+            match start_login(ui.ctx()) {
+                Ok(job) => (ed.login, ed.login_err) = (Some(job), String::new()),
+                Err(e) => ed.login_err = e,
             }
-            count(ui, n);
-        });
-        if let Some(job) = &ed.login {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Finish signing in in your browser…").size(11.5).color(p.subtle));
-                if ui.button("Copy link").clicked() {
-                    ui.ctx().copy_text(job.url.clone());
-                }
-                if ui.button("Cancel").clicked() {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-            });
         }
-        if !ed.login_err.is_empty() {
-            note(ui, &ed.login_err, p.danger);
-        }
-        if let Some(e) = ed.fetch_errs.get(&pr.name) {
-            note(ui, e, p.danger);
-        }
+        count(ui, "Accounts", n);
     });
+    if let Some(job) = &ed.login {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Finish signing in in your browser…").size(11.5).color(p.subtle));
+            if ui.button("Copy link").clicked() {
+                ui.ctx().copy_text(job.url.clone());
+            }
+            if ui.button("Cancel").clicked() {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    if !ed.login_err.is_empty() {
+        note(ui, &ed.login_err, p.danger);
+    }
+    if let Some(e) = ed.fetch_errs.get(&pr.name) {
+        note(ui, e, p.danger);
+    }
     let mut remove = None;
     for (n, acc) in pr.accounts.iter_mut().enumerate() {
         card(ui, |ui| {

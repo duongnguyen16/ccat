@@ -40,42 +40,40 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     });
     feed.analytics(ui, &title);
     let n = model_count(pr);
-    card(ui, |ui| {
-        row(ui, |ui, _| {
-            ed.fetch_btn(ui, pr);
-            let free = ed.muse_login.is_none();
-            let tip = if has_account {
-                "Sign in with MuseAI in Chrome (replaces existing session)"
-            } else {
-                "Add a MuseAI account (opens Chrome)"
-            };
-            if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text(tip).clicked()).inner {
-                match start_login(ui.ctx()) {
-                    Ok(job) => (ed.muse_login, ed.muse_err) = (Some(job), String::new()),
-                    Err(e) => ed.muse_err = e,
-                }
+    row(ui, |ui, _| {
+        ed.fetch_btn(ui, pr);
+        let free = ed.muse_login.is_none();
+        let tip = if has_account {
+            "Sign in with MuseAI in Chrome (replaces existing session)"
+        } else {
+            "Add a MuseAI account (opens Chrome)"
+        };
+        if ui.add_enabled_ui(free, |ui| icon_btn(ui, Icon::New).on_hover_text(tip).clicked()).inner {
+            match start_login(ui.ctx()) {
+                Ok(job) => (ed.muse_login, ed.muse_err) = (Some(job), String::new()),
+                Err(e) => ed.muse_err = e,
             }
-            count(ui, n);
-        });
-        if let Some(job) = &ed.muse_login {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Finish signing in in Chrome…").size(11.5).color(p.subtle));
-                if ui.button("Copy link").clicked() {
-                    ui.ctx().copy_text(job.url.clone());
-                }
-                if ui.button("Cancel").clicked() {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-            });
         }
-        if !ed.muse_err.is_empty() {
-            note(ui, &ed.muse_err, p.danger);
-        }
-        if let Some(e) = ed.fetch_errs.get(&pr.name) {
-            note(ui, e, p.danger);
-        }
+        count(ui, "Accounts", n);
     });
+    if let Some(job) = &ed.muse_login {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Finish signing in in Chrome…").size(11.5).color(p.subtle));
+            if ui.button("Copy link").clicked() {
+                ui.ctx().copy_text(job.url.clone());
+            }
+            if ui.button("Cancel").clicked() {
+                job.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+    if !ed.muse_err.is_empty() {
+        note(ui, &ed.muse_err, p.danger);
+    }
+    if let Some(e) = ed.fetch_errs.get(&pr.name) {
+        note(ui, e, p.danger);
+    }
 
     let mut clear_account = false;
     if let Some(acc) = &mut pr.muse_account {
