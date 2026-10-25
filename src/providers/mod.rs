@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 pub const AG_NAME: &str = "Antigravity";
 /// The built-in ChatGPT provider's fixed name.
 pub const GPT_NAME: &str = "ChatGPT";
+/// What the user sees for a stored provider name: the ChatGPT provider is shown as Codex; the stored name never changes.
+pub(crate) fn label(name: &str) -> &str {
+    if name == GPT_NAME { "Codex" } else { name }
+}
 /// The built-in Ollama provider's fixed name.
 pub const OLLAMA_NAME: &str = "Ollama";
 /// The built-in MuseAI provider's fixed name.
@@ -82,6 +86,19 @@ impl Provider {
             Kind::Muse
         } else {
             Kind::Endpoint
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_chatgpt_provider_is_shown_as_codex_and_stored_as_chatgpt() {
+        assert_eq!((label(GPT_NAME), GPT_NAME), ("Codex", "ChatGPT"));
+        for same in [AG_NAME, OLLAMA_NAME, MUSE_NAME, "", "Claude", "chatgpt", "My Codex endpoint"] {
+            assert_eq!(label(same), same, "only the stored ChatGPT name is renamed");
         }
     }
 }

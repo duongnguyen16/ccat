@@ -354,7 +354,7 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
     let name = name.trim();
     if name.is_empty() {
         Err("Give it a name.".into())
-    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) {
+    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) || name.eq_ignore_ascii_case(providers::label(GPT_NAME)) {
         Err("That is a built-in provider's name.".into())
     } else if providers.iter().enumerate().any(|(n, p)| n != i && p.name.eq_ignore_ascii_case(name)) {
         Err("Another provider already has that name.".into())
@@ -365,7 +365,12 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
 
 /// Models a provider offers: fetched, plus saved custom ids the list doesn't have.
 fn model_count(p: &Provider) -> usize {
-    p.models.len() + p.custom.iter().filter(|c| !p.models.contains(c)).count()
+    model_names(p).len()
+}
+
+/// The ids behind `model_count`, in the order the pickers list them.
+fn model_names(p: &Provider) -> Vec<&str> {
+    p.models.iter().chain(p.custom.iter().filter(|c| !p.models.contains(c))).map(String::as_str).collect()
 }
 
 /// Emails of the accounts turned off, for the proxy's pool.
@@ -483,6 +488,10 @@ fn builtin_muse(cfg: &mut Config) {
     }, |i| cfg.providers.remove(i));
     if mu.url.trim().is_empty() {
         mu.url = museai::DEFAULT_URL.into();
+    }
+    // The local bridge's list is a constant: offered from the start, without a Fetch click.
+    if mu.models.is_empty() && museai::is_local_bridge(&museai::normalize_url(&mu.url)) {
+        mu.models = museai::list_models(&mu.url, None).unwrap_or_default();
     }
     let old = std::mem::replace(&mut mu.name, MUSE_NAME.into());
     rename_routes(&mut cfg.tiers, &old, MUSE_NAME);
@@ -844,6 +853,8 @@ enum Icon {
     Fetch,
     Settings,
     Minimize,
+    Up,
+    Down,
 }
 
 /// 28×28 icon button, drawn with strokes (no icon font): fill only on hover (the style's, so rounder in Settings).
@@ -854,7 +865,7 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let hot = resp.hovered() || resp.has_focus();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), match icon {
         Icon::New => "New", Icon::Delete => "Delete", Icon::GitHub => "GitHub", Icon::Reload => "Reload",
-        Icon::Rename => "Rename", Icon::Save => "Save", Icon::Fetch => "Fetch", Icon::Settings => "Settings", Icon::Minimize => "Minimize",
+        Icon::Rename => "Rename", Icon::Save => "Save", Icon::Fetch => "Fetch", Icon::Settings => "Settings", Icon::Minimize => "Minimize", Icon::Up => "Move up", Icon::Down => "Move down",
     }));
     let danger = matches!(icon, Icon::Delete);
     if hot {
@@ -872,6 +883,10 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     match icon {
         Icon::Minimize => {
             pt.line_segment([c - vec2(5.0, 0.0), c + vec2(5.0, 0.0)], s);
+        }
+        Icon::Up | Icon::Down => {
+            let d = if matches!(icon, Icon::Up) { -1.0 } else { 1.0 };
+            pt.add(egui::Shape::line(vec![c + vec2(-4.5, 2.0 * d), c + vec2(0.0, -2.5 * d), c + vec2(4.5, 2.0 * d)], s));
         }
         Icon::Settings => {
             let teeth = (0..32).map(|i| {
@@ -977,7 +992,7 @@ fn route_text(r: &Route) -> String {
 }
 
 fn target_text(provider: &str, model: &str) -> String {
-    let provider = if provider.is_empty() { OFFICIAL } else { provider };
+    let provider = if provider.is_empty() { OFFICIAL } else { providers::label(provider) };
     let model = if model.is_empty() { "Claude Code's pick" } else { model };
     format!("{provider} · {model}")
 }
@@ -992,7 +1007,7 @@ fn selector_text(provider: &str, model: &str, claude: &[String], providers: &[Pr
     if offered < 2 {
         return model.into();
     }
-    format!("{model} ({})", if provider.is_empty() { OFFICIAL } else { provider })
+    format!("{model} ({})", if provider.is_empty() { OFFICIAL } else { providers::label(provider) })
 }
 
 impl App {
@@ -1056,21 +1071,22 @@ impl App {
                 return None;
             }
             let Some(i) = self.cfg.providers.iter().position(|p| p.name == provider) else {
-                return Some((format!("{what}: provider “{provider}” no longer exists."), false));
+                return Some((format!("{what}: provider “{}” no longer exists.", providers::label(provider)), false));
             };
             let p = &self.cfg.providers[i];
+            let name = providers::label(&p.name);
             match () {
-                _ if p.disabled => Some((format!("“{}” is turned off.", p.name), true)),
-                _ if model.trim().is_empty() => Some((format!("{what} needs a model on {}.", p.name), false)),
-                _ if p.antigravity && p.accounts.is_empty() => Some((format!("“{}” needs at least one Google account.", p.name), true)),
-                _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every Google account turned off.", p.name), true)),
-                _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{}” needs a signed-in ChatGPT account.", p.name), true)),
-                _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every account turned off.", p.name), true)),
-                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings.", p.name), true)),
+                _ if p.disabled => Some((format!("“{name}” is turned off."), true)),
+                _ if model.trim().is_empty() => Some((format!("{what} needs a model on {name}."), false)),
+                _ if p.antigravity && p.accounts.is_empty() => Some((format!("“{name}” needs at least one Google account."), true)),
+                _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => Some((format!("“{name}” has every Google account turned off."), true)),
+                _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{name}” needs a signed-in Codex account."), true)),
+                _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{name}” has every account turned off."), true)),
+                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{name}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings."), true)),
                 _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
                 // A local Ollama needs no key; Ollama Cloud's is only required by the server.
-                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{}” needs a URL.", p.name), true)),
-                _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{}” needs a URL and a key.", p.name), true)),
+                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{name}” needs a URL."), true)),
+                _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{name}” needs a URL and a key."), true)),
                 _ => None,
             }
         };
@@ -1297,16 +1313,14 @@ impl Drop for App {
 /// Which selector of a tier: its model and fallbacks in order (0 = the model), or its Claude name.
 const SPOOF_ROW: usize = usize::MAX;
 
-/// The four tiers, each: its name and the Spoofing switch, the Claude name it's shown as (while spoofing), its
-/// model and fallbacks numbered in the order they're tried, and "+ New fallback". In the Settings window, where a
-/// change reaches running sessions.
+/// The tiers' editor: the Settings window's Models page, where a change reaches running sessions.
 #[derive(Default)]
 struct TierEditor {
     /// The selector whose dropdown is open: (tier, row).
     pick: Option<(usize, usize)>,
     query: String,
     focus: bool,
-    /// The configuration button above the tiers, its menu and dialogs.
+    /// The configuration button beside the page title, its menu and dialogs.
     bar: profiles::Bar,
     /// This frame's row labels, (tier, row, rect): where the route tree is drawn.
     at: Vec<(usize, usize, egui::Rect)>,
@@ -1331,7 +1345,9 @@ impl TierEditor {
         self.pick.is_some() || self.bar.active()
     }
 
-    fn rows(&mut self, ui: &mut egui::Ui, g: &mut crate::settings::Cards, cfg: &mut Config) {
+    /// One settings group per tier: its Spoofing switch, the Claude name it's shown as (while spoofing), its model and
+    /// fallbacks as numbered cards in the order they're tried (arrows move one up or down), and an "Add fallback" card.
+    fn rows(&mut self, ui: &mut egui::Ui, cfg: &mut Config) {
         let p = pal(ui);
         self.at.clear();
         if self.live.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(1)) {
@@ -1347,84 +1363,94 @@ impl TierEditor {
         let tiers = &mut cfg.tiers;
         let mut saved: Vec<(String, String)> = Vec::new();
         for (t, (tier, _, env)) in TIERS.iter().enumerate() {
-            g.item(ui, |ui| {
+            ui.label(RichText::new(*tier).size(13.0).color(p.muted).strong()).on_hover_text(*env);
+            ui.add_space(6.0);
             let family: Vec<String> = claude.iter().filter(|m| m.contains(TIERS[t].1)).cloned().collect();
             let r = &mut tiers[t];
-            // Name, and Spoofing when the model isn't a Claude one already.
-            ui.allocate_ui_with_layout(vec2(ui.available_width(), 26.0), Layout::right_to_left(Align::Center), |ui| {
+            settings::group(ui, |ui, g| {
+                // Spoofing, when the model isn't a Claude one already.
                 if !r.provider.is_empty() {
-                    let mut on = !r.claude_as.is_empty();
-                    if switch(ui, &mut on, "Spoofing").on_hover_text("Claude Code treats this tier as the Claude model you pick (context window, thinking) and sends the real id via modelOverrides.").changed() {
-                        r.claude_as = if on { family.first().cloned().unwrap_or_default() } else { String::new() };
-                    }
-                }
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.label(RichText::new(*tier).size(12.5).color(p.muted).strong()).on_hover_text(*env);
-                });
-            });
-            let full = ui.available_width() - 24.0;
-            if !r.provider.is_empty() && !r.claude_as.is_empty() {
-                let shown = self.selector(ui, t, SPOOF_ROW, "=", full, &r.claude_as.clone(), false);
-                if let Some(rect) = shown.filter(|_| self.pick == Some((t, SPOOF_ROW))) {
-                    let choices: Vec<Choice> = family.iter().map(|m| Choice { provider: String::new(), model: m.clone(), text: m.clone(), tag: "" }).collect();
-                    if let Some(c) = self.dropdown(ui, rect, &[(OFFICIAL.to_string(), choices)], ("", &r.claude_as.clone())) {
-                        r.claude_as = c.model;
-                    }
-                }
-                if names[t] != r.claude_as {
-                    ui.label(RichText::new(format!("{} already stands for another tier; this one keeps its real id.", r.claude_as)).size(11.5).color(p.danger));
-                }
-            }
-            // The model, then the fallbacks: one numbered chain.
-            let mut chain: Vec<(String, String)> = std::iter::once((r.provider.clone(), r.model.clone())).chain(r.fallbacks.iter().map(|f| (f.provider.clone(), f.model.clone()))).collect();
-            let mut remove = None;
-            let mut picked = None;
-            let only = chain.len() == 1;
-            for (n, (provider, model)) in chain.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let placeholder = provider.is_empty() && model.is_empty();
-                    let shown = self.selector(ui, t, n, &(n + 1).to_string(), full - 36.0, &selector_text(provider, model, &claude, providers), placeholder);
-                    // Nothing to remove from a lone Default; its space stays so every selector keeps its width.
-                    if only && placeholder {
-                        ui.allocate_space(vec2(28.0, 28.0));
-                    } else {
-                        let tip = if n == 0 { "Remove (the first fallback takes its place)" } else { "Remove this fallback" };
-                        if icon_btn(ui, Icon::Delete).on_hover_text(tip).clicked() {
-                            remove = Some(n);
+                    g.setting(ui, "Spoofing", "Claude Code treats this tier as the Claude model you pick (context window, thinking) and sends the real id via modelOverrides.", |ui| {
+                        let mut on = !r.claude_as.is_empty();
+                        if switch(ui, &mut on, "").changed() {
+                            r.claude_as = if on { family.first().cloned().unwrap_or_default() } else { String::new() };
                         }
-                    }
-                    if let Some(rect) = shown.filter(|_| self.pick == Some((t, n))) {
-                        if let Some(c) = self.dropdown(ui, rect, &model_groups(providers, &(self.query.trim().to_string(), claude.clone()), claude_off), (provider, model)) {
-                            picked = Some((n, c));
+                    });
+                }
+                let w = |ui: &egui::Ui, buttons: f32| ui.available_width() - buttons * (28.0 + ui.spacing().item_spacing.x) - 16.0 - ui.spacing().item_spacing.x - 2.0;
+                if !r.provider.is_empty() && !r.claude_as.is_empty() {
+                    g.item(ui, |ui| {
+                        let shown = self.selector(ui, t, SPOOF_ROW, "=", w(ui, 0.0), &r.claude_as.clone(), false);
+                        if let Some(rect) = shown.filter(|_| self.pick == Some((t, SPOOF_ROW))) {
+                            let choices: Vec<Choice> = family.iter().map(|m| Choice { provider: String::new(), model: m.clone(), text: m.clone(), tag: "" }).collect();
+                            if let Some(c) = self.dropdown(ui, rect, &[(OFFICIAL.to_string(), choices)], ("", &r.claude_as.clone())) {
+                                r.claude_as = c.model;
+                            }
                         }
-                    }
+                        if names[t] != r.claude_as {
+                            ui.label(RichText::new(format!("{} already stands for another tier; this one keeps its real id.", r.claude_as)).size(11.5).color(p.danger));
+                        }
+                    });
+                }
+                // The model, then the fallbacks: one numbered chain.
+                let mut chain: Vec<(String, String)> = std::iter::once((r.provider.clone(), r.model.clone())).chain(r.fallbacks.iter().map(|f| (f.provider.clone(), f.model.clone()))).collect();
+                let (mut remove, mut picked, mut moved, mut add) = (None, None, None, false);
+                let count = chain.len();
+                for (n, (provider, model)) in chain.iter().enumerate() {
+                    g.item(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let placeholder = provider.is_empty() && model.is_empty();
+                            let shown = self.selector(ui, t, n, &(n + 1).to_string(), w(ui, 3.0), &selector_text(provider, model, &claude, providers), placeholder);
+                            for (icon, up, tip, on) in [(Icon::Up, true, "Move up (tried earlier)", n > 0), (Icon::Down, false, "Move down (tried later)", n + 1 < count)] {
+                                if ui.add_enabled_ui(on, |ui| icon_btn(ui, icon)).inner.on_hover_text(tip).clicked() {
+                                    moved = Some((n, up));
+                                }
+                            }
+                            // Nothing to remove from a lone Default; its space stays so every selector keeps its width.
+                            if count == 1 && placeholder {
+                                ui.allocate_space(vec2(28.0, 28.0));
+                            } else {
+                                let tip = if n == 0 { "Remove (the first fallback takes its place)" } else { "Remove this fallback" };
+                                if icon_btn(ui, Icon::Delete).on_hover_text(tip).clicked() {
+                                    remove = Some(n);
+                                }
+                            }
+                            if let Some(rect) = shown.filter(|_| self.pick == Some((t, n))) {
+                                if let Some(c) = self.dropdown(ui, rect, &model_groups(providers, &(self.query.trim().to_string(), claude.clone()), claude_off), (provider, model)) {
+                                    picked = Some((n, c));
+                                }
+                            }
+                        });
+                    });
+                }
+                g.setting(ui, "Add fallback", "Tried in turn when the routes above are down or out of quota.", |ui| {
+                    add = settings::button(ui, "Add").clicked();
                 });
-            }
-            self.tree(ui, t, &chain, live.get(TIERS[t].1));
-            // Lined up with the selectors: past the tree's gutter and the number column `selector` draws.
-            ui.horizontal(|ui| {
-                ui.add_space(GUTTER + 16.0 + 2.0 * ui.spacing().item_spacing.x);
-                if ui.add(egui::Label::new(RichText::new(format!("+ New {tier} fallback")).size(12.0).color(p.subtle)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.tree(ui, t, &chain, live.get(TIERS[t].1));
+                if add {
                     chain.push((String::new(), String::new()));
                     self.open(t, chain.len() - 1);
                 }
-            });
-            if let Some((n, c)) = picked {
-                if !c.provider.is_empty() && !c.model.is_empty() {
-                    saved.push((c.provider.clone(), c.model.clone()));
+                if let Some((n, c)) = picked {
+                    if !c.provider.is_empty() && !c.model.is_empty() {
+                        saved.push((c.provider.clone(), c.model.clone()));
+                    }
+                    chain[n] = (c.provider, c.model);
+                    self.pick = None;
                 }
-                chain[n] = (c.provider, c.model);
-                self.pick = None;
-            }
-            if let Some(n) = remove {
-                chain.remove(n);
-                if chain.is_empty() {
-                    chain.push((String::new(), String::new())); // back to Claude Code's own pick
+                if let Some((n, up)) = moved {
+                    shift(&mut chain, n, up);
+                    self.pick = None;
                 }
-                self.pick = None;
-            }
-            (r.provider, r.model) = chain[0].clone();
-            r.fallbacks = chain[1..].iter().map(|(provider, model)| Fallback { provider: provider.clone(), model: model.clone() }).collect();
+                if let Some(n) = remove {
+                    chain.remove(n);
+                    if chain.is_empty() {
+                        chain.push((String::new(), String::new())); // back to Claude Code's own pick
+                    }
+                    self.pick = None;
+                }
+                (r.provider, r.model) = chain[0].clone();
+                r.fallbacks = chain[1..].iter().map(|(provider, model)| Fallback { provider: provider.clone(), model: model.clone() }).collect();
             });
         }
         // A typed id stays on offer under its provider.
@@ -1550,7 +1576,7 @@ impl TierEditor {
                                 continue;
                             }
                             ui.add_space(6.0);
-                            ui.label(RichText::new(group).size(11.5).color(p.subtle));
+                            ui.label(RichText::new(providers::label(group)).size(11.5).color(p.subtle));
                             for c in shown {
                                 first.get_or_insert(c);
                                 let checked = (c.provider.as_str(), c.model.as_str()) == cur;
@@ -1576,6 +1602,18 @@ impl TierEditor {
         }
         // A custom id is only offered under each provider while typing; it's remembered with that provider.
         chosen
+    }
+}
+
+/// Moves row `n` one place up (earlier, towards the primary) or down; false when it is already at that end.
+fn shift<T>(rows: &mut [T], n: usize, up: bool) -> bool {
+    let to = if up { n.checked_sub(1) } else { Some(n + 1).filter(|&m| m < rows.len()) };
+    match to.filter(|_| n < rows.len()) {
+        Some(m) => {
+            rows.swap(n, m);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1674,7 +1712,7 @@ struct Prepared {
 /// signs in by cookie login and needs no key; `login` finds the muse-cli login for configs saved before accounts were.
 fn muse_blocked(p: &Provider, login: impl FnOnce() -> Option<museai::Account>) -> Option<String> {
     match p.muse_account.clone().or_else(login) {
-        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", p.name)),
+        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", providers::label(&p.name))),
         Some(a) if a.disabled => Some(format!("“{}” has its account turned off.", p.name)),
         Some(_) => None,
     }
@@ -1990,6 +2028,21 @@ mod tests {
     }
 
     #[test]
+    fn shift_swaps_with_the_neighbour_and_ignores_the_ends() {
+        let mut v = vec!['a', 'b', 'c'];
+        assert!(shift(&mut v, 1, true));
+        assert_eq!(v, ['b', 'a', 'c']);
+        assert!(shift(&mut v, 1, false));
+        assert_eq!(v, ['b', 'c', 'a']);
+        assert!(!shift(&mut v, 0, true));
+        assert!(!shift(&mut v, 2, false));
+        assert!(!shift(&mut v, 3, true)); // out of range
+        assert_eq!(v, ['b', 'c', 'a']);
+        assert!(!shift(&mut ['x'], 0, false));
+        assert!(!shift::<char>(&mut [], 0, true));
+    }
+
+    #[test]
     fn selector_names_the_provider_only_when_the_model_is_ambiguous() {
         let claude: Vec<String> = ["claude-opus-5-5".into()].to_vec();
         let or = Provider { name: "OR".into(), models: vec!["gemini-x".into(), "claude-opus-5-5".into()], ..Default::default() };
@@ -2154,6 +2207,7 @@ mod tests {
         builtin_chatgpt(&mut fresh);
         assert_eq!(fresh.providers.iter().map(|p| (p.name.as_str(), p.chatgpt)).collect::<Vec<_>>(), [(AG_NAME, false), (GPT_NAME, true)]);
         assert!(check_rename(&fresh.providers, 0, "chatgpt").is_err(), "the name is reserved");
+        assert!(check_rename(&fresh.providers, 0, "Codex").is_err(), "so is the name it is shown under");
     }
 
     #[test]
@@ -2235,6 +2289,25 @@ mod tests {
         let mu = Provider { muse_account: Some(museai::Account::default()), ..cfg.providers[3].clone() };
         let t_mu = target(MUSE_NAME, "muse-chat", &[mu], &claude, 0, "");
         assert_eq!(t_mu.map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
+    }
+
+    #[test]
+    fn muse_chat_is_offered_from_the_start_and_listed_on_its_page() {
+        let mut cfg = Config::default();
+        builtin_muse(&mut cfg);
+        let mu = cfg.providers.iter().find(|p| p.muse).unwrap();
+        assert_eq!((model_names(mu), model_count(mu)), (vec!["muse-chat"], 1), "no Fetch click needed on the local bridge");
+        let groups = model_groups(&cfg.providers, &(String::new(), Vec::new()), false);
+        let muse = groups.iter().find(|(g, _)| g == MUSE_NAME).expect("MuseAI group");
+        assert!(muse.1.iter().any(|c| c.model == "muse-chat" && c.provider == MUSE_NAME));
+        assert!(model_groups(&[Provider { disabled: true, ..mu.clone() }], &(String::new(), Vec::new()), false).iter().all(|(g, _)| g != MUSE_NAME), "off: not offered");
+        // A saved list stays; a remote gateway is not asked at load; custom ids are listed once.
+        let mut kept = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, models: vec!["x".into()], custom: vec!["x".into(), "y".into()], ..Default::default() }], ..Default::default() };
+        builtin_muse(&mut kept);
+        assert_eq!(model_names(&kept.providers[0]), ["x", "y"]);
+        let mut remote = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, url: "https://gateway.invalid".into(), ..Default::default() }], ..Default::default() };
+        builtin_muse(&mut remote);
+        assert!(model_names(&remote.providers[0]).is_empty());
     }
 
     #[test]

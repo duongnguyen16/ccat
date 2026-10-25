@@ -222,7 +222,7 @@ pub fn local_date(t: u64) -> (i64, i64, i64) {
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     };
-    let ticks = t * 10_000_000 + 116_444_736_000_000_000;
+    let ticks = t.min(1 << 40) * 10_000_000 + 116_444_736_000_000_000; // a corrupt huge `t` must not overflow
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
     // SAFETY: plain out-parameters on the stack.
     unsafe {
@@ -246,7 +246,7 @@ pub fn local(t: u64) -> (u16, u16, u16) {
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     };
-    let ticks = t * 10_000_000 + 116_444_736_000_000_000;
+    let ticks = t.min(1 << 40) * 10_000_000 + 116_444_736_000_000_000; // a corrupt huge `t` must not overflow
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
     // SAFETY: plain out-parameters on the stack.
     unsafe {
@@ -520,6 +520,11 @@ pub enum Src {
 impl Src {
     const ALL: [Src; 5] = [Src::Claude, Src::ChatGpt, Src::Antigravity, Src::Ollama, Src::Muse];
 
+    /// What the user sees (the stored `name` stays "ChatGPT").
+    fn label(self) -> &'static str {
+        crate::providers::label(self.name())
+    }
+
     fn name(self) -> &'static str {
         match self {
             Src::Claude => "Claude",
@@ -727,7 +732,7 @@ pub fn tooltip(u: &Usage, shown: &[Src], ag: &[Bar]) -> String {
             Src::Ollama => &u.ollama,
             Src::Muse => &u.muse,
         };
-        lines.push(if src.error.is_empty() { format!("{} {}", s.name(), short(&src.bars)) } else { format!("{}: see window", s.name()) });
+        lines.push(if src.error.is_empty() { format!("{} {}", s.label(), short(&src.bars)) } else { format!("{}: see window", s.label()) });
     }
     lines.join("\n").chars().take(127).collect()
 }
@@ -1106,7 +1111,7 @@ const HEADER_H: f32 = 30.0;
 const ICON_H: f32 = 22.0;
 
 /// `rgba` (w x h, straight alpha) averaged down to `to` x `to`: a plain GPU minify of the 1254px logo aliases.
-fn shrink(rgba: &[u8], w: usize, h: usize, to: usize) -> egui::ColorImage {
+pub(crate) fn shrink(rgba: &[u8], w: usize, h: usize, to: usize) -> egui::ColorImage {
     let mut pixels = Vec::with_capacity(to * to);
     for ty in 0..to {
         let (y0, y1) = (ty * h / to, ((ty + 1) * h / to).max(ty * h / to + 1));
@@ -1188,7 +1193,7 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
         out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: tidy(&u.claude.bars, cfg.show_fable), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty() });
     }
     if u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty()) {
-        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
+        out.push(Section { src: Src::ChatGpt, title: "Codex", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
     }
     if ollama_active(cfg) && (!u.ollama.bars.is_empty() || !u.ollama.error.is_empty()) {
         out.push(Section { src: Src::Ollama, title: "Ollama", which: 3, bars: u.ollama.bars.clone(), errors: [u.ollama.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.ollama.error.is_empty() });
@@ -1720,7 +1725,7 @@ fn load_stats(text: &str, by_model: bool, today: i64, days: i64, provider: Optio
         }
         let n = |k: &str| v[k].as_u64().unwrap_or(0);
         let (input, output) = (n("input") + n("cache_read") + n("cache_write"), n("output"));
-        let key = if by_model { pretty_model(v["model"].as_str().unwrap_or("?")) } else { v["provider"].as_str().unwrap_or("?").to_string() };
+        let key = if by_model { pretty_model(v["model"].as_str().unwrap_or("?")) } else { crate::providers::label(v["provider"].as_str().unwrap_or("?")).to_string() };
         let t = totals.entry(key.clone()).or_default();
         (t.0, t.1) = (t.0 + input, t.1 + output);
         by_day.push((day - first, key, input + output));
@@ -1789,7 +1794,7 @@ pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
         v += step;
     }
     let slot = plot.width() / bars.count.max(1) as f32;
-    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count - 1));
+    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count.saturating_sub(1)));
     for d in 0..bars.count {
         let x = plot.left() + slot * (d as f32 + 0.19);
         let mut base = 0.0;
@@ -1804,7 +1809,7 @@ pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
             pt.rect_filled(bar, radius, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
             base += n;
         }
-        if d % bars.every == bars.first % bars.every {
+        if d % bars.every.max(1) == bars.first % bars.every.max(1) {
             pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, (bars.label)(d), egui::FontId::proportional(10.5), p.subtle);
         }
     }
@@ -1882,15 +1887,26 @@ fn legend(ui: &mut egui::Ui, st: &Stats, more: &mut bool) {
 const RANGES: [&str; 3] = ["Recently", "Today", "This week"];
 
 /// (first bucket's start, bucket seconds, buckets) of range `r` at `now`.
-fn range_span(r: u8, now: u64) -> (u64, u64, usize) {
-    let (wd, h, m) = local(now);
-    let midnight = now - u64::from(h) * 3600 - u64::from(m) * 60 - now % 60;
+pub(crate) fn range_span(r: u8, now: u64) -> (u64, u64, usize) {
+    let (wd, _, _) = local(now);
+    let midnight = midnight(now);
     match r {
         1 => (midnight, 900, 96),
         // ponytail: seven 24-hour days back from midnight; a week with a DST change is an hour off
         2 => (midnight.saturating_sub(u64::from((wd + 6) % 7) * 86_400), 3600, 168),
-        _ => ((now / 60 + 1).saturating_sub(60) * 60, 60, 60),
+        _ => trailing(now, 60, 60),
     }
+}
+
+/// Local midnight of the day holding `t`.
+pub(crate) fn midnight(t: u64) -> u64 {
+    let (_, h, m) = local(t);
+    t.saturating_sub(u64::from(h) * 3600 + u64::from(m) * 60 + t % 60)
+}
+
+/// The last `n` buckets of `w` seconds, the newest one holding `now`: a window that slides with the clock.
+pub(crate) fn trailing(now: u64, w: u64, n: usize) -> (u64, u64, usize) {
+    ((now / w + 1).saturating_sub(n as u64) * w, w, n)
 }
 
 /// Model pricing from models.dev: model_id -> [input, output, cache_read, cache_write] in USD per 1M tokens.
@@ -2009,11 +2025,11 @@ fn load_calls(text: &str, since: u64, pricing: &Pricing) -> Vec<Call> {
 
 /// Per key ("Total", or each model, or each provider: `by` 0, 1, 2), its tokens, calls, or cost per bucket of `span`, running
 /// totals if `cumulative`. Keys biggest first.
-fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
+pub(crate) fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumulative: bool) -> (Vec<String>, Vec<Vec<f64>>) {
     let (start, w, n) = span;
     let key = |c: &Call| match by {
         1 => c.model.clone(),
-        2 => c.provider.clone(),
+        2 => crate::providers::label(&c.provider).to_string(),
         _ => "Total".to_string(),
     };
     let mut keys: Vec<(String, f64)> = Vec::new();
@@ -2048,16 +2064,57 @@ fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumu
     (names, series)
 }
 
-/// One translucent area and line per key, each from zero so they overlap, up to now; Recently slides left with the clock. The scale eases to new heights,
-/// and a key with a request finished in the last minute pulses at its edge and reads "running".
-fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, cumulative: bool) {
+/// How `area_chart` lays its buckets along x. `Slide`: each at its real time, so the chart drifts left with the clock.
+/// `Fit`: the first at the left edge and the latest at the right one. `Full`: the whole span, its future part empty.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum XMode {
+    Slide,
+    Fit,
+    Full,
+}
+
+/// What `area_chart` draws: one translucent area per name, `series[i][bucket]` high, over the buckets of `span`.
+pub(crate) struct Area<'a> {
+    pub names: &'a [String],
+    pub series: &'a [Vec<f64>],
+    pub span: (u64, u64, usize),
+    pub mode: XMode,
+    /// 0 tokens, 1 calls, 2 cost.
+    pub metric: u8,
+    pub cumulative: bool,
+    pub height: f32,
+    /// Time marks under the plot: a position from 0 to 1 and its text.
+    pub marks: &'a [(f32, String)],
+    /// The hover heading for the bucket starting at a time.
+    pub when: &'a dyn Fn(u64) -> String,
+    /// Whether a name is serving a request right now.
+    pub running: &'a dyn Fn(&str) -> bool,
+    /// Where the eased scale is remembered; it must differ whenever the scale's meaning does.
+    pub id: egui::Id,
+    /// A running name's dot pulses (needs a frame every ~30 ms); else it is a still halo.
+    pub pulse: bool,
+}
+
+/// The bucket of `span` that holds `now` (the last one when `now` is past it).
+pub(crate) fn current_bucket(span: (u64, u64, usize), now: u64) -> usize {
+    let (start, w, n) = span;
+    (now.saturating_sub(start) / w.max(1)).min(n.max(1) as u64 - 1) as usize
+}
+
+/// Whether a request of `by` (1 model, 2 provider, else all) named `name` finished in the last minute.
+pub(crate) fn running(calls: &[Call], now: u64, by: u8, name: &str) -> bool {
+    calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { crate::providers::label(&c.provider) }) == name)
+}
+
+/// One translucent area and line per name, each from zero so they overlap, up to now. The scale eases to new heights,
+/// and a name with a request finished in the last minute has a dot at its edge.
+pub(crate) fn area_chart(ui: &mut egui::Ui, exact: f64, a: &Area) {
     let p = crate::pal(ui);
-    let exact = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let now = exact as u64;
-    let span @ (start, w, n) = range_span(range, now);
-    let (names, series) = live_series(calls, span, by, metric, cumulative);
-    let cur = (now.saturating_sub(start) / w).min(n as u64 - 1) as usize;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 170.0), egui::Sense::hover());
+    let span @ (start, w, n) = a.span;
+    let (names, series, metric) = (a.names, a.series, a.metric);
+    let cur = current_bucket(span, now);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), a.height), egui::Sense::hover());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(38.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
     // Each key from zero, overlapping: the scale is the highest single one.
     let max = series.iter().flat_map(|s| &s[..=cur]).cloned().fold(0.0, f64::max).max(match metric {
@@ -2070,7 +2127,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
     let mag = 10f64.powf(raw.log10().floor());
     let step = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|s| *s >= raw).unwrap_or(raw);
     let target = (max / step).ceil() * step;
-    let top = ui.ctx().animate_value_with_time(egui::Id::new(("live-top", range, by, metric, cumulative)), target as f32, 0.35).max(if metric == 2 { 0.005 } else { 1.0 }) as f64;
+    let top = ui.ctx().animate_value_with_time(a.id, target as f32, 0.35).max(if metric == 2 { 0.005 } else { 1.0 }) as f64;
     let pt = ui.painter_at(rect);
     let y_of = |v: f64| plot.bottom() - (v / top).min(1.05) as f32 * plot.height();
     let fmt = |v: f64| match metric {
@@ -2087,15 +2144,12 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
         pt.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER, fmt(v), egui::FontId::proportional(10.5), p.subtle);
         v += step;
     }
-    // Recently: each bucket's centre sits at its real time, so the chart drifts left as the clock runs. This week
-    // scales from Monday to the latest bucket so the line meets the right edge. Today keeps its 24 hours.
-    let x_of = |k: usize| match range {
-        0 => plot.right() - (((exact - (start + k as u64 * w) as f64 - w as f64 / 2.0) / (n as u64 * w) as f64) as f32 * plot.width()),
-        2 if cur > 0 => plot.left() + (k as f32 / cur as f32) * plot.width(),
+    let x_of = |k: usize| match a.mode {
+        XMode::Slide => plot.right() - (((exact - (start + k as u64 * w) as f64 - w as f64 / 2.0) / (n as u64 * w) as f64) as f32 * plot.width()),
+        XMode::Fit if cur > 0 => plot.left() + (k as f32 / cur as f32) * plot.width(),
         _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
     };
     let clip = pt.with_clip_rect(plot);
-    let running = |name: &str| calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { &c.provider }) == name);
     // Biggest first, so the smaller ones are drawn over it and stay visible.
     for (i, s) in series.iter().enumerate() {
         let c = hue(i, p);
@@ -2117,49 +2171,26 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
             clip.add(mesh);
             clip.add(egui::Shape::line(edge, egui::Stroke::new(2.0, c)));
         }
-        if running(&names[i]) {
-            let pulse = (exact.fract() * std::f64::consts::TAU).sin() as f32 * 0.5 + 0.5;
+        if (a.running)(&names[i]) {
+            let pulse = if a.pulse { (exact.fract() * std::f64::consts::TAU).sin() as f32 * 0.5 + 0.5 } else { 0.5 };
             let at = egui::pos2(x_of(cur), y_of(s[cur]));
             pt.circle_filled(at, 3.0 + 3.0 * pulse, c.gamma_multiply(0.35 * (1.0 - pulse)));
             pt.circle_filled(at, 3.0, c);
         }
     }
     // Time along the bottom.
-    let clock = |t: u64| {
-        let (_, h, m) = local(t);
-        format!("{h:02}:{m:02}")
-    };
-    let (wd, _, _) = local(now);
-    let cur_day = ((wd + 6) % 7) as usize;
-    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let marks: Vec<(f32, String)> = match range {
-        0 => vec![(0.0, "-60m".into()), (0.5, "-30m".into()), (1.0, "now".into())],
-        1 => (0..=4).map(|q| (q as f32 / 4.0, format!("{:02}:00", q * 6))).collect(),
-        _ if cur == 0 => vec![(0.0, "Mon".into())],
-        _ => (0..=cur_day)
-            .map(|d| {
-                let center = if d < cur_day { d as f32 * 24.0 + 12.0 } else { ((d * 24 + cur) as f32 / 2.0).min(cur as f32) };
-                (center / cur as f32, days[d].to_string())
-            })
-            .collect(),
-    };
-    for (frac, text) in marks {
-        let align = if frac <= 0.05 { egui::Align2::LEFT_TOP } else if frac >= 0.95 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
+    for (frac, text) in a.marks {
+        let align = if *frac <= 0.05 { egui::Align2::LEFT_TOP } else if *frac >= 0.95 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
         pt.text(egui::pos2(plot.left() + plot.width() * frac.clamp(0.0, 1.0), plot.bottom() + 4.0), align, text, egui::FontId::proportional(10.5), p.subtle);
     }
     // Hover: the bucket under the pointer, per key.
     if let Some(h) = resp.hover_pos().filter(|h| plot.contains(*h)) {
         let k = (0..=cur).min_by(|a, b| (x_of(*a) - h.x).abs().total_cmp(&(x_of(*b) - h.x).abs())).unwrap_or(0);
         clip.line_segment([egui::pos2(x_of(k), plot.top()), egui::pos2(x_of(k), plot.bottom())], egui::Stroke::new(1.0, p.border_strong));
-        let at = start + k as u64 * w;
-        let when = match range {
-            0 => format!("{} ({})", clock(at), match now.saturating_sub(at) / 60 { 0 => "this minute".to_string(), m => format!("{m}m ago") }),
-            1 => format!("{} – {}", clock(at), clock(at + w)),
-            _ => format!("{} {}", ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][local(at).0 as usize % 7], clock(at)),
-        };
+        let when = (a.when)(start + k as u64 * w);
         let rows: Vec<(usize, f64)> = series.iter().enumerate().map(|(i, s)| (i, s[k])).filter(|(_, v)| *v > 0.0).collect();
         resp.on_hover_ui_at_pointer(|ui| {
-            ui.label(egui::RichText::new(if cumulative { format!("{when}, so far") } else { when }).strong().color(p.fg));
+            ui.label(egui::RichText::new(if a.cumulative { format!("{when}, so far") } else { when }).strong().color(p.fg));
             if rows.is_empty() {
                 ui.label(egui::RichText::new("None").color(p.subtle));
             }
@@ -2172,10 +2203,59 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
             }
         });
     }
+}
+
+/// The tray's Live chart, with its legend under it. Recently slides left with the clock.
+fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, cumulative: bool) {
+    let p = crate::pal(ui);
+    let exact = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let now = exact as u64;
+    let span @ (_, w, _) = range_span(range, now);
+    let (names, series) = live_series(calls, span, by, metric, cumulative);
+    let cur = current_bucket(span, now);
+    let clock = |t: u64| {
+        let (_, h, m) = local(t);
+        format!("{h:02}:{m:02}")
+    };
+    let (wd, _, _) = local(now);
+    let cur_day = ((wd + 6) % 7) as usize;
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    // Time along the bottom.
+    let marks: Vec<(f32, String)> = match range {
+        0 => vec![(0.0, "-60m".into()), (0.5, "-30m".into()), (1.0, "now".into())],
+        1 => (0..=4).map(|q| (q as f32 / 4.0, format!("{:02}:00", q * 6))).collect(),
+        _ if cur == 0 => vec![(0.0, "Mon".into())],
+        _ => (0..=cur_day)
+            .map(|d| {
+                let center = if d < cur_day { d as f32 * 24.0 + 12.0 } else { ((d * 24 + cur) as f32 / 2.0).min(cur as f32) };
+                (center / cur as f32, days[d].to_string())
+            })
+            .collect(),
+    };
+    let when = |at: u64| match range {
+        0 => format!("{} ({})", clock(at), match now.saturating_sub(at) / 60 { 0 => "this minute".to_string(), m => format!("{m}m ago") }),
+        1 => format!("{} – {}", clock(at), clock(at + w)),
+        _ => format!("{} {}", ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][local(at).0 as usize % 7], clock(at)),
+    };
+    let is_running = |name: &str| running(calls, now, by, name);
+    // Recently: each bucket's centre sits at its real time, so the chart drifts left as the clock runs. This week
+    // scales from Monday to the latest bucket so the line meets the right edge. Today keeps its 24 hours.
+    let mode = match range {
+        0 => XMode::Slide,
+        2 => XMode::Fit,
+        _ => XMode::Full,
+    };
+    let area = Area { names: &names, series: &series, span, mode, metric, cumulative, height: 170.0, marks: &marks, when: &when, running: &is_running, id: egui::Id::new(("live-top", range, by, metric, cumulative)), pulse: true };
+    area_chart(ui, exact, &area);
     ui.add_space(6.0);
     let unit = match metric {
         1 => " calls",
         _ => "",
+    };
+    let fmt = |v: f64| match metric {
+        0 => fmt_tokens(v),
+        1 => format!("{v:.0}"),
+        _ => fmt_cost(v),
     };
     for (i, name) in names.iter().enumerate() {
         let total = if cumulative { series[i][cur] } else { series[i].iter().sum() };
@@ -2184,7 +2264,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
             ui.painter().rect_filled(dot, 2.0, hue(i, p));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(format!("{}{unit}", fmt(total))).size(12.0).color(p.fg));
-                if running(name) {
+                if is_running(name) {
                     ui.label(egui::RichText::new("running").size(11.0).color(BLUE));
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -2320,7 +2400,7 @@ pub(crate) fn display_block(ui: &mut egui::Ui, g: &mut crate::settings::Cards, c
         let mut swap = None;
         // Right to left, so the chips read in order.
         for (i, s) in list.iter().enumerate().rev() {
-            let m = chip(ui, s.name(), i > 0, i < last);
+            let m = chip(ui, s.label(), i > 0, i < last);
             if m != 0 {
                 swap = Some((i, (i as i32 + m) as usize));
             }
@@ -2368,6 +2448,14 @@ fn spawn_refresh(which: usize, busy: Option<std::sync::Arc<std::sync::atomic::At
     });
 }
 
+/// After the popup resizes, moves or switches tab, a focus loss this soon is Windows reshuffling, not a click elsewhere.
+const FOCUS_GRACE: Duration = Duration::from_millis(600);
+
+/// Esc always closes; losing focus closes only after the window has been focused once and the resize grace is over.
+fn should_close(focused_once: bool, focused: Option<bool>, ignore_until: std::time::Instant, now: std::time::Instant, esc: bool) -> bool {
+    esc || (focused_once && focused == Some(false) && now >= ignore_until)
+}
+
 struct Popup {
     cfg: crate::Config,
     loaded: Value,
@@ -2377,6 +2465,8 @@ struct Popup {
     busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; Src::ALL.len()],
     anchor: (f32, f32, f32),
     focused_once: bool,
+    /// Our own resize/move (or a tab switch) can make Windows report a transient focus loss: ignored until then.
+    ignore_focus_until: std::time::Instant,
     /// The window's fade-in is off (done on the first frame, before eframe shows it).
     styled: bool,
     tab: Tab,
@@ -2664,7 +2754,7 @@ impl eframe::App for Popup {
         let focused = ui.input(|i| i.viewport().focused);
         self.focused_once |= focused == Some(true);
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if esc || (self.focused_once && focused == Some(false)) {
+        if should_close(self.focused_once, focused, self.ignore_focus_until, std::time::Instant::now(), esc) {
             ui.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -2678,10 +2768,12 @@ impl eframe::App for Popup {
         let h = h.min(self.anchor.1 - self.anchor.2).max(120.0);
         if let Some(r) = ui.input(|i| i.viewport().inner_rect) {
             if (r.height() - h).abs() > 0.5 {
+                self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
                 ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(POPUP_W, h)));
             }
             let want = egui::pos2(self.anchor.0, (self.anchor.1 - h).max(self.anchor.2));
             if ui.input(|i| i.viewport().outer_rect).is_some_and(|o| (o.min - want).length() > 1.0) {
+                self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
                 ui.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want));
             }
         }
@@ -2690,6 +2782,7 @@ impl eframe::App for Popup {
         // What this window edits: the Antigravity view and the Analytics options.
         let snapshot = |c: &crate::Config| (c.ag_group.clone(), [c.analytics_view, c.live_range, c.live_by], c.live_metric, c.live_cumulative);
         let before = snapshot(&self.cfg);
+        let tab_before = self.tab;
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
         let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::same(PAD as i8));
         let measured = egui::CentralPanel::default()
@@ -2726,6 +2819,9 @@ impl eframe::App for Popup {
         if (measured - self.measured).abs() > 0.5 {
             self.measured = measured;
             ctx.request_repaint();
+        }
+        if self.tab != tab_before || snapshot(&self.cfg) != before {
+            self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
         }
         if snapshot(&self.cfg) != before {
             self.save(); // running sessions follow the config file
@@ -2779,6 +2875,7 @@ pub fn run_popup(click: (f64, f64)) {
                 busy: Default::default(),
                 anchor,
                 focused_once: false,
+                ignore_focus_until: std::time::Instant::now(),
                 styled: false,
                 tab: Tab::Usage,
                 by_model,
@@ -2924,7 +3021,7 @@ mod tests {
         let cfg = crate::Config::default();
         let mut u = Usage { chatgpt_on: true, chatgpt_plan: plan, chatgpt: Source { bars, ..Default::default() }, ..Default::default() };
         let s = sections(&cfg, &u, true);
-        assert_eq!(s.iter().map(|s| s.title).collect::<Vec<_>>(), ["Claude", "ChatGPT"], "between Claude and Antigravity");
+        assert_eq!(s.iter().map(|s| s.title).collect::<Vec<_>>(), ["Claude", "Codex"], "between Claude and Antigravity");
         u.chatgpt_on = false;
         assert!(sections(&cfg, &u, false).is_empty(), "no Codex login: no section");
     }
@@ -3078,6 +3175,7 @@ mod tests {
             busy: Default::default(),
             anchor: (0.0, 0.0, 0.0),
             focused_once: false,
+            ignore_focus_until: std::time::Instant::now(),
             styled: false,
             tab: Tab::Usage,
             by_model: false,
@@ -3199,7 +3297,7 @@ mod tests {
         let (names, s) = live_series(&calls, span, 0, 0, false);
         assert_eq!((names.len(), s[0][1], s[0][49]), (1, 110.0, 10.0), "total tokens, in and out");
         let (names, c) = live_series(&calls, span, 2, 1, true);
-        assert_eq!(names, ["Antigravity", "ChatGPT", "Claude"]);
+        assert_eq!(names, ["Antigravity", "Claude", "Codex"]);
         assert_eq!((c[2][0], c[2][1], c[2][59], c[0][48], c[0][49]), (0.0, 1.0, 1.0, 0.0, 1.0), "cumulative: only ever rises");
         let (_names, cost) = live_series(&calls, span, 0, 2, false);
         assert!(cost[0][1] > 0.0, "cost is computed from model rates");
@@ -3351,5 +3449,38 @@ mod tests {
         assert_eq!(ag.keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["Gemini X"], "a provider page counts only its own records");
     }
 
+    #[test]
+    fn analytics_edge_data_does_not_panic() {
+        let today = local_day(1_792_400_000);
+        // Empty file, garbage only, a record from the future (today before the first record), a corrupt huge time.
+        for text in ["", "garbage\n\n{}", r#"{"t":9999999999,"provider":"X","model":"m","input":1}"#, r#"{"t":18446744073709551615,"model":"m"}"#] {
+            for days in [1, 7, DAYS] {
+                let st = load_stats(text, true, today, days, None);
+                assert!(st.keys.is_empty() && st.days == days, "{text}");
+            }
+        }
+        let one = r#"{"t":1792400000,"provider":"Claude","model":"claude-opus-5-5","input":3,"output":4}"#;
+        let st = load_stats(one, true, today, DAYS, None);
+        assert_eq!((st.keys.len(), st.cells[&(DAYS - 1, 0)]), (1, 7), "one record is today's last bar");
+        let (names, series) = live_series(&[], range_span(1, 1_792_400_000), 1, 0, true);
+        assert!(names.is_empty() && series.is_empty());
+        assert!(load_calls("", 0, &Pricing::default()).is_empty());
+        let calls = load_calls(&format!("{one}\n{{}}"), 0, &Pricing::default());
+        for r in 0..3 {
+            let (n, s) = live_series(&calls, range_span(r, 1_792_400_000), 2, 2, true);
+            assert!(s.iter().all(|x| x.len() == range_span(r, 1_792_400_000).2), "{n:?}");
+        }
+    }
 
+    #[test]
+    fn popup_focus_loss_closes_only_after_the_grace() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + FOCUS_GRACE;
+        assert!(should_close(false, None, t0, t0, true), "Esc always closes, even inside the grace");
+        assert!(should_close(true, Some(false), t0, t0, false), "a click elsewhere closes once the grace is over");
+        assert!(!should_close(true, Some(false), later, t0, false), "a focus loss inside the grace is ignored");
+        assert!(should_close(true, Some(false), later, later, false), "...and counts again when it ends");
+        assert!(!should_close(false, Some(false), t0, later, false), "never focused yet: not a click-away");
+        assert!(!should_close(true, Some(true), t0, later, false) && !should_close(true, None, t0, later, false));
+    }
 }

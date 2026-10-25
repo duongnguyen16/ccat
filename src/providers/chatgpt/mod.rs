@@ -390,7 +390,7 @@ impl Drop for Lock {
 /// while this one waited (a second refresh with the rotated token would be `refresh_token_reused`, which is terminal).
 /// `rejected` is a token the API just refused; it is never handed out again. `refresh` does the network call.
 pub fn access(dir: &Path, key: &str, rejected: Option<&str>, refresh: &dyn Fn(&Creds) -> Result<Creds, TokenErr>) -> Result<(String, u64), TokenErr> {
-    let again = || TokenErr::SignIn("This ChatGPT account must be signed in again.".into());
+    let again = || TokenErr::SignIn("This Codex account must be signed in again.".into());
     let usable = |c: &Creds| c.expires_at > now() + EARLY && Some(c.access_token.as_str()) != rejected;
     let c = read(dir, key).ok_or_else(again)?;
     if c.reauth {
@@ -554,7 +554,7 @@ fn get_json(url: &str, headers: &[(&str, String)]) -> Result<Value, String> {
     let text = res.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("response is not JSON: {e}"))?;
     if status != 200 {
-        return Err(format!("ChatGPT request failed ({status}): {}", error_fields(&v).1));
+        return Err(format!("Codex request failed ({status}): {}", error_fields(&v).1));
     }
     Ok(v)
 }
@@ -564,7 +564,7 @@ fn get_json(url: &str, headers: &[(&str, String)]) -> Result<Value, String> {
 /// refuses falls back to the official `/models`.
 pub fn list_models(key: &str, legacy: bool) -> Result<Vec<ChatgptModel>, String> {
     let d = dir();
-    let creds = read(&d, key).ok_or("This ChatGPT account must be signed in again.")?;
+    let creds = read(&d, key).ok_or("This Codex account must be signed in again.")?;
     let (token, _) = access(&d, key, None, &refresh_tokens).map_err(|e| e.message().to_string())?;
     if creds.route == CODEX || legacy {
         let url = format!("{CODEX_BASE}/codex/models?client_version={CODEX_VERSION}");
@@ -621,7 +621,7 @@ pub fn sign_out(key: &str) {
     let d = dir();
     if let Some(c) = read(&d, key).filter(|c| c.route != CODEX) {
         if let Err(e) = revoke(&c) {
-            log(&format!("ChatGPT sign-out: could not revoke the token at OpenAI ({e}); deleting the local copy anyway"));
+            log(&format!("Codex sign-out: could not revoke the token at OpenAI ({e}); deleting the local copy anyway"));
         }
     }
     for f in [format!("{key}.json"), format!("{key}.lock")] {
@@ -762,7 +762,7 @@ impl Login {
         let granted = c.scope.split_whitespace().any(|s| s == PLAN_SCOPE);
         let key = key_of(&sub);
         write(&self.dir, &key, &c)?;
-        log(&format!("ChatGPT signed in {email} (plan usage {})", if granted { "granted" } else { "NOT granted" }));
+        log(&format!("Codex signed in {email} (plan usage {})", if granted { "granted" } else { "NOT granted" }));
         Ok(ChatgptAccount { key, email, granted, plan: c.plan, ..Default::default() })
     }
 
@@ -784,7 +784,7 @@ impl Login {
         (c.account_id, c.plan, c.email, c.sub) = (account_id, plan.clone(), email.clone(), sub);
         let key = key_of(&format!("codex:{who}"));
         write(&self.dir, &key, &c)?;
-        log(&format!("ChatGPT (Codex route) signed in {email} (plan {plan})"));
+        log(&format!("Codex (Legacy route) signed in {email} (plan {plan})"));
         Ok(ChatgptAccount { key, email, granted: true, route: CODEX.into(), plan, ..Default::default() })
     }
 }
@@ -854,8 +854,8 @@ pub fn classify(status: u16, code: &str, message: &str, param: &str) -> Denied {
     let unsupported = code == "subscription_sharing_unsupported_capability";
     let message = match (unsupported, param.is_empty()) {
         _ if code == "context_length_exceeded" => format!("prompt is too long: {message}"),
-        (true, false) => format!("ChatGPT: {message} (unsupported: {param})"),
-        _ => format!("ChatGPT: {message}"),
+        (true, false) => format!("Codex: {message} (unsupported: {param})"),
+        _ => format!("Codex: {message}"),
     };
     Denied { failure: Failure { status: st, message, retry_after: block.filter(|_| st == 429) }, block, param: if unsupported { param.to_string() } else { String::new() } }
 }
@@ -947,7 +947,7 @@ impl Pool {
     /// Skips the account for `secs`, remembering why, so "nothing left" names the real reason.
     pub fn block(&self, key: &str, secs: u64, why: &Failure) {
         let who = self.accounts.read().unwrap().iter().find(|a| a.key == key).map_or(key.to_string(), |a| a.email.clone());
-        log(&format!("ChatGPT {who} skipped for {secs}s: {} {}", why.status, why.message));
+        log(&format!("Codex {who} skipped for {secs}s: {} {}", why.status, why.message));
         self.blocked.lock().unwrap().insert(key.to_string(), (Instant::now() + Duration::from_secs(secs), why.status, why.message.clone()));
         self.since.lock().unwrap().insert(key.to_string(), crate::now());
     }
@@ -960,7 +960,7 @@ impl Pool {
         blocked.retain(|k, (t, status, _)| !(*status == 429 && *t > Instant::now() && since.get(k).is_some_and(|s| *s < fetched)));
         let lifted = blocked.len() < before;
         if lifted {
-            log(&format!("ChatGPT has plan usage again (usage at {fetched}): back in the rotation"));
+            log(&format!("Codex has plan usage again (usage at {fetched}): back in the rotation"));
         }
         lifted
     }
@@ -984,7 +984,7 @@ impl Pool {
         if !self.blocked.lock().unwrap().get(key).is_some_and(|(_, st, _)| matches!(st, 401 | 403)) || read(&self.dir, key).is_none_or(|c| c.signed_in <= since) {
             return;
         }
-        log(&format!("ChatGPT {key} signed in again: its block is lifted"));
+        log(&format!("Codex {key} signed in again: its block is lifted"));
         self.blocked.lock().unwrap().remove(key);
         self.since.lock().unwrap().remove(key);
         self.cache.lock().unwrap().remove(key);
@@ -996,14 +996,14 @@ impl Pool {
         let usable: Vec<&ChatgptAccount> = accounts.iter().filter(|a| !self.off(a)).collect();
         let fail = |message: &str| Failure { status: 403, message: message.into(), retry_after: None };
         if accounts.is_empty() {
-            return fail("No ChatGPT accounts. Sign in with ChatGPT in ccat → Settings → ChatGPT.");
+            return fail("No Codex accounts. Sign in with ChatGPT in ccat → Settings → Codex.");
         }
         if usable.is_empty() {
             let refused = self.legacy() && accounts.iter().any(|a| a.usable() && read(&self.dir, &a.key).is_some_and(|c| c.refused()));
             return fail(if refused {
-                "Codex (Legacy) needs its own sign-in: the Codex backend refused the ChatGPT sign-in. Use \"Sign in for Codex (Legacy)\" in ccat → Settings → ChatGPT, or switch to Official."
+                "Codex (Legacy) needs its own sign-in: the Codex backend refused the ChatGPT sign-in. Use \"Sign in for Codex (Legacy)\" in ccat → Settings → Codex, or switch to Official."
             } else {
-                "No ChatGPT account can be used in this mode: turn one on, or sign in (again) in ccat → Settings → ChatGPT (plan usage must be granted)."
+                "No Codex account can be used in this mode: turn one on, or sign in (again) in ccat → Settings → Codex (plan usage must be granted)."
             });
         }
         // The account back soonest, and why it is out.
@@ -1012,9 +1012,9 @@ impl Pool {
         let (secs, status, why) = soonest.map_or((60, 429, String::new()), |(t, st, m)| (t.saturating_duration_since(Instant::now()).as_secs().max(1), *st, m.clone()));
         let wait = format!("{}m{}s", secs / 60, secs % 60);
         match status {
-            429 => Failure { status: 429, message: format!("All {} ChatGPT account(s) are over their plan usage; trying again in {wait}.", usable.len()), retry_after: Some(secs) },
-            401 => Failure { status: 401, message: format!("{why}. Sign in again in ccat → Settings → ChatGPT."), retry_after: None },
-            st => Failure { status: st, message: format!("{why} (ChatGPT is skipped for {wait})."), retry_after: None },
+            429 => Failure { status: 429, message: format!("All {} Codex account(s) are over their plan usage; trying again in {wait}.", usable.len()), retry_after: Some(secs) },
+            401 => Failure { status: 401, message: format!("{why}. Sign in again in ccat → Settings → Codex."), retry_after: None },
+            st => Failure { status: st, message: format!("{why} (Codex is skipped for {wait})."), retry_after: None },
         }
     }
 
@@ -1077,7 +1077,7 @@ impl Pool {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 let h = limit_headers(res.headers());
-                log(&format!("ChatGPT response headers about limits: {}", if h.is_empty() { "none".to_string() } else { h.join(" ") }));
+                log(&format!("Codex response headers about limits: {}", if h.is_empty() { "none".to_string() } else { h.join(" ") }));
             }
             let status = res.status().as_u16();
             if status == 200 {
@@ -1086,7 +1086,7 @@ impl Pool {
             let text = res.body_mut().read_to_string().unwrap_or_default();
             let (code, message, param) = error_fields(&serde_json::from_str(&text).unwrap_or_default());
             let message = if message.is_empty() { text.chars().take(300).collect() } else { message };
-            log(&format!("ChatGPT {}: {status} {code} {message}", a.email));
+            log(&format!("Codex {}: {status} {code} {message}", a.email));
             // A plain 401 (no code) may only be a stale token: refresh once and ask again.
             if status == 401 && code.is_empty() && rejected.is_none() {
                 self.cache.lock().unwrap().remove(&a.key);
@@ -1156,15 +1156,15 @@ fn usage_accounts(cfg: &crate::Config, refused: &dyn Fn(&str) -> bool) -> Vec<Ch
     accounts
 }
 
-const LOGIN_EXPIRED: &str = "ChatGPT login expired";
+const LOGIN_EXPIRED: &str = "Codex login expired";
 
 /// What a refused usage call (401/403) means for this account: only a Codex-client login can be "expired"; a Sign in with
 /// ChatGPT token is simply not accepted by `wham/usage`.
 fn usage_refusal(a: &ChatgptAccount) -> &'static str {
     if a.own_codex() {
-        "ChatGPT login expired: sign in again in ccat."
+        "Codex login expired: sign in again in ccat."
     } else {
-        "Usage numbers need the Codex (Legacy) sign-in: use \"Sign in for Codex (Legacy)\" in Settings → ChatGPT."
+        "Usage numbers need the Codex (Legacy) sign-in: use \"Sign in for Codex (Legacy)\" in Settings → Codex."
     }
 }
 
@@ -1173,7 +1173,7 @@ fn usage_refusal(a: &ChatgptAccount) -> &'static str {
 /// not read it, and the answer is no numbers (the Settings page says so).
 pub(crate) fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (String, u64)> {
     let legacy = gpt_mode(cfg);
-    let mut last = ("ChatGPT sign-in expired: sign in again in Settings → ChatGPT.".to_string(), 0);
+    let mut last = ("Codex sign-in expired: sign in again in Settings → Codex.".to_string(), 0);
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
     let mut refused = false;
     for a in usage_accounts(cfg, &legacy_refused) {
@@ -1185,7 +1185,7 @@ pub(crate) fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (
         let mut res = match req.call() {
             Ok(r) => r,
             Err(e) => {
-                last = (format!("Can't reach ChatGPT: {e}"), 0);
+                last = (format!("Can't reach Codex: {e}"), 0);
                 continue;
             }
         };
@@ -1210,7 +1210,7 @@ pub(crate) fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (
             }
             s => {
                 refused = true;
-                last = (format!("ChatGPT answered {s}."), 0);
+                last = (format!("Codex answered {s}."), 0);
             }
         }
     }
@@ -1415,7 +1415,7 @@ mod tests {
         p.block("cxa", 60, &d.failure);
         let f = p.exhausted();
         assert_eq!(f.status, 401);
-        assert!(f.message.contains("invalidated oauth token") && f.message.contains("Settings → ChatGPT") && !f.message.contains("plan usage"), "{}", f.message);
+        assert!(f.message.contains("invalidated oauth token") && f.message.contains("Settings → Codex") && !f.message.contains("plan usage"), "{}", f.message);
     }
 
     #[test]

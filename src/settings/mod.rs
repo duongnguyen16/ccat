@@ -35,6 +35,7 @@ enum Page {
     Tokens,
     Display,
     About,
+    Dashboard,
     Analytics,
     History,
     Claude,
@@ -75,6 +76,7 @@ fn items(cfg: &Config) -> Vec<Item> {
         general(Page::Tokens, "Token saving", Glyph::Leaf),
         general(Page::Display, "Display", Glyph::Monitor),
         general(Page::About, "About", Glyph::Info),
+        item(Group::Insights, Page::Dashboard, "Dashboard", Glyph::Dashboard, false),
         item(Group::Insights, Page::Analytics, "Analytics", Glyph::Bars, false),
         item(Group::Insights, Page::History, "History", Glyph::Clock, false),
     ];
@@ -82,7 +84,7 @@ fn items(cfg: &Config) -> Vec<Item> {
     v.push(provider(Page::Claude, "Claude", Glyph::Claude, cfg.claude_off));
     for (kind, page, glyph) in [(Kind::Antigravity, Page::Antigravity, Glyph::Antigravity), (Kind::ChatGpt, Page::ChatGpt, Glyph::ChatGpt), (Kind::Ollama, Page::Ollama, Glyph::Ollama), (Kind::Muse, Page::Muse, Glyph::Muse)] {
         if let Some(p) = cfg.providers.iter().find(|p| p.kind() == kind) {
-            v.push(provider(page, &p.name, glyph, p.disabled));
+            v.push(provider(page, crate::providers::label(&p.name), glyph, p.disabled));
         }
     }
     for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::Endpoint) {
@@ -102,6 +104,7 @@ impl Page {
     /// The page a command-line argument names: a sidebar label, or its first word ("models", "token").
     fn parse(arg: &str, cfg: &Config) -> Option<Page> {
         let a = arg.trim().to_lowercase();
+        let a = if a == "chatgpt" { "codex".to_string() } else { a }; // the page's old name
         items(cfg).into_iter().filter(|i| i.page != Page::Add).find(|i| {
             let label = i.label.to_lowercase();
             label == a || label.split_whitespace().next() == Some(a.as_str())
@@ -318,7 +321,7 @@ fn setting_row(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, contr
 }
 
 /// A sidebar row: the selected one is a filled, rounded row.
-fn nav_item(ui: &mut egui::Ui, text: &str, glyph: Glyph, selected: bool, off: bool) -> egui::Response {
+fn nav_item(ui: &mut egui::Ui, logos: &mut glyph::Logos, text: &str, glyph: Glyph, selected: bool, off: bool) -> egui::Response {
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if selected {
@@ -329,7 +332,10 @@ fn nav_item(ui: &mut egui::Ui, text: &str, glyph: Glyph, selected: bool, off: bo
     let color = if selected || !off { p.fg } else { p.muted };
     let right = if off { 38.0 } else { 10.0 };
     // The icon and the label share the row's centre line, whatever the font's metrics.
-    glyph::paint(ui.painter(), rect.left_center() + vec2(20.0, 0.0), glyph, color);
+    let at = rect.left_center() + vec2(20.0, 0.0);
+    if !logos.paint(ui, at, 18.0, glyph, color, if selected || !off { 1.0 } else { 0.45 }) {
+        glyph::paint(ui.painter(), at, glyph, color);
+    }
     ui.painter().with_clip_rect(rect.with_max_x(rect.right() - right)).text(rect.left_center() + vec2(38.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(13.5), color);
     if off {
         ui.painter().text(rect.right_center() - vec2(10.0, 0.0), Align2::RIGHT_CENTER, "off", FontId::proportional(11.0), p.subtle);
@@ -350,15 +356,17 @@ struct Settings {
     providers: ProvidersEditor,
     /// `usage.json` as the provider pages' limits blocks show it.
     feed: usage::Feed,
-    /// The Analytics and History pages' log and filters.
+    /// The Dashboard, Analytics and History pages' log and filters.
     insights: insights::Insights,
     /// The logo at the top of the sidebar, loaded on first draw.
     logo: Option<egui::TextureHandle>,
+    /// The providers' logos in the sidebar.
+    logos: glyph::Logos,
 }
 
 impl Settings {
     fn new(cfg: Config, loaded: serde_json::Value) -> Self {
-        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new(), insights: insights::Insights::new(), logo: None }
+        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new(), insights: insights::Insights::new(), logo: None, logos: Default::default() }
     }
 
     /// Takes in what another process saved (the launcher, a second Settings, a session's model switch), unless
@@ -428,7 +436,7 @@ impl Settings {
                 ui.label(RichText::new(caption).size(11.5).color(p.subtle));
                 ui.add_space(2.0);
                 for it in mine {
-                    if nav_item(ui, &it.label, it.glyph, it.page == self.page, it.off).clicked() {
+                    if nav_item(ui, &mut self.logos, &it.label, it.glyph, it.page == self.page, it.off).clicked() {
                         go = Some(it.page.clone());
                     }
                 }
@@ -451,7 +459,7 @@ impl Settings {
             }
         }
         egui::ScrollArea::vertical().id_salt(format!("{:?}", self.page)).auto_shrink([false, false]).show(ui, |ui| {
-            let wide = matches!(self.page, Page::Analytics | Page::History);
+            let wide = matches!(self.page, Page::Dashboard | Page::Analytics | Page::History);
             ui.set_max_width((ui.available_width() - SCROLL_GAP).min(if wide { WIDE_W } else { PANE_W }));
             match self.page.clone() {
                 Page::Models => self.models(ui, frame),
@@ -462,6 +470,7 @@ impl Settings {
                     group(ui, |ui, g| usage::display_block(ui, g, &mut self.cfg));
                 }
                 Page::About => self.about(ui),
+                Page::Dashboard => self.insights.dashboard(ui),
                 Page::Analytics => self.insights.analytics(ui),
                 Page::History => self.insights.history(ui),
                 Page::Claude => claude::page(ui, &mut self.cfg, &self.feed),
@@ -486,17 +495,14 @@ impl Settings {
 
     fn models(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let p = pal(ui);
-        heading(ui, "Models & tiers");
         ui.scope(|ui| {
             ui.set_max_width(ui.available_width().min(TIERS_W));
-            group(ui, |ui, g| {
-                g.item(ui, |ui| {
-                    self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
-                        ui.label(RichText::new("Configuration").size(14.0));
-                    });
-                });
-                self.tiers.rows(ui, g, &mut self.cfg);
+            // The page title with the profile selector on its right.
+            self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
+                ui.label(title("Models & tiers"));
             });
+            ui.add_space(8.0);
+            self.tiers.rows(ui, &mut self.cfg);
             ui.add(egui::Label::new(RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
         });
     }
@@ -797,12 +803,45 @@ mod tests {
         assert_eq!(labels(&filter(&all, "tier")), ["Models & tiers"]);
         assert!(filter(&all, "zzz").is_empty());
         let names: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(names[..7], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Analytics", "History"]);
-        assert_eq!(names[7..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!(names[..8], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Dashboard", "Analytics", "History"]);
+        assert_eq!(names[8..], ["Claude", "Antigravity", "Codex", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!((Page::parse("codex", &cfg), Page::parse("ChatGPT", &cfg)), (Some(Page::ChatGpt), Some(Page::ChatGpt)), "the old page name still opens it");
         assert_eq!(Page::parse("models", &cfg), Some(Page::Models), "the first word of a label is enough");
         assert_eq!((Page::parse("analytics", &cfg), Page::parse("History", &cfg)), (Some(Page::Analytics), Some(Page::History)));
+        assert_eq!(Page::parse("dashboard", &cfg), Some(Page::Dashboard), "--ccat-settings dashboard");
         assert_eq!(Page::parse("openrouter", &cfg), Some(Page::Endpoint(4)));
         assert_eq!(Page::parse("add", &cfg), None);
+    }
+
+    /// Only the five built-in providers carry a logo: the white marks are tinted, the brand ones keep their colours; every
+    /// other item (pages, endpoints, "Add endpoint") stays a drawn glyph. The embedded files decode.
+    #[test]
+    fn provider_items_use_their_logo_and_the_rest_keep_the_glyph() {
+        let cfg = crate::from_raw(serde_json::json!({ "providers": [{ "name": "OpenRouter" }] }));
+        let logo = |label: &str| {
+            let it = items(&cfg).into_iter().find(|i| i.label == label).unwrap();
+            glyph::art(it.glyph).map(|a| (a.file, a.mono))
+        };
+        assert_eq!(logo("Claude"), Some(("claude-code.png", false)));
+        assert_eq!(logo("Antigravity"), Some(("google-antigravity.png", false)));
+        assert_eq!(logo("Codex"), Some(("openai-chatgpt.png", true)), "stored as ChatGPT, shown as Codex");
+        assert_eq!(logo("Ollama"), Some(("ollama-dark.png", true)));
+        assert_eq!(logo("MuseAI"), Some(("Muse-logo.png", false)));
+        for plain in ["Models & tiers", "Routing", "Token saving", "Display", "About", "Dashboard", "Analytics", "History", "OpenRouter", "Add endpoint"] {
+            assert_eq!(logo(plain), None, "{plain}");
+        }
+        for g in [Glyph::Claude, Glyph::Antigravity, Glyph::ChatGpt, Glyph::Ollama, Glyph::Muse] {
+            let icon = eframe::icon_data::from_png_bytes(glyph::art(g).unwrap().png).unwrap();
+            assert_eq!((icon.width, icon.height), (96, 96), "{g:?}");
+            // The decoded mark paints through a real context without a window.
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                let mut logos = glyph::Logos::default();
+                assert!(logos.paint(ui, egui::pos2(20.0, 20.0), 18.0, g, egui::Color32::WHITE, 0.5), "{g:?}");
+                assert!(!logos.paint(ui, egui::pos2(20.0, 20.0), 18.0, Glyph::Link, egui::Color32::WHITE, 1.0));
+            });
+            out.textures_delta.clear();
+        }
     }
 
     /// The two windows share one file: what another process wrote is picked up, an edit not yet saved survives it, and
