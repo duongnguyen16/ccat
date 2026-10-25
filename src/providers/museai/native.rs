@@ -192,6 +192,117 @@ fn read_json_body(reader: impl Read) -> Result<Value, Failure> {
     serde_json::from_slice(&bytes).map_err(|_| fail(502, "expected JSON"))
 }
 
+// ---------------------------------------------------------------- subscription (live usage)
+
+/// Server Action id of `fetchSubscriptionAction` in the build seen last; a deploy changes it, then `discover` finds the new one.
+const KNOWN_ACTION: &str = "40034617c46db812e70eec8e362677944a0a532adf";
+const MAX_CHUNKS: usize = 1200; // ponytail: ~1000 chunks exist, the action sits ~420 deep; raise if muse.ai grows past this
+const MAX_CHUNK: usize = 4 * 1024 * 1024;
+static ACTION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// When a crawl last came back empty-handed.
+static LAST_MISS: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The headers muse.ai wants from a same-origin browser call (403 without them); never the cookie.
+fn browser<B>(req: ureq::RequestBuilder<B>, referer: &str, accept: &str) -> ureq::RequestBuilder<B> {
+    req.header("User-Agent", "Mozilla/5.0 Chrome/153.0.0.0").header("Referer", referer).header("Origin", "https://muse.ai")
+        .header("Sec-Fetch-Site", "same-origin").header("Sec-Fetch-Mode", "cors").header("Sec-Fetch-Dest", "empty").header("Accept", accept)
+}
+fn text_failure(e: ureq::Error, what: &str) -> Failure {
+    match e {
+        ureq::Error::StatusCode(s) => fail(s, format!("MuseAI {what}: HTTP {s}")),
+        ureq::Error::TooManyRedirects => fail(401, format!("MuseAI {what}: redirected away, sign in again")), // redirects are never followed with the cookie
+        _ => fail(502, format!("MuseAI {what}: HTTPS request failed")),
+    }
+}
+fn read_text(reader: impl Read, limit: usize) -> Result<String, Failure> {
+    let mut bytes = Vec::new();
+    reader.take((limit + 1) as u64).read_to_end(&mut bytes).map_err(|_| fail(502, "invalid HTTPS response"))?;
+    if bytes.len() > limit { return Err(fail(502, "HTTPS response exceeds limit")); }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+fn web_agent() -> ureq::Agent {
+    ureq::Agent::config_builder().max_redirects(0).timeout_global(Some(Duration::from_secs(20))).build().into()
+}
+
+/// The result of a Server Action from its RSC stream: `0:{"a":"$@N",..}` points at the line `N:` that carries it;
+/// failing that, the first line whose JSON holds `subscription`.
+pub(super) fn rsc_result(text: &str) -> Option<Value> {
+    let lines: Vec<(&str, Value)> = text.lines().filter_map(|l| { let (id, json) = l.split_once(':')?; Some((id, serde_json::from_str(json).ok()?)) }).collect();
+    let pointed = lines.iter().find(|(id, _)| *id == "0").and_then(|(_, v)| v["a"].as_str()?.strip_prefix("$@"))
+        .and_then(|n| lines.iter().find(|(id, v)| *id == n && v.is_object()));
+    pointed.or_else(|| lines.iter().find(|(_, v)| v.get("subscription").is_some())).map(|(_, v)| v.clone())
+}
+
+/// The id in `createServerReference("<hex>",…,"fetchSubscriptionAction")`, tolerant of minifier spacing; another action's reference never matches.
+pub(super) fn action_id(js: &str) -> Option<String> {
+    const CALL: &str = "createServerReference";
+    js.match_indices(CALL).find_map(|(i, _)| {
+        let rest = js[i + CALL.len()..].trim_start();
+        let rest = rest.strip_prefix(')').unwrap_or(rest).trim_start().strip_prefix('(')?.trim_start().strip_prefix('"')?;
+        let end = rest.find(|c: char| !matches!(c, '0'..='9' | 'a'..='f'))?;
+        let args = rest[end..].strip_prefix('"')?;
+        (end >= 40 && args[..args.find(')')?].contains("\"fetchSubscriptionAction\"")).then(|| rest[..end].to_string())
+    })
+}
+
+/// `static/chunks/<name>.js` paths named in a page or a chunk (the route's lazy chunks are only named inside other chunks).
+fn chunk_paths(s: &str) -> impl Iterator<Item = &str> {
+    s.match_indices("static/chunks/").filter_map(|(i, _)| {
+        let rest = &s[i..];
+        let path = &rest[..rest.find(|c: char| !(c.is_ascii_alphanumeric() || "/_-.".contains(c)))?];
+        (path.ends_with(".js") && !path.contains("..")).then_some(path)
+    })
+}
+/// Finds the current action id: the page's script chunks and the chunks they name (public static files, fetched without
+/// the cookie) breadth first, a batch at a time in parallel; the action sat ~420 chunks in when this was written.
+fn discover(cookies: &str) -> Result<String, Failure> {
+    let agent = web_agent();
+    let page = browser(agent.get("https://muse.ai/hatch"), "https://muse.ai/hatch", "text/html").header("Cookie", cookies).call().map_err(|e| text_failure(e, "/hatch"))?;
+    let mut queue: Vec<String> = Vec::new();
+    let add = |queue: &mut Vec<String>, text: &str| for p in chunk_paths(text) { if !queue.iter().any(|q| q == p) { queue.push(p.into()); } };
+    add(&mut queue, &read_text(page.into_body().into_reader(), MAX_BODY)?);
+    let fetch = |path: &String| browser(agent.get(format!("https://muse.ai/_next/{path}")), "https://muse.ai/hatch", "*/*").call().ok().and_then(|r| read_text(r.into_body().into_reader(), MAX_CHUNK).ok());
+    let mut next = 0;
+    while next < queue.len().min(MAX_CHUNKS) {
+        let end = queue.len().min(MAX_CHUNKS).min(next + 8);
+        let bodies: Vec<Option<String>> = std::thread::scope(|s| queue[next..end].iter().map(|p| s.spawn(|| fetch(p))).collect::<Vec<_>>().into_iter().map(|h| h.join().ok().flatten()).collect());
+        next = end;
+        for js in bodies.into_iter().flatten() {
+            if let Some(id) = action_id(&js) { return Ok(id); }
+            add(&mut queue, &js);
+        }
+    }
+    Err(fail(502, "MuseAI usage: could not locate the subscription action"))
+}
+
+/// One `fetchSubscriptionAction` call (read-only). 404 doubles as "no parsable result": an unknown id answers so.
+fn call_action(cookies: &str, id: &str) -> Result<Value, Failure> {
+    let response = browser(web_agent().post("https://muse.ai/hatch"), "https://muse.ai/hatch", "text/x-component").header("Next-Action", id)
+        .header("Content-Type", "text/plain;charset=UTF-8").header("Cookie", cookies)
+        .send(r#"[{"includeAgreement":true}]"#).map_err(|e| text_failure(e, "usage"))?;
+    let text = read_text(response.into_body().into_reader(), MAX_BODY)?;
+    rsc_result(&text).filter(|v| v["subscription"].is_object()).ok_or_else(|| fail(404, "MuseAI usage: response not understood"))
+}
+
+/// The account's subscription (plan, weekly and top-up usage) as muse.ai's own page loads it.
+pub(super) fn subscription(cookies: &str) -> Result<Value, Failure> {
+    let known = ACTION.lock().ok().and_then(|g| g.clone()).unwrap_or_else(|| KNOWN_ACTION.into());
+    let remember = |id: &str| if let Ok(mut g) = ACTION.lock() { *g = Some(id.into()); };
+    match call_action(cookies, &known) {
+        Err(e) if e.status == 404 => {
+            // A crawl is ~1000 requests: after one that found nothing, the next waits an hour (the tray polls often).
+            // ponytail: per process, and a found id isn't saved, so each new process crawls once after a deploy.
+            if LAST_MISS.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < Duration::from_secs(3600)) { return Err(e); }
+            let id = discover(cookies).inspect_err(|_| if let Ok(mut g) = LAST_MISS.lock() { *g = Some(std::time::Instant::now()); })?;
+            if id == known { return Err(e); }
+            let value = call_action(cookies, &id)?;
+            remember(&id);
+            Ok(value)
+        }
+        other => { if other.is_ok() { remember(&known); } other }
+    }
+}
+
 pub(super) struct Identity { pub viewer_id: String, pub vm_id: String, pub token: String }
 pub(super) fn identity(cookies: &str) -> Result<Identity, Failure> {
     let auth = http_json(cookies, "/api/auth/check", Some(&json!({})), None)?;
@@ -406,6 +517,28 @@ mod tests {
         assert!(check_other_frame(response(9, 200), Some(3)).is_err());
         assert!(check_other_frame(response(3, 403), Some(3)).is_err());
         assert!(check_other_frame(ServiceFrame { stream_id: 3, kind: Some(FrameKind::Reset(Reset { code: 1, reason: String::new() })) }, Some(3)).is_err());
+    }
+    #[test]
+    fn rsc_result_follows_the_pointer_then_falls_back() {
+        let pointed = "0:{\"a\":\"$@1\",\"f\":\"\"}\n1:{\"success\":true,\"subscription\":{\"x\":1}}\n2:{\"subscription\":{\"x\":2}}\n";
+        assert_eq!(rsc_result(pointed).unwrap()["subscription"]["x"], 1);
+        let fallback = "0:{\"a\":\"$@9\"}\n1:I[\"chunk\",[]]\n2:{\"subscription\":{\"x\":2}}\n";
+        assert_eq!(rsc_result(fallback).unwrap()["subscription"]["x"], 2);
+        assert!(rsc_result("<html>nope</html>\n\n0:garbage").is_none());
+        assert!(rsc_result("").is_none());
+    }
+    #[test]
+    fn action_id_matches_only_the_subscription_reference() {
+        let id = "40034617c46db812e70eec8e362677944a0a532adf";
+        let js = format!("a=(0,r.createServerReference)( \"{id}\" ,r.callServer,void 0,r.findSourceMapURL,\"fetchSubscriptionAction\"),b=1");
+        assert_eq!(action_id(&js).as_deref(), Some(id));
+        let plain = format!("createServerReference(\"{id}\",r.callServer,void 0,\"fetchSubscriptionAction\")");
+        assert_eq!(action_id(&plain).as_deref(), Some(id));
+        let other = format!("(0,r.createServerReference)(\"{id}\",r.callServer,void 0,r.findSourceMapURL,\"somethingElse\"),x=\"fetchSubscriptionAction\"");
+        assert!(action_id(&other).is_none());
+        let both = format!("(0,r.createServerReference)(\"{}\",r.callServer,void 0,void 0,\"other\"),(0,r.createServerReference)(\"{id}\",r.callServer,void 0,void 0,\"fetchSubscriptionAction\")", "ab".repeat(21));
+        assert_eq!(action_id(&both).as_deref(), Some(id));
+        assert!(action_id("createServerReference(\"abc\",\"fetchSubscriptionAction\")").is_none());
     }
     #[test]
     fn https_json_body_rejects_oversize() {

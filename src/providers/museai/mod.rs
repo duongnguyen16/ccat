@@ -6,7 +6,7 @@ mod ui;
 pub(crate) use ui::page;
 
 use crate::common::{self, Failure};
-use crate::usage::{dirs_home, Bar, WEEK};
+use crate::usage::{Bar, WEEK};
 use crate::proxy::http::{record, respond, respond_error, Req};
 use crate::proxy::sse::{Stop, Tx};
 use crate::proxy::{Ctx, Fail};
@@ -70,8 +70,8 @@ fn active_account_in(dir: &Path) -> Option<Account> {
     native::cookies(&raw).ok()?;
     let cfg: Value = serde_json::from_str::<Value>(&raw).ok().filter(|v| v.get("viewer_id").is_some())
         .or_else(|| fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str(&s).ok())).unwrap_or_default();
-    let usage: Value = fs::read_to_string(dir.join("usage.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    Some(Account { viewer_id: cfg["viewer_id"].as_str().filter(|s| !s.is_empty()).unwrap_or("Active session").into(), vm_id: cfg["vm_id"].as_str().unwrap_or("").into(), tier: usage["tier"].as_str().unwrap_or("Free plan").into(), disabled: false })
+    let plan = crate::usage::load_usage().muse_plan; // the live plan the last usage refresh saved
+    Some(Account { viewer_id: cfg["viewer_id"].as_str().filter(|s| !s.is_empty()).unwrap_or("Active session").into(), vm_id: cfg["vm_id"].as_str().unwrap_or("").into(), tier: if plan.is_empty() { "Free plan".into() } else { plan }, disabled: false })
 }
 pub fn remove_account() -> Result<(), String> {
     let path = account_dir().join("cookies.txt");
@@ -351,33 +351,28 @@ fn remote_open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box
 
 // ---------------------------------------------------------------- usage
 
+/// MuseAI's usage from muse.ai's subscription result (`{"subscription":{..}}` or the inner object): the plan, the
+/// weekly allowance and the top-up tokens.
 pub(crate) fn parse_muse(v: &Value) -> (String, Vec<Bar>) {
-    let obs = v.get("observedState").or_else(|| v.get("sourceAnalysis").and_then(|s| s.get("observedState"))).unwrap_or(v);
-    let plan = obs["tier"].as_str().unwrap_or("Free plan").to_string();
-    let reset = obs["resetDisplayString"].as_str().unwrap_or("");
-    let reset = reset.strip_prefix("Weekly limit resets ").map(|s| format!("Resets {s}")).unwrap_or_else(|| reset.into());
+    let sub = v.get("subscription").unwrap_or(v);
+    let text = |s: &Value| s.as_str().filter(|s| !s.is_empty()).map(String::from);
+    let plan = text(&sub["usageRowLabel"]).or_else(|| text(&sub["tier"]["name"])).unwrap_or_else(|| "Free plan".into());
+    let subtitle = sub["statusSubtitle"].as_str().unwrap_or("");
+    let reset = subtitle.strip_prefix("Weekly limit resets ").map(|s| format!("Resets {s}")).unwrap_or_else(|| subtitle.into());
+    let (balance, total) = (sub["topupBalance"].as_f64().unwrap_or(0.0), sub["topupTotal"].as_f64().unwrap_or(0.0));
+    // ponytail: `topupRowValueLabel`'s "N tokens left" has no Bar field to live in (the old cache's balance text was not shown either).
     (plan, vec![
-        Bar { label: "Weekly (7 day)".into(), used: obs["weeklyUsagePercent"].as_f64().unwrap_or(0.0), window: WEEK, reset_label: reset, ..Default::default() },
-        Bar { label: "Additional tokens".into(), used: obs["additionalTokensUsagePercent"].as_f64().unwrap_or(0.0), reset_label: obs["additionalTokensExpiration"].as_str().unwrap_or("").into(), ..Default::default() },
+        Bar { label: "Weekly (7 day)".into(), used: sub["usage"]["percentUsed"].as_f64().unwrap_or(0.0), resets: sub["usage"]["resetsAt"].as_u64().unwrap_or(0), window: WEEK, reset_label: reset, ..Default::default() },
+        Bar { label: "Additional tokens".into(), used: if total > 0.0 { ((total - balance) / total * 100.0).clamp(0.0, 100.0) } else { 0.0 }, reset_label: "Never expires".into(), ..Default::default() },
     ])
 }
 
-/// Reads MuseAI quota and reset text from the existing local session cache.
+/// MuseAI's live usage, asked of muse.ai with the signed-in session; a failure says so, never an old number.
 pub(crate) fn fetch_muse(_p: &crate::Provider) -> Result<(String, Vec<Bar>), String> {
-    // Read synced live usage from ~/.config/muse-cli/usage.json
-    let usage_path = dirs_home().join(".config").join("muse-cli").join("usage.json");
-    if let Ok(content) = fs::read_to_string(&usage_path) {
-        if let Ok(v) = serde_json::from_str::<Value>(&content) {
-            return Ok(parse_muse(&v));
-        }
-    }
-
-    let cookie_file = dirs_home().join(".config").join("muse-cli").join("cookies.txt");
-    if !cookie_file.exists() {
-        return Err("No MuseAI account found. Use + in Settings → Providers to sign in.".into());
-    }
-
-    Err("Usage not yet synced. Sign in via + in Providers or run a query.".into())
+    let raw = fs::read_to_string(account_dir().join("cookies.txt")).map_err(|_| "No MuseAI account found. Use + in Settings → Providers to sign in.".to_string())?;
+    let cookies = native::cookies(&raw).map_err(|e| e.message)?;
+    let sub = native::subscription(&cookies).map_err(|e| if matches!(e.status, 401 | 403) { "MuseAI usage: sign in again".into() } else { e.message })?;
+    Ok(parse_muse(&sub))
 }
 
 // ---------------------------------------------------------------- proxy: Anthropic → OpenAI Chat Completions
@@ -442,17 +437,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn muse_usage_preserves_reset_text_without_plan_or_balance_rows() {
-        let observed = serde_json::json!({"tier":"Free plan","weeklyUsagePercent":1.0,"resetDisplayString":"Weekly limit resets on Oct 28","additionalTokensBalance":"1B tokens left","additionalTokensUsagePercent":0.0,"additionalTokensExpiration":"Never expires"});
-        for value in [observed.clone(), serde_json::json!({"observedState":observed}), serde_json::json!({"sourceAnalysis":{"observedState":observed}})] {
+    fn muse_usage_maps_the_live_subscription() {
+        let sub = serde_json::json!({"tier":{"name":"Muse Free","tierCode":"HATCH_FREE"},"usage":{"state":"METERED","percentUsed":8,"resetsAt":1793194964u64,"quotaStatus":"SUFFICIENT"},"statusSubtitle":"Weekly limit resets on Oct 28","usageRowLabel":"Free plan","usageRowValueLabel":"8% used","topupBalance":40000000,"topupTotal":40000000,"topupRowLabel":"Additional tokens","topupRowValueLabel":"0% used (1B tokens left)"});
+        for value in [sub.clone(), serde_json::json!({"success":true,"subscription":sub})] {
             let (plan, bars) = parse_muse(&value);
             assert_eq!(plan, "Free plan");
             assert!(bars.iter().all(|bar| bar.part.is_empty()));
-            assert_eq!(bars[0].used, 1.0);
+            assert_eq!((bars[0].used, bars[0].resets, bars[0].window), (8.0, 1793194964, WEEK));
+            assert_eq!(bars[0].label, "Weekly (7 day)");
             assert_eq!(bars[0].reset_label, "Resets on Oct 28");
-            assert_eq!(bars[1].label, "Additional tokens");
-            assert_eq!(bars[1].reset_label, "Never expires");
+            assert_eq!((bars[1].label.as_str(), bars[1].used, bars[1].reset_label.as_str()), ("Additional tokens", 0.0, "Never expires"));
         }
+        let used = parse_muse(&serde_json::json!({"tier":{"name":"Muse Pro"},"topupBalance":10,"topupTotal":40})).1;
+        assert_eq!(used[1].used, 75.0);
+        let (plan, bars) = parse_muse(&serde_json::json!({}));
+        assert_eq!((plan.as_str(), bars[0].used, bars[1].used), ("Free plan", 0.0, 0.0));
+        assert_eq!(parse_muse(&serde_json::json!({"tier":{"name":"Muse Pro"}})).0, "Muse Pro");
+    }
+
+    #[test]
+    #[ignore = "explicit live-account opt-in; one read-only request to muse.ai"]
+    fn live_muse_subscription() {
+        let p = crate::Provider::default();
+        let (plan, bars) = fetch_muse(&p).expect("live MuseAI usage");
+        assert!(!plan.is_empty());
+        let weekly = bars.iter().find(|b| b.label == "Weekly (7 day)").expect("weekly bar");
+        println!("MuseAI plan: {plan}, weekly {}% used, reset time known: {}", weekly.used, weekly.resets > 0);
     }
 
     #[test]

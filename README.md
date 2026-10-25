@@ -122,7 +122,7 @@ MuseAI runs inside ccat using native Rust HTTPS, Noise WebSocket encryption and 
 | :--- | :---: | :---: | :--- |
 | **Local tool call loop & multiturn** | P0 | ➖ Prompt-based adapter | Declared names and argument schemas are validated before returning calls to the client. A live tool-call → client result → final answer passed, but a repeat of the same test returned ordinary text instead. Upstream structured tool support is unverified. |
 | **Streaming & cancellation** | P0 | ➖ Buffered response | History polling returns the completed answer over SSE with heartbeats, not token streaming. Isolated history can expose partial text, but append-only progression is unproven. Each request has an isolated session, cleaned up on completion or cancellation. Live reader-drop cancellation verified. |
-| **Quota display & tray dial** | P0 | ➖ Cached data | Reads existing `~/.config/muse-cli/usage.json`. The native gateway does not refresh that cache; displayed usage may be stale. |
+| **Quota display & tray dial** | P0 | ✅ Supported | Usage is fetched live from muse.ai's subscription endpoint with your signed-in session (plan, weekly limit and reset, additional tokens). A failed fetch greys out the last known bars instead of showing stale numbers. |
 | **Model selection & tier routing** | P1 | ✅ Supported | Supported as a first-class built-in provider in `ccat` routing tiers with fallback support. Default model: `muse-chat`. |
 | **Image input (code screenshots)** | P1 | ➖ Planned | Vision payload mapping planned for compiler error and UI screenshot analysis. |
 | **Web search & citations** | P1 | ➖ Planned | Native search controls and source attribution planned for future updates. |
