@@ -3,7 +3,7 @@
 use super::{active_account, remove_account, Account, Login};
 use crate::settings::providers::{badge, count, head, name, note, row, trash, LoginJob, ProvidersEditor};
 use crate::settings::group;
-use crate::{icon_btn, model_count, pal, switch, Config, Icon};
+use crate::{icon_btn, model_count, model_names, pal, switch, Config, Icon};
 use eframe::egui::{self, Layout, RichText};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -47,7 +47,7 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
             g.item(ui, |ui| feed.limits(ui, 4, &u.muse_plan, &crate::usage::muse_bars(u), u.muse.fetched, &u.muse.error));
         }
     });
-    let n = model_count(pr);
+    let (n, names) = (model_count(pr), model_names(pr).into_iter().map(String::from).collect::<Vec<_>>());
     row(ui, |ui, _| {
         ed.fetch_btn(ui, pr);
         let free = ed.muse_login.is_none();
@@ -62,7 +62,15 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
                 Err(e) => ed.muse_err = e,
             }
         }
-        count(ui, "Accounts", n);
+        count(ui, "Models", n);
+    });
+    // What the pickers offer from MuseAI: the ids themselves, not just how many.
+    ui.horizontal_wrapped(|ui| {
+        for m in &names {
+            egui::Frame::new().fill(p.field).corner_radius(8).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
+                ui.label(RichText::new(m).size(11.5).color(p.fg));
+            });
+        }
     });
     if let Some(job) = &ed.muse_login {
         ui.horizontal(|ui| {

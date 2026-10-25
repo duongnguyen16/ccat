@@ -354,7 +354,7 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
     let name = name.trim();
     if name.is_empty() {
         Err("Give it a name.".into())
-    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) {
+    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) || name.eq_ignore_ascii_case(providers::label(GPT_NAME)) {
         Err("That is a built-in provider's name.".into())
     } else if providers.iter().enumerate().any(|(n, p)| n != i && p.name.eq_ignore_ascii_case(name)) {
         Err("Another provider already has that name.".into())
@@ -365,7 +365,12 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
 
 /// Models a provider offers: fetched, plus saved custom ids the list doesn't have.
 fn model_count(p: &Provider) -> usize {
-    p.models.len() + p.custom.iter().filter(|c| !p.models.contains(c)).count()
+    model_names(p).len()
+}
+
+/// The ids behind `model_count`, in the order the pickers list them.
+fn model_names(p: &Provider) -> Vec<&str> {
+    p.models.iter().chain(p.custom.iter().filter(|c| !p.models.contains(c))).map(String::as_str).collect()
 }
 
 /// Emails of the accounts turned off, for the proxy's pool.
@@ -483,6 +488,10 @@ fn builtin_muse(cfg: &mut Config) {
     }, |i| cfg.providers.remove(i));
     if mu.url.trim().is_empty() {
         mu.url = museai::DEFAULT_URL.into();
+    }
+    // The local bridge's list is a constant: offered from the start, without a Fetch click.
+    if mu.models.is_empty() && museai::is_local_bridge(&museai::normalize_url(&mu.url)) {
+        mu.models = museai::list_models(&mu.url, None).unwrap_or_default();
     }
     let old = std::mem::replace(&mut mu.name, MUSE_NAME.into());
     rename_routes(&mut cfg.tiers, &old, MUSE_NAME);
@@ -977,7 +986,7 @@ fn route_text(r: &Route) -> String {
 }
 
 fn target_text(provider: &str, model: &str) -> String {
-    let provider = if provider.is_empty() { OFFICIAL } else { provider };
+    let provider = if provider.is_empty() { OFFICIAL } else { providers::label(provider) };
     let model = if model.is_empty() { "Claude Code's pick" } else { model };
     format!("{provider} · {model}")
 }
@@ -992,7 +1001,7 @@ fn selector_text(provider: &str, model: &str, claude: &[String], providers: &[Pr
     if offered < 2 {
         return model.into();
     }
-    format!("{model} ({})", if provider.is_empty() { OFFICIAL } else { provider })
+    format!("{model} ({})", if provider.is_empty() { OFFICIAL } else { providers::label(provider) })
 }
 
 impl App {
@@ -1056,21 +1065,22 @@ impl App {
                 return None;
             }
             let Some(i) = self.cfg.providers.iter().position(|p| p.name == provider) else {
-                return Some((format!("{what}: provider “{provider}” no longer exists."), false));
+                return Some((format!("{what}: provider “{}” no longer exists.", providers::label(provider)), false));
             };
             let p = &self.cfg.providers[i];
+            let name = providers::label(&p.name);
             match () {
-                _ if p.disabled => Some((format!("“{}” is turned off.", p.name), true)),
-                _ if model.trim().is_empty() => Some((format!("{what} needs a model on {}.", p.name), false)),
-                _ if p.antigravity && p.accounts.is_empty() => Some((format!("“{}” needs at least one Google account.", p.name), true)),
-                _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every Google account turned off.", p.name), true)),
-                _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{}” needs a signed-in ChatGPT account.", p.name), true)),
-                _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every account turned off.", p.name), true)),
-                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings.", p.name), true)),
+                _ if p.disabled => Some((format!("“{name}” is turned off."), true)),
+                _ if model.trim().is_empty() => Some((format!("{what} needs a model on {name}."), false)),
+                _ if p.antigravity && p.accounts.is_empty() => Some((format!("“{name}” needs at least one Google account."), true)),
+                _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => Some((format!("“{name}” has every Google account turned off."), true)),
+                _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{name}” needs a signed-in Codex account."), true)),
+                _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{name}” has every account turned off."), true)),
+                _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{name}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings."), true)),
                 _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
                 // A local Ollama needs no key; Ollama Cloud's is only required by the server.
-                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{}” needs a URL.", p.name), true)),
-                _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{}” needs a URL and a key.", p.name), true)),
+                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{name}” needs a URL."), true)),
+                _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{name}” needs a URL and a key."), true)),
                 _ => None,
             }
         };
@@ -1550,7 +1560,7 @@ impl TierEditor {
                                 continue;
                             }
                             ui.add_space(6.0);
-                            ui.label(RichText::new(group).size(11.5).color(p.subtle));
+                            ui.label(RichText::new(providers::label(group)).size(11.5).color(p.subtle));
                             for c in shown {
                                 first.get_or_insert(c);
                                 let checked = (c.provider.as_str(), c.model.as_str()) == cur;
@@ -1674,7 +1684,7 @@ struct Prepared {
 /// signs in by cookie login and needs no key; `login` finds the muse-cli login for configs saved before accounts were.
 fn muse_blocked(p: &Provider, login: impl FnOnce() -> Option<museai::Account>) -> Option<String> {
     match p.muse_account.clone().or_else(login) {
-        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", p.name)),
+        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", providers::label(&p.name))),
         Some(a) if a.disabled => Some(format!("“{}” has its account turned off.", p.name)),
         Some(_) => None,
     }
@@ -2154,6 +2164,7 @@ mod tests {
         builtin_chatgpt(&mut fresh);
         assert_eq!(fresh.providers.iter().map(|p| (p.name.as_str(), p.chatgpt)).collect::<Vec<_>>(), [(AG_NAME, false), (GPT_NAME, true)]);
         assert!(check_rename(&fresh.providers, 0, "chatgpt").is_err(), "the name is reserved");
+        assert!(check_rename(&fresh.providers, 0, "Codex").is_err(), "so is the name it is shown under");
     }
 
     #[test]
@@ -2235,6 +2246,25 @@ mod tests {
         let mu = Provider { muse_account: Some(museai::Account::default()), ..cfg.providers[3].clone() };
         let t_mu = target(MUSE_NAME, "muse-chat", &[mu], &claude, 0, "");
         assert_eq!(t_mu.map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
+    }
+
+    #[test]
+    fn muse_chat_is_offered_from_the_start_and_listed_on_its_page() {
+        let mut cfg = Config::default();
+        builtin_muse(&mut cfg);
+        let mu = cfg.providers.iter().find(|p| p.muse).unwrap();
+        assert_eq!((model_names(mu), model_count(mu)), (vec!["muse-chat"], 1), "no Fetch click needed on the local bridge");
+        let groups = model_groups(&cfg.providers, &(String::new(), Vec::new()), false);
+        let muse = groups.iter().find(|(g, _)| g == MUSE_NAME).expect("MuseAI group");
+        assert!(muse.1.iter().any(|c| c.model == "muse-chat" && c.provider == MUSE_NAME));
+        assert!(model_groups(&[Provider { disabled: true, ..mu.clone() }], &(String::new(), Vec::new()), false).iter().all(|(g, _)| g != MUSE_NAME), "off: not offered");
+        // A saved list stays; a remote gateway is not asked at load; custom ids are listed once.
+        let mut kept = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, models: vec!["x".into()], custom: vec!["x".into(), "y".into()], ..Default::default() }], ..Default::default() };
+        builtin_muse(&mut kept);
+        assert_eq!(model_names(&kept.providers[0]), ["x", "y"]);
+        let mut remote = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, url: "https://gateway.invalid".into(), ..Default::default() }], ..Default::default() };
+        builtin_muse(&mut remote);
+        assert!(model_names(&remote.providers[0]).is_empty());
     }
 
     #[test]

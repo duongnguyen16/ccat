@@ -44,10 +44,10 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
     let title = pr.name.clone();
     head(ui, |ui| {
         let mut on = !pr.disabled;
-        if switch(ui, &mut on, "").on_hover_text("Off: ChatGPT is not offered in the pickers and not used for routing.").changed() {
+        if switch(ui, &mut on, "").on_hover_text("Off: Codex is not offered in the pickers and not used for routing.").changed() {
             pr.disabled = !on;
         }
-        name(ui, &title, on);
+        name(ui, crate::providers::label(&title), on);
     });
     let mut start: Option<(Option<ChatgptAccount>, bool)> = None;
     // Official or Codex (Legacy): followed live by the running sessions (see `Pool::set_legacy`).
@@ -191,7 +191,7 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
         std::thread::spawn(move || sign_out(&gone.key));
     }
     if pr.chatgpt_accounts.is_empty() && ed.gpt_login.is_none() {
-        note(ui, "No ChatGPT account yet. + signs in with ChatGPT in your browser, once, for both modes.", p.subtle);
+        note(ui, "No Codex account yet. + signs in with ChatGPT in your browser, once, for both modes.", p.subtle);
     }
     if cfg.chatgpt_note == 1 {
         group(ui, |ui, g| {

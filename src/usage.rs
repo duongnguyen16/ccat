@@ -222,7 +222,7 @@ pub fn local_date(t: u64) -> (i64, i64, i64) {
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     };
-    let ticks = t * 10_000_000 + 116_444_736_000_000_000;
+    let ticks = t.min(1 << 40) * 10_000_000 + 116_444_736_000_000_000; // a corrupt huge `t` must not overflow
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
     // SAFETY: plain out-parameters on the stack.
     unsafe {
@@ -246,7 +246,7 @@ pub fn local(t: u64) -> (u16, u16, u16) {
         Foundation::{FILETIME, SYSTEMTIME},
         System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     };
-    let ticks = t * 10_000_000 + 116_444_736_000_000_000;
+    let ticks = t.min(1 << 40) * 10_000_000 + 116_444_736_000_000_000; // a corrupt huge `t` must not overflow
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
     // SAFETY: plain out-parameters on the stack.
     unsafe {
@@ -520,6 +520,11 @@ pub enum Src {
 impl Src {
     const ALL: [Src; 5] = [Src::Claude, Src::ChatGpt, Src::Antigravity, Src::Ollama, Src::Muse];
 
+    /// What the user sees (the stored `name` stays "ChatGPT").
+    fn label(self) -> &'static str {
+        crate::providers::label(self.name())
+    }
+
     fn name(self) -> &'static str {
         match self {
             Src::Claude => "Claude",
@@ -727,7 +732,7 @@ pub fn tooltip(u: &Usage, shown: &[Src], ag: &[Bar]) -> String {
             Src::Ollama => &u.ollama,
             Src::Muse => &u.muse,
         };
-        lines.push(if src.error.is_empty() { format!("{} {}", s.name(), short(&src.bars)) } else { format!("{}: see window", s.name()) });
+        lines.push(if src.error.is_empty() { format!("{} {}", s.label(), short(&src.bars)) } else { format!("{}: see window", s.label()) });
     }
     lines.join("\n").chars().take(127).collect()
 }
@@ -1188,7 +1193,7 @@ fn sections(cfg: &crate::Config, u: &Usage, claude: bool) -> Vec<Section> {
         out.push(Section { src: Src::Claude, title: "Claude", which: 0, bars: tidy(&u.claude.bars, cfg.show_fable), errors: [u.claude.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.claude.error.is_empty() });
     }
     if u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty()) {
-        out.push(Section { src: Src::ChatGpt, title: "ChatGPT", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
+        out.push(Section { src: Src::ChatGpt, title: "Codex", which: 2, bars: tidy(&u.chatgpt.bars, false), errors: [u.chatgpt.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.chatgpt.error.is_empty() });
     }
     if ollama_active(cfg) && (!u.ollama.bars.is_empty() || !u.ollama.error.is_empty()) {
         out.push(Section { src: Src::Ollama, title: "Ollama", which: 3, bars: u.ollama.bars.clone(), errors: [u.ollama.error.clone()].into_iter().filter(|e| !e.is_empty()).collect(), stale: !u.ollama.error.is_empty() });
@@ -1720,7 +1725,7 @@ fn load_stats(text: &str, by_model: bool, today: i64, days: i64, provider: Optio
         }
         let n = |k: &str| v[k].as_u64().unwrap_or(0);
         let (input, output) = (n("input") + n("cache_read") + n("cache_write"), n("output"));
-        let key = if by_model { pretty_model(v["model"].as_str().unwrap_or("?")) } else { v["provider"].as_str().unwrap_or("?").to_string() };
+        let key = if by_model { pretty_model(v["model"].as_str().unwrap_or("?")) } else { crate::providers::label(v["provider"].as_str().unwrap_or("?")).to_string() };
         let t = totals.entry(key.clone()).or_default();
         (t.0, t.1) = (t.0 + input, t.1 + output);
         by_day.push((day - first, key, input + output));
@@ -1789,7 +1794,7 @@ pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
         v += step;
     }
     let slot = plot.width() / bars.count.max(1) as f32;
-    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count - 1));
+    let hover = resp.hover_pos().filter(|h| plot.x_range().contains(h.x)).map(|h| (((h.x - plot.left()) / slot) as usize).min(bars.count.saturating_sub(1)));
     for d in 0..bars.count {
         let x = plot.left() + slot * (d as f32 + 0.19);
         let mut base = 0.0;
@@ -1804,7 +1809,7 @@ pub(crate) fn bar_chart(ui: &mut egui::Ui, height: f32, bars: &Bars) {
             pt.rect_filled(bar, radius, if hover.is_some_and(|h| h != d) { c.gamma_multiply(0.55) } else { c });
             base += n;
         }
-        if d % bars.every == bars.first % bars.every {
+        if d % bars.every.max(1) == bars.first % bars.every.max(1) {
             pt.text(egui::pos2(x + slot * 0.31, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, (bars.label)(d), egui::FontId::proportional(10.5), p.subtle);
         }
     }
@@ -2013,7 +2018,7 @@ fn live_series(calls: &[Call], span: (u64, u64, usize), by: u8, metric: u8, cumu
     let (start, w, n) = span;
     let key = |c: &Call| match by {
         1 => c.model.clone(),
-        2 => c.provider.clone(),
+        2 => crate::providers::label(&c.provider).to_string(),
         _ => "Total".to_string(),
     };
     let mut keys: Vec<(String, f64)> = Vec::new();
@@ -2095,7 +2100,7 @@ fn live_chart(ui: &mut egui::Ui, calls: &[Call], range: u8, by: u8, metric: u8, 
         _ => plot.left() + (k as f32 + 0.5) / n as f32 * plot.width(),
     };
     let clip = pt.with_clip_rect(plot);
-    let running = |name: &str| calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { &c.provider }) == name);
+    let running = |name: &str| calls.iter().rev().take_while(|c| c.t + 60 >= now).any(|c| by == 0 || (if by == 1 { &c.model } else { crate::providers::label(&c.provider) }) == name);
     // Biggest first, so the smaller ones are drawn over it and stay visible.
     for (i, s) in series.iter().enumerate() {
         let c = hue(i, p);
@@ -2320,7 +2325,7 @@ pub(crate) fn display_block(ui: &mut egui::Ui, g: &mut crate::settings::Cards, c
         let mut swap = None;
         // Right to left, so the chips read in order.
         for (i, s) in list.iter().enumerate().rev() {
-            let m = chip(ui, s.name(), i > 0, i < last);
+            let m = chip(ui, s.label(), i > 0, i < last);
             if m != 0 {
                 swap = Some((i, (i as i32 + m) as usize));
             }
@@ -2368,6 +2373,14 @@ fn spawn_refresh(which: usize, busy: Option<std::sync::Arc<std::sync::atomic::At
     });
 }
 
+/// After the popup resizes, moves or switches tab, a focus loss this soon is Windows reshuffling, not a click elsewhere.
+const FOCUS_GRACE: Duration = Duration::from_millis(600);
+
+/// Esc always closes; losing focus closes only after the window has been focused once and the resize grace is over.
+fn should_close(focused_once: bool, focused: Option<bool>, ignore_until: std::time::Instant, now: std::time::Instant, esc: bool) -> bool {
+    esc || (focused_once && focused == Some(false) && now >= ignore_until)
+}
+
 struct Popup {
     cfg: crate::Config,
     loaded: Value,
@@ -2377,6 +2390,8 @@ struct Popup {
     busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; Src::ALL.len()],
     anchor: (f32, f32, f32),
     focused_once: bool,
+    /// Our own resize/move (or a tab switch) can make Windows report a transient focus loss: ignored until then.
+    ignore_focus_until: std::time::Instant,
     /// The window's fade-in is off (done on the first frame, before eframe shows it).
     styled: bool,
     tab: Tab,
@@ -2664,7 +2679,7 @@ impl eframe::App for Popup {
         let focused = ui.input(|i| i.viewport().focused);
         self.focused_once |= focused == Some(true);
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if esc || (self.focused_once && focused == Some(false)) {
+        if should_close(self.focused_once, focused, self.ignore_focus_until, std::time::Instant::now(), esc) {
             ui.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -2678,10 +2693,12 @@ impl eframe::App for Popup {
         let h = h.min(self.anchor.1 - self.anchor.2).max(120.0);
         if let Some(r) = ui.input(|i| i.viewport().inner_rect) {
             if (r.height() - h).abs() > 0.5 {
+                self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
                 ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(POPUP_W, h)));
             }
             let want = egui::pos2(self.anchor.0, (self.anchor.1 - h).max(self.anchor.2));
             if ui.input(|i| i.viewport().outer_rect).is_some_and(|o| (o.min - want).length() > 1.0) {
+                self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
                 ui.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want));
             }
         }
@@ -2690,6 +2707,7 @@ impl eframe::App for Popup {
         // What this window edits: the Antigravity view and the Analytics options.
         let snapshot = |c: &crate::Config| (c.ag_group.clone(), [c.analytics_view, c.live_range, c.live_by], c.live_metric, c.live_cumulative);
         let before = snapshot(&self.cfg);
+        let tab_before = self.tab;
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
         let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::same(PAD as i8));
         let measured = egui::CentralPanel::default()
@@ -2726,6 +2744,9 @@ impl eframe::App for Popup {
         if (measured - self.measured).abs() > 0.5 {
             self.measured = measured;
             ctx.request_repaint();
+        }
+        if self.tab != tab_before || snapshot(&self.cfg) != before {
+            self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
         }
         if snapshot(&self.cfg) != before {
             self.save(); // running sessions follow the config file
@@ -2779,6 +2800,7 @@ pub fn run_popup(click: (f64, f64)) {
                 busy: Default::default(),
                 anchor,
                 focused_once: false,
+                ignore_focus_until: std::time::Instant::now(),
                 styled: false,
                 tab: Tab::Usage,
                 by_model,
@@ -2924,7 +2946,7 @@ mod tests {
         let cfg = crate::Config::default();
         let mut u = Usage { chatgpt_on: true, chatgpt_plan: plan, chatgpt: Source { bars, ..Default::default() }, ..Default::default() };
         let s = sections(&cfg, &u, true);
-        assert_eq!(s.iter().map(|s| s.title).collect::<Vec<_>>(), ["Claude", "ChatGPT"], "between Claude and Antigravity");
+        assert_eq!(s.iter().map(|s| s.title).collect::<Vec<_>>(), ["Claude", "Codex"], "between Claude and Antigravity");
         u.chatgpt_on = false;
         assert!(sections(&cfg, &u, false).is_empty(), "no Codex login: no section");
     }
@@ -3078,6 +3100,7 @@ mod tests {
             busy: Default::default(),
             anchor: (0.0, 0.0, 0.0),
             focused_once: false,
+            ignore_focus_until: std::time::Instant::now(),
             styled: false,
             tab: Tab::Usage,
             by_model: false,
@@ -3199,7 +3222,7 @@ mod tests {
         let (names, s) = live_series(&calls, span, 0, 0, false);
         assert_eq!((names.len(), s[0][1], s[0][49]), (1, 110.0, 10.0), "total tokens, in and out");
         let (names, c) = live_series(&calls, span, 2, 1, true);
-        assert_eq!(names, ["Antigravity", "ChatGPT", "Claude"]);
+        assert_eq!(names, ["Antigravity", "Claude", "Codex"]);
         assert_eq!((c[2][0], c[2][1], c[2][59], c[0][48], c[0][49]), (0.0, 1.0, 1.0, 0.0, 1.0), "cumulative: only ever rises");
         let (_names, cost) = live_series(&calls, span, 0, 2, false);
         assert!(cost[0][1] > 0.0, "cost is computed from model rates");
@@ -3351,5 +3374,38 @@ mod tests {
         assert_eq!(ag.keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["Gemini X"], "a provider page counts only its own records");
     }
 
+    #[test]
+    fn analytics_edge_data_does_not_panic() {
+        let today = local_day(1_792_400_000);
+        // Empty file, garbage only, a record from the future (today before the first record), a corrupt huge time.
+        for text in ["", "garbage\n\n{}", r#"{"t":9999999999,"provider":"X","model":"m","input":1}"#, r#"{"t":18446744073709551615,"model":"m"}"#] {
+            for days in [1, 7, DAYS] {
+                let st = load_stats(text, true, today, days, None);
+                assert!(st.keys.is_empty() && st.days == days, "{text}");
+            }
+        }
+        let one = r#"{"t":1792400000,"provider":"Claude","model":"claude-opus-5-5","input":3,"output":4}"#;
+        let st = load_stats(one, true, today, DAYS, None);
+        assert_eq!((st.keys.len(), st.cells[&(DAYS - 1, 0)]), (1, 7), "one record is today's last bar");
+        let (names, series) = live_series(&[], range_span(1, 1_792_400_000), 1, 0, true);
+        assert!(names.is_empty() && series.is_empty());
+        assert!(load_calls("", 0, &Pricing::default()).is_empty());
+        let calls = load_calls(&format!("{one}\n{{}}"), 0, &Pricing::default());
+        for r in 0..3 {
+            let (n, s) = live_series(&calls, range_span(r, 1_792_400_000), 2, 2, true);
+            assert!(s.iter().all(|x| x.len() == range_span(r, 1_792_400_000).2), "{n:?}");
+        }
+    }
 
+    #[test]
+    fn popup_focus_loss_closes_only_after_the_grace() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + FOCUS_GRACE;
+        assert!(should_close(false, None, t0, t0, true), "Esc always closes, even inside the grace");
+        assert!(should_close(true, Some(false), t0, t0, false), "a click elsewhere closes once the grace is over");
+        assert!(!should_close(true, Some(false), later, t0, false), "a focus loss inside the grace is ignored");
+        assert!(should_close(true, Some(false), later, later, false), "...and counts again when it ends");
+        assert!(!should_close(false, Some(false), t0, later, false), "never focused yet: not a click-away");
+        assert!(!should_close(true, Some(true), t0, later, false) && !should_close(true, None, t0, later, false));
+    }
 }

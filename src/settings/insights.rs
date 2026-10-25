@@ -363,7 +363,7 @@ pub(super) fn analyse(calls: &[Call], q: &Query, now: u64) -> Analysis {
         }
         let key = match q.group {
             Group::Model => c.model.clone(),
-            Group::Provider => c.provider.clone(),
+            Group::Provider => crate::providers::label(&c.provider).to_string(),
             Group::Tier if c.tier.is_empty() => "—".to_string(),
             Group::Tier => c.tier.clone(),
             Group::Day => usage::day_label(d),
@@ -407,7 +407,7 @@ pub(super) fn history(calls: &[Call], q: &HQuery, now: u64) -> (Vec<usize>, Tota
         if c.t < since || !is(&q.provider, &c.provider) || !is(&q.tier, &c.tier) {
             continue;
         }
-        let fields = [&c.model, &c.provider, &c.tier, &c.acct, &c.stop].map(|f| f.to_lowercase());
+        let fields = [c.model.as_str(), &c.provider, crate::providers::label(&c.provider), &c.tier, &c.acct, &c.stop].map(|f| f.to_lowercase());
         if terms.iter().all(|t| fields.iter().any(|f| f.contains(t.as_str()))) {
             found.push(i);
             totals.add(c);
@@ -540,7 +540,7 @@ const NO_REQUESTS_HINT: &str = "ccat logs every request that goes through its pr
 
 /// `options` as the "All …" choice and then one per name.
 fn choices(all: &str, names: Vec<String>) -> Vec<(String, String)> {
-    std::iter::once((all.to_string(), String::new())).chain(names.into_iter().map(|n| (n.clone(), n))).collect()
+    std::iter::once((all.to_string(), String::new())).chain(names.into_iter().map(|n| (crate::providers::label(&n).to_string(), n))).collect()
 }
 
 /// Filters list the busiest names; the one picked stays listed even when it is not among them.
@@ -810,7 +810,7 @@ impl Insights {
                     let c = &calls[i];
                     let cells: Vec<String> = cols.iter().map(|(id, _)| match id {
                         0 => when(c.t),
-                        1 => c.provider.clone(),
+                        1 => crate::providers::label(&c.provider).to_string(),
                         2 => c.tier.clone(),
                         3 => c.model.clone(),
                         4 => usage::fmt_tokens(c.input as f64),
@@ -880,7 +880,7 @@ fn details(ui: &mut egui::Ui, c: &Call) {
         let line = |ui: &mut egui::Ui, text: String| {
             ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.muted)).wrap());
         };
-        line(ui, format!("{} · {} · tier {} · account {} · stopped: {}", c.model, c.provider, or(&c.tier), or(&c.acct), or(&c.stop.replace('_', " "))));
+        line(ui, format!("{} · {} · tier {} · account {} · stopped: {}", c.model, crate::providers::label(&c.provider), or(&c.tier), or(&c.acct), or(&c.stop.replace('_', " "))));
         line(ui, format!(
             "input {} · output {} · cache read {} · cache write {} · took {} · est. {}",
             thousands(c.input),
@@ -943,14 +943,14 @@ mod tests {
         ];
         let a = analyse(&calls, &query(Range::D7, Group::Provider, Metric::Tokens), NOW);
         assert_eq!((a.total.requests, a.buckets, a.hourly), (3, 7, false));
-        assert_eq!(a.names, ["ChatGPT", "Claude"], "biggest first: ChatGPT 70 tokens, Claude 33");
+        assert_eq!(a.names, ["Codex", "Claude"], "biggest first: ChatGPT 70 tokens, Claude 33");
     }
 
     #[test]
     fn groups_are_ordered_by_the_metric_and_the_bars_hold_the_same_sum() {
         let calls = vec![call(100, "Claude", "A", 10, 20, 0), call(200, "ChatGPT", "B", 30, 40, 0), call(300, "ChatGPT", "B", 1, 1, 0)];
         let a = analyse(&calls, &query(Range::D7, Group::Provider, Metric::Tokens), NOW);
-        assert_eq!(a.names, ["ChatGPT", "Claude"]);
+        assert_eq!(a.names, ["Codex", "Claude"]);
         let bars: f64 = a.cells.iter().flatten().sum();
         assert_eq!(bars, 102.0, "tokens in + out");
         assert_eq!(a.rows[0].totals.requests, 2);

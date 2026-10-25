@@ -379,7 +379,7 @@ impl<'a> Tx<'a> {
                 if s("type") == "response.incomplete" {
                     match v["response"]["incomplete_details"]["reason"].as_str().unwrap_or("") {
                         "max_output_tokens" => self.max_tokens = true,
-                        other => return Err(self.fail(Failure { status: 400, message: format!("ChatGPT stopped generating ({other})"), retry_after: None }, None)),
+                        other => return Err(self.fail(Failure { status: 400, message: format!("Codex stopped generating ({other})"), retry_after: None }, None)),
                     }
                 }
                 Ok(())
@@ -395,7 +395,7 @@ impl<'a> Tx<'a> {
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("ChatGPT stream broke: {e}"), retry_after: None }, Some(0))),
+                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("Codex stream broke: {e}"), retry_after: None }, Some(0))),
             };
             if let Some(d) = line.strip_prefix("data:") {
                 data.push_str(d.trim_start());
@@ -409,10 +409,10 @@ impl<'a> Tx<'a> {
             self.event(&v)?;
         }
         if !self.done {
-            return Err(self.fail(Failure { status: 502, message: "ChatGPT stream ended before the response finished".into(), retry_after: None }, Some(0)));
+            return Err(self.fail(Failure { status: 502, message: "Codex stream ended before the response finished".into(), retry_after: None }, Some(0)));
         }
         if !self.started && self.queries.is_empty() && self.links.is_empty() {
-            return Err(self.fail(Failure { status: 529, message: "ChatGPT returned an empty response".into(), retry_after: None }, Some(0)));
+            return Err(self.fail(Failure { status: 529, message: "Codex returned an empty response".into(), retry_after: None }, Some(0)));
         }
         let any_tool = self.blocks.iter().any(|b| b["type"] == "tool_use");
         self.stop_reason = if any_tool { "tool_use" } else if self.max_tokens { "max_tokens" } else { "end_turn" };

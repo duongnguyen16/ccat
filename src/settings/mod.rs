@@ -82,7 +82,7 @@ fn items(cfg: &Config) -> Vec<Item> {
     v.push(provider(Page::Claude, "Claude", Glyph::Claude, cfg.claude_off));
     for (kind, page, glyph) in [(Kind::Antigravity, Page::Antigravity, Glyph::Antigravity), (Kind::ChatGpt, Page::ChatGpt, Glyph::ChatGpt), (Kind::Ollama, Page::Ollama, Glyph::Ollama), (Kind::Muse, Page::Muse, Glyph::Muse)] {
         if let Some(p) = cfg.providers.iter().find(|p| p.kind() == kind) {
-            v.push(provider(page, &p.name, glyph, p.disabled));
+            v.push(provider(page, crate::providers::label(&p.name), glyph, p.disabled));
         }
     }
     for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::Endpoint) {
@@ -102,6 +102,7 @@ impl Page {
     /// The page a command-line argument names: a sidebar label, or its first word ("models", "token").
     fn parse(arg: &str, cfg: &Config) -> Option<Page> {
         let a = arg.trim().to_lowercase();
+        let a = if a == "chatgpt" { "codex".to_string() } else { a }; // the page's old name
         items(cfg).into_iter().filter(|i| i.page != Page::Add).find(|i| {
             let label = i.label.to_lowercase();
             label == a || label.split_whitespace().next() == Some(a.as_str())
@@ -798,7 +799,8 @@ mod tests {
         assert!(filter(&all, "zzz").is_empty());
         let names: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(names[..7], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Analytics", "History"]);
-        assert_eq!(names[7..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!(names[7..], ["Claude", "Antigravity", "Codex", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!((Page::parse("codex", &cfg), Page::parse("ChatGPT", &cfg)), (Some(Page::ChatGpt), Some(Page::ChatGpt)), "the old page name still opens it");
         assert_eq!(Page::parse("models", &cfg), Some(Page::Models), "the first word of a label is enough");
         assert_eq!((Page::parse("analytics", &cfg), Page::parse("History", &cfg)), (Some(Page::Analytics), Some(Page::History)));
         assert_eq!(Page::parse("openrouter", &cfg), Some(Page::Endpoint(4)));

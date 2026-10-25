@@ -362,7 +362,7 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                 for (n, (u, m)) in tries.iter().enumerate() {
                     let last = n + 1 == tries.len();
                     if n > 0 {
-                        common::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
+                        common::log(&format!("{asked} [{tier}]: falling back to {m} on {}", crate::providers::label(&format!("{u:?}"))));
                     }
                     let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
                     // Claude always gets Claude Code's own bytes.
