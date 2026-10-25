@@ -1,7 +1,9 @@
-//! The small vector icons in the Settings sidebar, drawn with painter strokes (no icon font, no image files). Each is
+//! The small icons in the Settings sidebar: vectors drawn with painter strokes (no icon font), and the providers' logos
+//! from `media/png` (`art`, `Logos`). Each stroked glyph is
 //! laid out for a 16 px square centred on `c`; the colour is the item's text colour.
 
 use eframe::egui::{self, vec2, Color32, Pos2, Shape, Stroke};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Glyph {
@@ -10,6 +12,7 @@ pub(super) enum Glyph {
     Leaf,
     Monitor,
     Info,
+    Dashboard,
     Bars,
     Clock,
     Claude,
@@ -71,6 +74,12 @@ pub(super) fn paint(pt: &egui::Painter, c: Pos2, glyph: Glyph, color: Color32) {
             pt.circle_filled(at(0.0, -3.0), 1.0, color);
             line((0.0, -0.5), (0.0, 4.0));
         }
+        Glyph::Dashboard => {
+            // Four tiles of different sizes.
+            for (a, b) in [((-7.0, -7.0), (-1.0, 0.0)), ((1.0, -7.0), (7.0, -2.0)), ((-7.0, 2.0), (-1.0, 7.0)), ((1.0, 0.0), (7.0, 7.0))] {
+                pt.rect_stroke(egui::Rect::from_min_max(at(a.0, a.1), at(b.0, b.1)), 1.5, s, egui::StrokeKind::Middle);
+            }
+        }
         Glyph::Bars => {
             for (x, top) in [(-6.5, 0.0), (-1.5, -7.0), (3.5, -3.5)] {
                 pt.rect_filled(egui::Rect::from_min_max(at(x, top), at(x + 3.0, 7.0)), 1.0, color);
@@ -119,5 +128,54 @@ pub(super) fn paint(pt: &egui::Painter, c: Pos2, glyph: Glyph, color: Color32) {
             line((-6.0, 0.0), (6.0, 0.0));
             line((0.0, -6.0), (0.0, 6.0));
         }
+    }
+}
+
+/// A provider's logo, from `media/png` (96 px, transparent): the sidebar paints it in place of the stroked glyph.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Art {
+    pub file: &'static str,
+    pub png: &'static [u8],
+    /// A white mark: tinted to the item's text colour, so it follows the theme and an off provider's dimming. A brand
+    /// logo keeps its own colours and is only faded.
+    pub mono: bool,
+}
+
+/// The logo of `glyph`'s provider, if it has one; the rest stay painter-drawn.
+pub(super) fn art(glyph: Glyph) -> Option<Art> {
+    macro_rules! art {
+        ($file:literal, $mono:literal) => {
+            Some(Art { file: $file, png: include_bytes!(concat!("../../media/png/", $file)), mono: $mono })
+        };
+    }
+    match glyph {
+        Glyph::Claude => art!("claude-code.png", false),
+        Glyph::Antigravity => art!("google-antigravity.png", false),
+        Glyph::ChatGpt => art!("openai-chatgpt.png", true),
+        Glyph::Ollama => art!("ollama-dark.png", true),
+        Glyph::Muse => art!("Muse-logo.png", false),
+        _ => None,
+    }
+}
+
+/// The logos' textures, each decoded the first time it is painted.
+#[derive(Default)]
+pub(super) struct Logos(HashMap<&'static str, Option<egui::TextureHandle>>);
+
+impl Logos {
+    /// Paints `glyph`'s logo, `size` points square, centred on `c`: tinted `color` when it is a white mark, faded to
+    /// `fade` (0 to 1) otherwise. `false` when it has none (or it cannot be decoded): paint the glyph instead.
+    pub(super) fn paint(&mut self, ui: &egui::Ui, c: Pos2, size: f32, glyph: Glyph, color: Color32, fade: f32) -> bool {
+        let Some(art) = art(glyph) else { return false };
+        let tex = self.0.entry(art.file).or_insert_with(|| {
+            let icon = eframe::icon_data::from_png_bytes(art.png).ok()?;
+            // Averaged down first: the GPU's plain minify of 96 px to 18 would alias.
+            let image = crate::usage::shrink(&icon.rgba, icon.width as usize, icon.height as usize, 48);
+            Some(ui.ctx().load_texture(art.file, image, egui::TextureOptions::LINEAR))
+        });
+        let Some(tex) = tex else { return false };
+        let tint = if art.mono { color } else { Color32::WHITE.gamma_multiply(fade) };
+        egui::Image::new(&*tex).fit_to_exact_size(vec2(size, size)).tint(tint).paint_at(ui, egui::Rect::from_center_size(c, vec2(size, size)));
+        true
     }
 }

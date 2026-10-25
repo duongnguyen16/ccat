@@ -1,4 +1,4 @@
-//! The Analytics and History pages: what the proxy logged in `tokens.jsonl`, one line per answered request. The file's
+//! The Dashboard, Analytics and History pages: what the proxy logged in `tokens.jsonl`, one line per answered request. The file's
 //! tail is read into memory once and then only what is appended (`Log`); the pages filter and add that up
 //! (`analyse`, `history`, both plain functions of the loaded calls and a query, so they can be tested without a window).
 
@@ -13,6 +13,8 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant, SystemTime},
 };
+
+mod dashboard;
 
 /// How often the file is looked at.
 const POLL: Duration = Duration::from_secs(3);
@@ -573,6 +575,8 @@ pub(super) struct Insights {
     limit: usize,
     open: Option<(usize, u64)>,
     found: Option<((u64, u64, HQuery), (Vec<usize>, Totals))>,
+    /// The Dashboard page: its options and the series it last built.
+    dash: dashboard::Dash,
 }
 
 impl Insights {
@@ -586,6 +590,7 @@ impl Insights {
             limit: PAGE,
             open: None,
             found: None,
+            dash: dashboard::Dash::default(),
         }
     }
 
