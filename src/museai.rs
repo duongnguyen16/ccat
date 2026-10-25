@@ -139,7 +139,7 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
 
 fn native_prompt(payload: &Value) -> Result<String, Failure> {
     if payload["ccat_unsupported_content"] == true { return Err(fail(400, "MuseAI native gateway supports text and client tool results, not media blocks")); }
-    let tools = payload.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let tools = effective_tools(payload);
     if !tools.is_array() { return Err(fail(400, "MuseAI: tools must be an array")); }
     for tool in tools.as_array().unwrap() {
         let function = tool.get("function").unwrap_or(tool);
@@ -157,6 +157,23 @@ fn native_prompt(payload: &Value) -> Result<String, Failure> {
     prompt.push_str(&payload["messages"].to_string());
     if prompt.len() > native::MAX_BODY - 4096 { return Err(fail(413, "MuseAI prompt exceeds 16 MiB transport limit")); }
     Ok(prompt)
+}
+fn effective_tools(payload: &Value) -> Value {
+    if payload["tool_choice"]["type"] == "none" { json!([]) }
+    else { payload.get("tools").cloned().unwrap_or_else(|| json!([])) }
+}
+fn enforce_tool_choice(delta: &Value, choice: Option<&Value>) -> Result<(), Failure> {
+    let kind = choice.and_then(|value| value["type"].as_str()).unwrap_or("auto");
+    if matches!(kind, "any" | "tool") && delta["tool_calls"].as_array().is_none_or(Vec::is_empty) {
+        return Err(fail(502, "MuseAI did not honor the required client tool choice"));
+    }
+    if kind == "tool" {
+        let name = choice.and_then(|value| value["name"].as_str()).unwrap_or("");
+        if delta["tool_calls"].as_array().into_iter().flatten().any(|call| call["function"]["name"] != name) {
+            return Err(fail(502, "MuseAI requested a different client tool than required"));
+        }
+    }
+    Ok(())
 }
 fn tool_schema(function: &Value) -> Value {
     let mut schema = function.get("parameters").or_else(|| function.get("input_schema")).cloned().unwrap_or_else(|| json!({"type":"object"}));
@@ -185,7 +202,11 @@ fn normalize_schema(schema: &mut Value) {
 fn reply_delta(text: &str, tools: &Value) -> Result<Value, Failure> {
     let trimmed = text.trim();
     let json_text = trimmed.strip_prefix("```json\n").and_then(|s| s.strip_suffix("```" )).unwrap_or(trimmed).trim();
-    let parsed: Value = serde_json::from_str(json_text).unwrap_or(Value::Null);
+    let parsed: Value = match serde_json::from_str(json_text) {
+        Ok(value) => value,
+        Err(_) if json_text.starts_with('{') && json_text.contains("\"tool_calls\"") => return Err(fail(502, "MuseAI returned malformed tool JSON")),
+        Err(_) => return Ok(json!({"content":text})),
+    };
     let Some(calls) = parsed.get("tool_calls") else { return Ok(json!({"content":text})); };
     let calls = calls.as_array().filter(|a| !a.is_empty()).ok_or_else(|| fail(502, "MuseAI returned malformed tool calls"))?;
     let mut output = Vec::new();
@@ -274,18 +295,19 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     let id = native::identity(&native::cookies(&cookie_text)?)?;
     let (tx, reader, cancel) = stream_channel();
     let gateway = Gateway::connect(&id, cancel.clone())?;
-    let tools = payload.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let tools = effective_tools(payload);
+    let tool_choice = payload.get("tool_choice").cloned();
     let request_id = crate::antigravity::random_hex(8);
     crate::antigravity::log(&json!({"event":"muse_native_request","phase":"start","request_id":request_id,"prompt_bytes":prompt.len(),"prompt_characters":prompt.chars().count(),"active_tools":tools.as_array().map_or(0, Vec::len),"usage_source":"unavailable"}).to_string());
     std::thread::Builder::new().name("muse-native".into()).spawn(move || {
         let _slot = slot;
-        let result = run_chat(gateway, &prompt, &tools, &tx, &cancel);
+        let result = run_chat(gateway, &prompt, &tools, tool_choice.as_ref(), &tx, &cancel);
         crate::antigravity::log(&json!({"event":"muse_native_request","phase":"end","request_id":request_id,"status":result.as_ref().err().map_or(200, |f| f.status),"elapsed_ms":started.elapsed().as_millis(),"usage_source":"unavailable"}).to_string());
         if let Err(f) = result { let _ = tx.send(Err(io::Error::other(f.message))); }
     }).map_err(|_| fail(500, "Could not start native MuseAI worker"))?;
     Ok(Box::new(BufReader::new(reader)))
 }
-fn run_chat(mut gateway: Gateway, prompt: &str, tools: &Value, tx: &StreamTx, cancel: &AtomicBool) -> Result<(), Failure> {
+fn run_chat(mut gateway: Gateway, prompt: &str, tools: &Value, tool_choice: Option<&Value>, tx: &StreamTx, cancel: &AtomicBool) -> Result<(), Failure> {
     let session = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat request"}})))?;
     let session = session["session_id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| fail(502, "MuseAI returned no session ID"))?.to_string();
     let mut chat = Chat { gateway, session };
@@ -299,6 +321,7 @@ fn run_chat(mut gateway: Gateway, prompt: &str, tools: &Value, tx: &StreamTx, ca
         let history = chat.gateway.request("GET", &path, None)?;
         if let Some(text) = completed_reply(&history, baseline)? {
             let delta = reply_delta(&text, tools)?;
+            enforce_tool_choice(&delta, tool_choice)?;
             let reason = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
             emit(tx, json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]}))?;
             tx.send(Ok(b"data: [DONE]\n\n".to_vec())).map_err(|_| fail(499, "MuseAI client disconnected"))?;
@@ -432,6 +455,17 @@ mod tests {
         assert!(reply_delta(r#"{"tool_calls":[{"name":"Read","arguments":{}}]}"#, &tools).is_err());
         let delta = reply_delta(r#"{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}]}"#, &tools).unwrap();
         assert_eq!(delta["tool_calls"][0]["function"]["name"], "Read");
+        assert!(reply_delta(r#"{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}"#, &tools).is_err(), "truncated tool JSON must fail closed");
+    }
+    #[test]
+    fn explicit_tool_choice_cannot_be_satisfied_by_plain_text_or_wrong_tool() {
+        let tools = json!([{"name":"Read","input_schema":{"type":"object"}},{"name":"Write","input_schema":{"type":"object"}}]);
+        assert!(enforce_tool_choice(&json!({"content":"I will read it"}), Some(&json!({"type":"any"}))).is_err());
+        assert!(enforce_tool_choice(&json!({"tool_calls":[{"function":{"name":"Write"}}]}), Some(&json!({"type":"tool","name":"Read"}))).is_err());
+        assert!(enforce_tool_choice(&json!({"tool_calls":[{"function":{"name":"Read"}}]}), Some(&json!({"type":"tool","name":"Read"}))).is_ok());
+        let payload = json!({"tools":tools,"tool_choice":{"type":"none"},"messages":[]});
+        assert_eq!(effective_tools(&payload), json!([]));
+        assert!(!native_prompt(&payload).unwrap().contains("Available tools:"));
     }
     #[test]
     fn native_history_filters_background_and_incomplete_replies() {
@@ -458,6 +492,16 @@ mod tests {
         drop(reader);
         assert!(cancel.load(Ordering::Relaxed));
         assert!(tx.send(Ok(Vec::new())).is_err());
+    }
+    #[test]
+    fn dropping_slow_reader_unblocks_full_channel() {
+        let (tx, reader, cancel) = stream_channel();
+        tx.send(Ok(vec![1])).unwrap();
+        tx.send(Ok(vec![2])).unwrap();
+        let worker = std::thread::spawn(move || tx.send(Ok(vec![3])));
+        drop(reader);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(worker.join().unwrap().is_err());
     }
     #[test]
     fn local_model_list_never_needs_runtime_or_account() {

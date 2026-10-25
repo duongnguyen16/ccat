@@ -2,6 +2,7 @@
 //! One owner per connection: Noise nonces must never be read concurrently.
 use prost::Message;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::{net::{TcpStream, ToSocketAddrs}, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use tungstenite::{client::IntoClientRequest, stream::MaybeTlsStream, protocol::WebSocketConfig, WebSocket, Message as WsMessage};
 use crate::antigravity::Failure;
@@ -178,12 +179,17 @@ pub(super) fn http_json(cookies: &str, path: &str, body: Option<&Value>, token: 
         if let Some(t) = token { req = req.header("Authorization", format!("Bearer {t}")); }
         req.send(value.to_string())
     } else { headers(agent.get(&url)).call() };
-    let mut response = result.map_err(|e| match e {
+    let response = result.map_err(|e| match e {
         ureq::Error::StatusCode(s) => fail(s, format!("MuseAI {path}: HTTP {s}")),
         _ => fail(502, format!("MuseAI {path}: HTTPS request failed")),
     })?;
-    let text = response.body_mut().read_to_string().map_err(|_| fail(502, "MuseAI: invalid HTTPS response"))?;
-    serde_json::from_str(&text).map_err(|_| fail(502, format!("MuseAI {path}: expected JSON")))
+    read_json_body(response.into_body().into_reader()).map_err(|e| fail(e.status, format!("MuseAI {path}: {}", e.message)))
+}
+fn read_json_body(reader: impl Read) -> Result<Value, Failure> {
+    let mut bytes = Vec::new();
+    reader.take((MAX_BODY + 1) as u64).read_to_end(&mut bytes).map_err(|_| fail(502, "invalid HTTPS response"))?;
+    if bytes.len() > MAX_BODY { return Err(fail(502, "HTTPS response exceeds limit")); }
+    serde_json::from_slice(&bytes).map_err(|_| fail(502, "expected JSON"))
 }
 
 pub(super) struct Identity { pub viewer_id: String, pub vm_id: String, pub token: String }
@@ -212,7 +218,7 @@ pub(super) fn socket(url: &str, host: &str, port: u16, max_size: usize) -> Resul
         .map(|(ws, _)| ws).map_err(|_| fail(502, "MuseAI: WebSocket/TLS handshake failed"))
 }
 
-pub(super) struct Gateway { ws: Socket, noise: snow::TransportState, stream: i64, cancel: Arc<AtomicBool> }
+pub(super) struct Gateway { ws: Socket, noise: snow::TransportState, stream: i64, chat_stream: Option<i64>, cancel: Arc<AtomicBool> }
 impl Gateway {
     pub fn connect(id: &Identity, cancel: Arc<AtomicBool>) -> Result<Self, Failure> {
         let url = format!("wss://hatch.metaaivm.com/v1/noise?vm_id={}&auth_token={}", encode_query(&id.vm_id), encode_query(&id.token));
@@ -228,7 +234,7 @@ impl Gateway {
         handshake.read_message(&response, &mut wire).map_err(|_| protocol_error())?;
         let n = handshake.write_message(&[], &mut wire).map_err(|_| protocol_error())?;
         ws.send(WsMessage::Binary(wire[..n].to_vec().into())).map_err(|_| protocol_error())?;
-        Ok(Self { ws, noise: handshake.into_transport_mode().map_err(|_| protocol_error())?, stream: 0, cancel })
+        Ok(Self { ws, noise: handshake.into_transport_mode().map_err(|_| protocol_error())?, stream: 0, chat_stream: None, cancel })
     }
     pub fn open(&mut self, verb: &str, path: &str, body: Option<&Value>) -> Result<i64, Failure> {
         if self.cancel.load(Ordering::Relaxed) { return Err(fail(499, "MuseAI request cancelled")); }
@@ -239,20 +245,23 @@ impl Gateway {
         for packet in pack(&mut self.noise, &envelope)? {
             self.ws.send(WsMessage::Binary(packet.into())).map_err(|_| fail(502, "MuseAI send failed; delivery is uncertain, not retried"))?;
         }
+        if path == "/chat/stream" { self.chat_stream = Some(self.stream); }
         Ok(self.stream)
     }
     pub fn cleanup(&mut self, session: &str) -> Result<(), Failure> {
         let previous = std::mem::replace(&mut self.cancel, Arc::new(AtomicBool::new(false)));
-        let result = self.request("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":session})));
+        let result = self.request_until("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":session})), Instant::now() + Duration::from_secs(3));
         self.cancel = previous;
         result.map(|_| ())
     }
     pub fn request(&mut self, verb: &str, path: &str, body: Option<&Value>) -> Result<Value, Failure> {
+        self.request_until(verb, path, body, Instant::now() + Duration::from_secs(30))
+    }
+    fn request_until(&mut self, verb: &str, path: &str, body: Option<&Value>, deadline: Instant) -> Result<Value, Failure> {
         let sid = self.open(verb, path, body)?;
         let mut chunks = Assembly::default();
         let mut output = Vec::new();
         let mut status = None;
-        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if self.cancel.load(Ordering::Relaxed) { return Err(fail(499, "MuseAI request cancelled")); }
             if Instant::now() >= deadline { return Err(fail(504, "MuseAI gateway response timed out")); }
@@ -260,13 +269,7 @@ impl Gateway {
             let Some(bytes) = chunks.push(unpack(&mut self.noise, &wire)?)? else { continue };
             let response = ServiceResponse::decode(bytes.as_slice()).map_err(|_| protocol_error())?;
             let frame = ServiceFrame::decode(response.payload.as_slice()).map_err(|_| protocol_error())?;
-            if frame.stream_id != sid {
-                // Only chat.stream's acknowledgement can coexist with this unary request.
-                if let Some(FrameKind::Response(r)) = frame.kind {
-                    if !(200..300).contains(&r.status) { return Err(fail(502, format!("MuseAI chat send rejected: HTTP {}", r.status))); }
-                }
-                continue;
-            }
+            if frame.stream_id != sid { check_other_frame(frame, self.chat_stream)?; continue; }
             let (bytes, done) = match frame.kind {
                 Some(FrameKind::Response(r)) => { status = Some(r.status); (r.body, r.end_body) },
                 Some(FrameKind::Body(b)) => (b.data, b.end_body),
@@ -282,6 +285,16 @@ impl Gateway {
                 return application_json(&output);
             }
         }
+    }
+}
+fn check_other_frame(frame: ServiceFrame, chat_stream: Option<i64>) -> Result<(), Failure> {
+    if Some(frame.stream_id) != chat_stream { return Err(protocol_error()); }
+    match frame.kind {
+        Some(FrameKind::Response(r)) if (200..300).contains(&r.status) => Ok(()),
+        Some(FrameKind::Response(r)) => Err(fail(502, format!("MuseAI chat send rejected: HTTP {}", r.status))),
+        Some(FrameKind::Body(_)) => Ok(()),
+        Some(FrameKind::Reset(_)) => Err(fail(502, "MuseAI chat send was reset")),
+        _ => Err(protocol_error()),
     }
 }
 fn application_json(bytes: &[u8]) -> Result<Value, Failure> {
@@ -312,6 +325,24 @@ fn read_binary(ws: &mut Socket, cancel: &AtomicBool, deadline: Instant) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_mock_gateway<S, C>(server: S, client: C)
+    where S: FnOnce(WebSocket<TcpStream>, snow::TransportState) + Send + 'static,
+          C: FnOnce(&mut Gateway) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client_noise, server_noise) = noise_pair();
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server(tungstenite::accept(stream).unwrap(), server_noise);
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (ws, _) = tungstenite::client(format!("ws://{address}").as_str(), MaybeTlsStream::Plain(stream)).unwrap();
+        let mut gateway = Gateway { ws, noise: client_noise, stream: 0, chat_stream: None, cancel: Arc::new(AtomicBool::new(false)) };
+        client(&mut gateway);
+        thread.join().unwrap();
+    }
 
     #[test]
     fn socket_read_timeout_does_not_abort_a_still_active_request() {
@@ -369,6 +400,51 @@ mod tests {
     }
 
     #[test]
+    fn only_known_chat_stream_frames_may_interleave_with_history() {
+        let response = |id, status| ServiceFrame { stream_id: id, kind: Some(FrameKind::Response(ApplicationResponse { status, headers: vec![], body: vec![], end_body: true })) };
+        assert!(check_other_frame(response(3, 200), Some(3)).is_ok());
+        assert!(check_other_frame(response(9, 200), Some(3)).is_err());
+        assert!(check_other_frame(response(3, 403), Some(3)).is_err());
+        assert!(check_other_frame(ServiceFrame { stream_id: 3, kind: Some(FrameKind::Reset(Reset { code: 1, reason: String::new() })) }, Some(3)).is_err());
+    }
+    #[test]
+    fn https_json_body_rejects_oversize() {
+        assert!(read_json_body(std::io::Cursor::new(vec![b'x'; MAX_BODY + 1])).is_err());
+        assert_eq!(read_json_body(std::io::Cursor::new(br#"{"ok":true}"#)).unwrap()["ok"], true);
+    }
+    #[test]
+    fn local_noise_gateway_reassembles_multichunk_response() {
+        with_mock_gateway(|mut ws, mut noise| {
+            let request = ws.read().unwrap().into_data();
+            let frame = unpack(&mut noise, &request).unwrap();
+            let envelope = ServiceRequest::decode(frame.payload.as_slice()).unwrap();
+            let id = ServiceFrame::decode(envelope.payload.as_slice()).unwrap().stream_id;
+            let response = ServiceFrame { stream_id: id, kind: Some(FrameKind::Response(ApplicationResponse { status: 200, headers: vec![], body: format!("{{\"text\":\"{}\"}}", "x".repeat(150_000)).into_bytes(), end_body: true })) };
+            let bytes = ServiceResponse { payload: response.encode_to_vec() }.encode_to_vec();
+            for wire in pack(&mut noise, &bytes).unwrap() { ws.send(WsMessage::Binary(wire.into())).unwrap(); }
+        }, |gateway| {
+            let result = gateway.request("GET", "/chat/history", None).unwrap();
+            assert_eq!(result["text"].as_str().unwrap().len(), 150_000);
+        });
+    }
+    #[test]
+    fn local_noise_gateway_rejects_unknown_and_reset_streams() {
+        for unknown in [true, false] {
+            with_mock_gateway(move |mut ws, mut noise| {
+                let request = ws.read().unwrap().into_data();
+                let frame = unpack(&mut noise, &request).unwrap();
+                let envelope = ServiceRequest::decode(frame.payload.as_slice()).unwrap();
+                let id = ServiceFrame::decode(envelope.payload.as_slice()).unwrap().stream_id;
+                let response = ServiceFrame { stream_id: if unknown { id + 1 } else { id }, kind: Some(FrameKind::Reset(Reset { code: 1, reason: String::new() })) };
+                let bytes = ServiceResponse { payload: response.encode_to_vec() }.encode_to_vec();
+                for wire in pack(&mut noise, &bytes).unwrap() { ws.send(WsMessage::Binary(wire.into())).unwrap(); }
+            }, |gateway| {
+                assert_eq!(gateway.request("GET", "/chat/history", None).unwrap_err().status, 502);
+            });
+        }
+    }
+
+    #[test]
     fn application_result_envelope_is_unwrapped_and_errors_fail() {
         assert_eq!(application_json(br#"{"ok":true,"result":{"session_id":"test"}}"#).unwrap()["session_id"], "test");
         assert!(application_json(br#"{"ok":false,"error":"private detail"}"#).is_err());
@@ -420,6 +496,40 @@ mod tests {
         let cleanup = gateway.request("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":sid})));
         assert!(cleanup.is_ok(), "Could not clean up ccat native verification session");
         assert!(outcome.is_ok(), "Native round trip failed: {outcome:?}");
+    }
+
+    #[test]
+    #[ignore = "explicit live-account opt-in; probes whether isolated history exposes partial replies"]
+    fn live_isolated_history_progress() {
+        let root = crate::usage::dirs_home().join(".config/muse-cli");
+        let text = std::fs::read_to_string(root.join("cookies.txt")).expect("Existing Muse cookie jar required");
+        let id = identity(&cookies(&text).unwrap()).unwrap();
+        let mut gateway = Gateway::connect(&id, Arc::new(AtomicBool::new(false))).unwrap();
+        let started = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat progress probe"}}))).unwrap();
+        let sid = started["session_id"].as_str().unwrap().to_string();
+        let path = format!("/chat/history?limit=20&session_id={}", encode_query(&sid));
+        let result = (|| -> Result<Vec<(String, usize)>, Failure> {
+            gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Write a short paragraph of about 100 words about a fictional garden."}],"node_id":crate::antigravity::random_hex(8),"capabilities":{},"session_id":sid})))?;
+            let mut snapshots = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while Instant::now() < deadline {
+                let history = gateway.request("GET", &path, None)?;
+                for event in history["chat_events"].as_array().into_iter().flatten().filter(|e| e["event_name"] == "message.assistant") {
+                    let payload = &event["payload"];
+                    let status = payload["status"].as_str().unwrap_or("").to_string();
+                    let length = payload["display_text"].as_str().or_else(|| payload["content"].as_str()).unwrap_or("").len();
+                    let sample = (status, length);
+                    if snapshots.last() != Some(&sample) { snapshots.push(sample.clone()); }
+                    if sample.0 == "completed" { return Ok(snapshots); }
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Err(fail(504, "Progress probe timed out"))
+        })();
+        let cleanup = gateway.request("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":sid})));
+        assert!(cleanup.is_ok(), "Progress probe cleanup failed");
+        let snapshots = result.unwrap();
+        println!("Isolated history status and byte-length snapshots: {snapshots:?}");
     }
 
     fn noise_pair() -> (snow::TransportState, snow::TransportState) {
