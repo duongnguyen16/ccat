@@ -575,12 +575,12 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
     match up {
         Upstream::Official => {
             let meter = counted.then_some((tier, "Claude", model));
-            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body.clone(), model), meter, may_fail)
+            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body, &req.body, model), meter, may_fail)
         }
         Upstream::Endpoint { name, url, key } => {
             let base = url.trim().trim_end_matches('/');
             let meter = counted.then_some((tier, name.as_str(), model));
-            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body.clone(), model), meter, may_fail)
+            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body, &req.body, model), meter, may_fail)
         }
         Upstream::Antigravity if !counted => {
             count_tokens(s, ctx, body, model);
@@ -636,16 +636,24 @@ impl Fail {
 
 /// The request body for an official or endpoint route: the tier's real model, and no thinking blocks another
 /// provider signed (Antigravity's `ag:` and ChatGPT's `oa:` tags, or none at all): Anthropic rejects a signature it didn't make.
+/// When neither applies the original bytes go on untouched, so the request is exactly what Claude Code sent (key order,
+/// number formatting, escapes); only a rewrite re-serializes `body` (which keeps its key order).
 /// ponytail: an assistant turn that was nothing but such thinking would be left empty; Claude Code always follows
 /// thinking with text or a tool call, so it hasn't come up.
-fn upstream_body(mut body: Value, model: &str) -> Vec<u8> {
+fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
     if body.is_null() {
         return Vec::new();
     }
+    let keeps = |b: &Value| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:"));
+    let blocks = || body["messages"].as_array().into_iter().flatten().filter_map(|m| m["content"].as_array()).flatten();
+    if body["model"] == model && blocks().all(keeps) {
+        return raw.to_vec();
+    }
+    let mut body = body.clone();
     body["model"] = json!(model);
-    for m in body["messages"].as_array_mut().into_iter().flatten() {
-        if let Some(blocks) = m["content"].as_array_mut() {
-            blocks.retain(|b| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:")));
+    for m in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(keeps);
         }
     }
     body.to_string().into_bytes()
@@ -2456,6 +2464,8 @@ mod tests {
     }
 
     pub static FAKE_API: Mutex<Option<String>> = Mutex::new(None);
+    /// Held by a test that points `FAKE_API` somewhere, so two of them never swap it under each other.
+    static FAKE_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_pool(pool: Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
         serve_with(pool, chatgpt::Pool::new(Vec::new(), Vec::new()), routes, folder).inspect(|p| p.fail_on_limit.store(true, Ordering::Relaxed))
@@ -2870,6 +2880,7 @@ be brief" }, { "type": "text", "text": " " }],
         assert_eq!(post(&proxy, &proxy.token, &body).0, 400);
 
         // A Claude tier (no token needed) whose fallback spends a key: without the token, no fallback.
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         proxy.routes.write().unwrap()[0] = Route { fallbacks: vec![(ep("Good", fake_endpoint(200, "good")), "x".into())], ..route("sonnet", &["m@sonnet"], Upstream::Official, "m") };
         *FAKE_API.lock().unwrap() = Some(busy);
         let (status, text) = post(&proxy, "not-the-token", &body);
@@ -2926,6 +2937,79 @@ be brief" }, { "type": "text", "text": " " }],
         assert_eq!(seen["body"]["model"], "vendor/m");
         let kept: Vec<&str> = seen["body"]["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
         assert_eq!(kept, ["from anthropic", "hello"], "thinking another provider signed is dropped");
+    }
+
+    /// What reached a fake Anthropic API: the raw body bytes and the headers, per request.
+    type Seen = Arc<Mutex<Vec<(Vec<u8>, Vec<(String, String)>)>>>;
+
+    fn fake_anthropic() -> (String, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Seen::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                log.lock().unwrap().push((req.body, req.headers));
+                let text = r#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1}}"#;
+                let _ = write!(s, "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{text}", text.len());
+            }
+        });
+        (url, seen)
+    }
+
+    /// The official route sends Claude Code's request on exactly as it came: same bytes when nothing needs changing,
+    /// and the same key order (only the model swapped, foreign thinking dropped) when something does.
+    #[test]
+    fn official_route_forwards_claude_codes_request_natively() {
+        let _api = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, seen) = fake_anthropic();
+        *FAKE_API.lock().unwrap() = Some(url);
+        let routes = vec![route("opus", &["claude-opus-4-5", "claude-opus-5-5"], Upstream::Official, "claude-opus-5-5")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let send = |body: &str| {
+            let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+            let res = agent.post(format!("{}/v1/messages?beta=true", proxy.url))
+                .header("authorization", "Bearer sk-ant-oat01-login")
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+                .header("anthropic-version", "2023-06-01")
+                .header("x-app", "cli")
+                .send(body.to_string())
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+            let (raw, headers) = seen.lock().unwrap().pop().unwrap();
+            (String::from_utf8(raw).unwrap(), headers)
+        };
+        // Keys deliberately out of alphabetical order, odd spacing, an escape and a float serde would write differently.
+        let body = r#"{"model": "claude-opus-5-5", "max_tokens":  64000,
+            "system":[{"type":"text","text":"You are Claude Code, caf\u00e9","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"hi"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"EqQBCkgIBhABGAIiQJz7Zp0YcRk3mV0aN8w"},{"type":"text","text":"yo"}]},
+                {"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]}],
+            "tools":[{"name":"Read","description":"d","input_schema":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"abc":{"type":"boolean"}},"required":["path"]}}],
+            "temperature": 1.0, "stream": true}"#;
+        let (got, headers) = send(body);
+        assert_eq!(got, body, "nothing to change: the very same bytes");
+        let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(h("authorization"), Some("Bearer sk-ant-oat01-login"), "Claude Code's own login");
+        assert_eq!(h("anthropic-beta"), Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"));
+        assert_eq!((h("anthropic-version"), h("x-app")), (Some("2023-06-01"), Some("cli")));
+        assert_eq!(h("x-api-key"), None);
+
+        // Another model name: the model is swapped in place, nothing else moves.
+        let compact = r#"{"model":"claude-opus-4-5","tools":[{"name":"Read","input_schema":{"type":"object","properties":{"path":{},"limit":{},"abc":{}}}}],"max_tokens":9,"stream":true}"#;
+        let (got, _) = send(compact);
+        assert_eq!(got, compact.replace("claude-opus-4-5", "claude-opus-5-5"));
+
+        // Thinking another provider signed is dropped; the key order stays.
+        let foreign = r#"{"model":"claude-opus-5-5","messages":[{"role":"assistant","content":[{"signature":"ag:claude:QUJD","type":"thinking","thinking":"x"},{"type":"text","text":"t"}]}],"z":1,"a":2}"#;
+        let (got, _) = send(foreign);
+        assert_eq!(got, r#"{"model":"claude-opus-5-5","messages":[{"role":"assistant","content":[{"type":"text","text":"t"}]}],"z":1,"a":2}"#);
+        *FAKE_API.lock().unwrap() = None;
     }
 
     #[test]
@@ -3385,7 +3469,7 @@ be brief" }, { "type": "text", "text": " " }],
         let body = json!({ "model": "x", "messages": [{ "role": "assistant", "content": [
             { "type": "thinking", "thinking": "a", "signature": "oa:eyJ9" }, { "type": "thinking", "thinking": "b", "signature": "ag:claude:QUJD" },
             { "type": "thinking", "thinking": "c", "signature": "EqQBCkg" }, { "type": "text", "text": "t" }] }] });
-        let sent: Value = serde_json::from_slice(&upstream_body(body, "claude-x")).unwrap();
+        let sent: Value = serde_json::from_slice(&upstream_body(&body, body.to_string().as_bytes(), "claude-x")).unwrap();
         let kept: Vec<&str> = sent["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
         assert_eq!(kept, ["c", "t"]);
         assert_eq!(untag(Some("oa:eyJ9"), "gpt"), None, "an Antigravity family never takes a ChatGPT signature");
