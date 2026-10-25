@@ -5,6 +5,7 @@
 //! Binds 127.0.0.1 on a random port. Routes that spend ccat's accounts or keys need the per-launch token;
 //! official routes only ever carry the caller's own credentials, so they don't.
 
+mod breaker;
 pub(crate) mod http;
 pub(crate) mod sse;
 
@@ -46,6 +47,8 @@ pub struct Proxy {
     pub chatgpt_models: Arc<RwLock<Vec<ChatgptModel>>>,
     /// Answer usage limits at once instead of holding the request until a route can run; switchable too.
     pub fail_on_limit: Arc<AtomicBool>,
+    /// Skip fallbacks that are custom endpoints (a paid API key); a tier's primary always runs. Switchable too.
+    pub no_paid_fallback: Arc<AtomicBool>,
     ctx: Arc<Ctx>,
 }
 
@@ -183,6 +186,9 @@ pub(crate) struct Ctx {
     /// Tokens per text byte of an Anthropic request, learned per model family from Google's real prompt counts.
     pub(crate) ratio: Mutex<HashMap<&'static str, f64>>,
     pub(crate) fail_on_limit: Arc<AtomicBool>,
+    pub(crate) no_paid_fallback: Arc<AtomicBool>,
+    /// Providers that keep failing are skipped for a while (see `breaker`).
+    pub(crate) breaker: breaker::Breaker,
     /// What this session's tiers are doing, written to its live file (see `live`).
     pub(crate) live: Mutex<crate::live::Session>,
     /// Bumped when a block is lifted early: held requests try again at once.
@@ -239,6 +245,7 @@ pub fn start(accounts: Vec<Account>, chatgpt: Vec<ChatgptAccount>, models: Vec<C
 fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
     let routes = Arc::new(RwLock::new(routes));
     let fail_on_limit = Arc::new(AtomicBool::new(false));
+    let no_paid_fallback = Arc::new(AtomicBool::new(false));
     let (disabled, chatgpt, chatgpt_models) = (pool.disabled.clone(), gpt.accounts.clone(), gpt.models.clone());
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -264,6 +271,8 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         folder,
         ratio: Mutex::new(HashMap::new()),
         fail_on_limit: fail_on_limit.clone(),
+        no_paid_fallback: no_paid_fallback.clone(),
+        breaker: Default::default(),
         live: Default::default(),
         wake: AtomicU64::new(0),
         plan_backs: Default::default(),
@@ -275,7 +284,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
             std::thread::spawn(move || serve(conn, &ctx));
         }
     });
-    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, ctx: handle })
+    Ok(Proxy { url, token, routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, ctx: handle })
 }
 
 // ---------------------------------------------------------------- request dispatch
@@ -316,11 +325,11 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             loop {
                 // Resolved on every pass: a route changed in Settings reaches a request already waiting.
                 let (up, model, tier, fallbacks) = ctx.resolve(&asked);
-                // Each try spends ccat's keys or accounts unless it's Claude: those need the token.
-                let tries: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).filter(|(u, _)| *u == Upstream::Official || authed).collect();
-                if tries.is_empty() {
+                let chain: Vec<(Upstream, String)> = std::iter::once((up, model)).chain(fallbacks).collect();
+                if !chain.iter().any(|(u, _)| *u == Upstream::Official || authed) {
                     return denied(&mut s);
                 }
+                let tries = pick_tries(chain, authed, ctx.no_paid_fallback.load(Ordering::Relaxed), &ctx.breaker);
                 let mut fails = Vec::new();
                 for (n, (u, m)) in tries.iter().enumerate() {
                     let last = n + 1 == tries.len();
@@ -328,7 +337,13 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                         common::log(&format!("{asked} [{tier}]: falling back to {m} on {u:?}"));
                     }
                     let may_fail = if !last { Fail::Fallback } else if hold { Fail::Limit } else { Fail::Never };
-                    match run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, may_fail) {
+                    let result = run(&mut s, ctx, &req, &body, &asked, u, m, tier, counted, may_fail);
+                    // Only a 5xx (or a timeout / connection error, which come back as 502) counts against the provider.
+                    match &result {
+                        Err(f) if f.status >= 500 => ctx.breaker.fail(&format!("{u:?}")),
+                        _ => ctx.breaker.ok(&format!("{u:?}")),
+                    }
+                    match result {
                         Ok(()) => {
                             if !tier.is_empty() {
                                 ctx.note(|s| {
@@ -397,6 +412,20 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
             respond_error(&mut s, &Failure { status: 404, message: format!("ccat proxy has no {} {}", req.method, req.path), retry_after: None })
         }
     }
+}
+
+/// The chain a request may try, in order. Each try spends ccat's keys or accounts unless it's Claude: those need the
+/// token. With `no_paid` a fallback that is a custom endpoint (a paid API key) is dropped; the primary never is.
+/// Tries whose breaker is open are skipped, unless that would leave none: a request is never failed untried.
+fn pick_tries(chain: Vec<(Upstream, String)>, authed: bool, no_paid: bool, breaker: &breaker::Breaker) -> Vec<(Upstream, String)> {
+    let all: Vec<_> = chain
+        .into_iter()
+        .enumerate()
+        .filter(|(n, (u, _))| (*u == Upstream::Official || authed) && (*n == 0 || !(no_paid && matches!(u, Upstream::Endpoint { .. }))))
+        .map(|(_, t)| t)
+        .collect();
+    let ready: Vec<_> = all.iter().filter(|(u, _)| breaker.allow(&format!("{u:?}"))).cloned().collect();
+    if ready.is_empty() { all } else { ready }
 }
 
 /// Sleeps `secs` while Claude Code keeps the connection open; false as soon as it closes it (Esc, or a timeout). Ends
@@ -604,6 +633,8 @@ pub(crate) mod tests {
             folder: PathBuf::new(),
             ratio: Mutex::new(HashMap::new()),
             fail_on_limit: Default::default(),
+            no_paid_fallback: Default::default(),
+            breaker: Default::default(),
             live: Default::default(),
             wake: AtomicU64::new(0),
             plan_backs: Default::default(),
@@ -848,16 +879,85 @@ pub(crate) mod tests {
 
     /// An endpoint that answers `status` with a body naming itself, for fallback tests.
     fn fake_endpoint(status: u16, who: &'static str) -> String {
+        counted_endpoint(status, who).0
+    }
+
+    /// `fake_endpoint` plus the number of requests it has received.
+    fn counted_endpoint(status: u16, who: &'static str) -> (String, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let n = hits.clone();
         std::thread::spawn(move || {
             for mut s in listener.incoming().flatten() {
                 let _ = read_request(&s);
+                n.fetch_add(1, Ordering::Relaxed);
                 let text = json!({ "type": "message", "who": who, "error": { "message": format!("{who} says {status}") }, "usage": { "input_tokens": 1, "output_tokens": 1 } }).to_string();
                 let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}", text.len());
             }
         });
-        url
+        (url, hits)
+    }
+
+    fn ep(name: &str, url: String) -> Upstream {
+        Upstream::Endpoint { name: name.into(), url, key: "k".into() }
+    }
+
+    fn ask(proxy: &Proxy) -> (u16, String) {
+        post(proxy, &proxy.token, &json!({ "model": "m@sonnet", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] }))
+    }
+
+    #[test]
+    fn never_paid_skips_endpoint_fallbacks_but_not_the_primary() {
+        let chain = |first: Upstream| vec![(first, "a".to_string()), (ep("Paid", "u".into()), "b".into()), (Upstream::Antigravity, "c".into()), (Upstream::Ollama { url: "u".into(), key: String::new() }, "d".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        let b = breaker::Breaker::default();
+        assert_eq!(names(pick_tries(chain(Upstream::Official), true, false, &b)), "abcd", "off: as before");
+        assert_eq!(names(pick_tries(chain(Upstream::Official), true, true, &b)), "acd", "on: the endpoint fallback goes, subscriptions and Ollama stay");
+        assert_eq!(names(pick_tries(chain(ep("Mine", "u".into())), true, true, &b)), "acd", "on: an endpoint primary still runs, the endpoint fallback goes");
+
+        let (busy, good) = (fake_endpoint(429, "busy"), fake_endpoint(200, "good"));
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy), "m");
+        r.fallbacks = vec![(ep("Good", good), "x".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        assert!(ask(&proxy).1.contains("\"who\":\"good\""), "off: the endpoint fallback answers");
+        proxy.no_paid_fallback.store(true, Ordering::Relaxed);
+        let (status, text) = ask(&proxy);
+        assert_eq!(status, 429, "on: the endpoint primary ran and its limit reached Claude Code: {text}");
+        assert!(text.contains("busy says 429"), "{text}");
+    }
+
+    #[test]
+    fn open_breakers_are_skipped_but_never_leave_a_request_untried() {
+        let b = breaker::Breaker::default();
+        let chain = || vec![(ep("A", "u".into()), "a".to_string()), (ep("B", "u".into()), "b".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        (0..3).for_each(|_| b.fail("A"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "b", "A is open: skipped, the order of the rest kept");
+        (0..3).for_each(|_| b.fail("B"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "ab", "every route open: all are tried, in order");
+    }
+
+    #[test]
+    fn the_breaker_trips_on_5xx_not_on_usage_limits() {
+        let (flaky, flaky_hits) = counted_endpoint(503, "flaky");
+        let (busy, busy_hits) = counted_endpoint(429, "busy");
+        let good = fake_endpoint(200, "good");
+        let mut r = route("sonnet", &["m@sonnet"], ep("Flaky", flaky), "m");
+        r.fallbacks = vec![(ep("Good", good.clone()), "x".into())];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![r], PathBuf::new()).unwrap();
+        for _ in 0..4 {
+            assert_eq!(ask(&proxy).0, 200, "the fallback answers every time");
+        }
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 3, "tripped after 3 failures: the 4th request skipped it");
+
+        let mut r = route("sonnet", &["m@sonnet"], ep("Busy", busy), "m");
+        r.fallbacks = vec![(ep("Good", good), "x".into())];
+        proxy.routes.write().unwrap()[0] = r;
+        for _ in 0..5 {
+            assert!(ask(&proxy).1.contains("\"who\":\"good\""));
+        }
+        assert_eq!(busy_hits.load(Ordering::Relaxed), 5, "a usage limit never opens the breaker");
     }
 
     #[test]
