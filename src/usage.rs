@@ -412,6 +412,15 @@ fn due(s: &Source, force: bool, now: u64) -> bool {
     now >= s.not_before && now.saturating_sub(s.fetched) >= if force { RELOAD_SECS } else { POLL_SECS }
 }
 
+/// ChatGPT's usage asked again at once, whatever the cooldowns say: after a sign-in or a mode switch the stored answer (often
+/// an error) was about a login that no longer is the one in use.
+pub fn refresh_chatgpt() -> Usage {
+    let mut u = load_usage();
+    (u.chatgpt.fetched, u.chatgpt.not_before) = (0, 0);
+    save_usage(&u);
+    refresh(false, false, true, false, false)
+}
+
 /// Fetches whatever is due (`force` = a reload click: due after `RELOAD_SECS` instead of `POLL_SECS`; a 429's wait
 /// Fetches whatever is due (`force` = a reload click: due after `RELOAD_SECS` instead of `POLL_SECS`; a 429's wait
 /// always holds), then saves. Errors stay with their own source.

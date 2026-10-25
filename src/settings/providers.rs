@@ -47,6 +47,8 @@ pub struct ProvidersEditor {
     /// `chatgpt::legacy_refused`), and when that was last looked up: the answer is in a file, so it is read every few
     /// seconds, not every frame.
     gpt_state: HashMap<String, (Instant, bool, bool)>,
+    /// A ChatGPT sign-in finished since `take_gpt_signed_in` was last asked: its usage is to be fetched again.
+    gpt_signed_in: bool,
     /// Accounts being looked up again (Antigravity by email: its plan; ChatGPT by key), and the answer to come.
     pub(crate) checking: HashMap<String, mpsc::Receiver<Result<String, String>>>,
 }
@@ -267,6 +269,11 @@ impl ProvidersEditor {
     }
 
     /// Takes in finished model lists and sign-ins; call it every frame, whether or not a provider page is showing.
+    /// Whether a ChatGPT sign-in finished since the last call.
+    pub(crate) fn take_gpt_signed_in(&mut self) -> bool {
+        std::mem::take(&mut self.gpt_signed_in)
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context, cfg: &mut Config) {
         // Accounts looked up again: an Antigravity plan as it is now.
         let mut plans = Vec::new();
@@ -356,6 +363,7 @@ impl ProvidersEditor {
                         }
                     }
                     self.gpt_state.clear();
+                    self.gpt_signed_in = true;
                     if cfg.chatgpt_note == 0 {
                         cfg.chatgpt_note = 1;
                     }

@@ -367,6 +367,8 @@ impl eframe::App for Settings {
         self.sync(editing);
         self.feed.poll();
         let before = serde_json::to_value(&self.cfg).unwrap_or_default();
+        let gpt_mode = |c: &Config| c.providers.iter().find(|p| p.chatgpt).map(|p| p.gpt_legacy());
+        let mode = gpt_mode(&self.cfg);
         self.providers.poll(&ctx, &mut self.cfg);
         // Esc belongs to a rename or a picker first, then to the search box, then it closes the window.
         if !self.providers.active() && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -382,6 +384,13 @@ impl eframe::App for Settings {
         resize_zones(ui);
         if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
             self.save();
+        }
+        // A finished ChatGPT sign-in or a mode switch makes the stored usage answer (often an error) stale: ask again, now
+        // that the config is saved (the refresh reads it from disk).
+        if self.providers.take_gpt_signed_in() | (gpt_mode(&self.cfg) != mode) {
+            std::thread::spawn(|| {
+                usage::refresh_chatgpt();
+            });
         }
     }
 }

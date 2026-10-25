@@ -965,11 +965,16 @@ impl Pool {
         lifted
     }
 
-    /// The first account, in the order they were added, that is on, granted, signed in and not blocked.
+    /// The first account that is on, granted, signed in and not blocked: in the order they were added, except that Legacy
+    /// mode tries Codex-client sign-ins first (their tokens are the ones the Codex backend takes; a Sign in with ChatGPT
+    /// token added earlier would otherwise be asked first and answer 401).
     pub fn pick(&self) -> Option<ChatgptAccount> {
         let accounts = self.accounts.read().unwrap();
         accounts.iter().for_each(|a| self.lift_resigned(&a.key));
-        accounts.iter().find(|a| !self.off(a) && self.blocked_for(&a.key).is_none()).cloned()
+        let legacy = self.legacy();
+        let mut order: Vec<&ChatgptAccount> = accounts.iter().collect();
+        order.sort_by_key(|a| legacy && !a.own_codex());
+        order.into_iter().find(|a| !self.off(a) && self.blocked_for(&a.key).is_none()).cloned()
     }
 
     /// A sign-in made after an account's 401/403 block was set lifts it: that block was about the old sign-in (the key is a
@@ -1151,6 +1156,18 @@ fn usage_accounts(cfg: &crate::Config, refused: &dyn Fn(&str) -> bool) -> Vec<Ch
     accounts
 }
 
+const LOGIN_EXPIRED: &str = "ChatGPT login expired";
+
+/// What a refused usage call (401/403) means for this account: only a Codex-client login can be "expired"; a Sign in with
+/// ChatGPT token is simply not accepted by `wham/usage`.
+fn usage_refusal(a: &ChatgptAccount) -> &'static str {
+    if a.own_codex() {
+        "ChatGPT login expired: sign in again in ccat."
+    } else {
+        "Usage numbers need the Codex (Legacy) sign-in: use \"Sign in for Codex (Legacy)\" in Settings → ChatGPT."
+    }
+}
+
 /// The usage call with the stored tokens one at a time (each refreshed only when its turn comes) until one answers.
 /// Tokens and the account id are never logged. In Official mode a refusal is not a failure: the official token may simply
 /// not read it, and the answer is no numbers (the Settings page says so).
@@ -1186,7 +1203,10 @@ pub(crate) fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (
             }
             401 | 403 => {
                 refused = true;
-                last = ("ChatGPT login expired: sign in again in ccat.".into(), 0);
+                // A Codex-client login's own refusal is the real "expired"; a Sign in with ChatGPT token just doesn't read usage.
+                if a.own_codex() || !last.0.starts_with(LOGIN_EXPIRED) {
+                    last = (usage_refusal(&a).into(), 0);
+                }
             }
             s => {
                 refused = true;
@@ -1553,11 +1573,15 @@ mod tests {
         p.block("a", 60, &Failure { status: 429, message: "m".into(), retry_after: None });
         assert!(p.pick().is_none(), "Official never falls to the Codex-client account");
         p.set_legacy(true);
-        assert_eq!(p.pick().map(|x| x.key), Some("a".into()), "switching forgets blocks learned in the other mode");
+        assert_eq!(p.pick().map(|x| x.key), Some("cxb".into()), "Legacy asks the Codex-client sign-in first, though \"a\" was added first (its 401 was the live bug)");
+        p.block("cxb", 60, &Failure { status: 429, message: "m".into(), retry_after: None });
+        assert_eq!(p.pick().map(|x| x.key), Some("a".into()), "and falls back to the Sign in with ChatGPT token");
 
         // The Codex backend refused the token: Legacy skips that account (and says why), Official still takes it.
         refuse_legacy(&p.dir, "a");
         assert!(read(&p.dir, "a").unwrap().refused());
+        p.set_legacy(false);
+        p.set_legacy(true);
         assert_eq!(p.pick().map(|x| x.key), Some("cxb".into()));
         p.accounts.write().unwrap().retain(|x| x.key == "a");
         assert!(p.pick().is_none() && p.exhausted().message.contains("Codex (Legacy) needs its own sign-in"), "{}", p.exhausted().message);
@@ -1705,6 +1729,22 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_usage_call_blames_the_login_only_when_it_is_a_codex_one() {
+        let acc = |route: &str| ChatgptAccount { route: route.into(), ..Default::default() };
+        assert!(usage_refusal(&acc(CODEX)).starts_with(LOGIN_EXPIRED));
+        assert!(usage_refusal(&acc("")).contains("Codex (Legacy) sign-in") && !usage_refusal(&acc("")).starts_with(LOGIN_EXPIRED));
+    }
+
+    #[test]
+    fn codex_headers_name_the_workspace_only_when_known() {
+        let names = |id: &str| codex_headers("tok", id).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        let h = codex_headers("tok", "acct-1");
+        assert_eq!(h[0], ("Authorization", "Bearer tok".to_string()));
+        assert!(h.contains(&("chatgpt-account-id", "acct-1".to_string())) && h.contains(&("originator", ORIGINATOR.to_string())) && h.contains(&("version", CODEX_VERSION.to_string())));
+        assert!(names("acct-1").contains(&"User-Agent") && !names("").contains(&"chatgpt-account-id"));
+    }
+
+    #[test]
     fn usage_asks_only_accounts_that_serve_the_mode_and_codex_logins_first() {
         let acc = |key: &str, route: &str| ChatgptAccount { key: key.into(), granted: true, route: route.into(), ..Default::default() };
         let cfg = |legacy: bool| crate::Config {
@@ -1742,6 +1782,7 @@ mod tests {
             let mode = if legacy { "Legacy" } else { "Official" };
             pool.set_legacy(legacy);
             let a = pool.pick().unwrap_or_else(|| panic!("no account usable in {mode} mode: {}", pool.exhausted().message));
+            println!("{mode}: account {} (route {:?})", a.key, a.route);
             let body = proxy::responses_body(&req, &model, None, &hints, &pool, legacy);
             let reader = match pool.open(&a, &body, &hints.session, legacy) {
                 Ok(r) => r,
