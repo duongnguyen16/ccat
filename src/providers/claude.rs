@@ -125,6 +125,25 @@ pub(crate) fn fetch_claude(token: &str) -> Result<Vec<Bar>, (String, u64)> {
     }
 }
 
+// ---------------------------------------------------------------- settings page
+
+/// Settings → Claude: Claude Code's own login can't be turned off, only offered (or not) as a choice.
+pub(crate) fn page(ui: &mut eframe::egui::Ui, cfg: &mut crate::Config) {
+    use crate::settings::providers::{head, name, note};
+    let p = crate::pal(ui);
+    head(ui, |ui| {
+        let mut on = !cfg.claude_off;
+        if crate::switch(ui, &mut on, "")
+            .on_hover_text("Off: Claude models leave the model pickers (Default stays) and are skipped as fallbacks. A tier already on Claude keeps working.")
+            .changed()
+        {
+            cfg.claude_off = !on;
+        }
+        name(ui, "Claude Code (Original)", on);
+    });
+    note(ui, "Claude Code's own login. Off: Claude models leave the model pickers (Default stays) and are skipped as fallbacks. A tier already on Claude keeps working.", p.subtle);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

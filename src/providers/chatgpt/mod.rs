@@ -8,6 +8,8 @@
 //! across processes by a lock file. The UI process signs in and out; the proxy only reads.
 
 pub(crate) mod proxy;
+mod ui;
+pub(crate) use ui::page;
 
 use crate::{
     common::{agent, log, Failure},

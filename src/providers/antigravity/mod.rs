@@ -20,6 +20,8 @@ use crate::usage::{parse_time, Bar, FIVE_HOURS, WEEK};
 
 pub(crate) mod mcp;
 pub(crate) mod proxy;
+mod ui;
+pub(crate) use ui::page;
 
 const ENDPOINTS: [&str; 2] = ["https://daily-cloudcode-pa.googleapis.com", "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 // Antigravity's public desktop OAuth client; base64 only so secret scanners leave it alone.

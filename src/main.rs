@@ -6,8 +6,8 @@ mod common;
 mod live;
 mod profiles;
 mod providers;
-mod providers_ui;
 mod proxy;
+mod settings;
 mod usage;
 
 use providers::{antigravity, chatgpt, museai, ollama, Provider, AG_NAME, GPT_NAME, MUSE_NAME, OLLAMA_NAME};
@@ -249,6 +249,11 @@ fn load() -> (Config, serde_json::Value) {
         eprintln!("ccat: {} is invalid ({e}); moved to {}", path.display(), bad.display());
         serde_json::Value::Null
     });
+    (from_raw(raw.clone()), raw)
+}
+
+/// The config a file's JSON stands for: older shapes migrated, the built-in providers in place.
+fn from_raw(raw: serde_json::Value) -> Config {
     let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_default();
     if raw.get("live_metric").is_none() && raw.get("live_calls").and_then(|v| v.as_bool()).unwrap_or(false) {
         cfg.live_metric = 1;
@@ -275,7 +280,7 @@ fn load() -> (Config, serde_json::Value) {
     if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
         chatgpt::sync_codex_cli(&mut g.chatgpt_accounts);
     }
-    (cfg, raw)
+    cfg
 }
 
 /// Before per-tier routing, tiers lived in each provider and the launcher picked one provider for all of them:
@@ -510,6 +515,46 @@ fn merged(disk: Option<serde_json::Value>, loaded: &serde_json::Value, mine: ser
     out
 }
 
+/// The config as another process left it, with what this window changed since `loaded` laid over it; and the file as
+/// read (the new `loaded`). `None` when the file can't be read: what is in memory stays. Never moves a file aside.
+fn reload(cfg: &Config, loaded: &serde_json::Value) -> Option<(Config, serde_json::Value)> {
+    let disk: serde_json::Value = serde_json::from_str(&fs::read_to_string(config_path()).ok()?).ok()?;
+    // `loaded` as `from_raw` reads it, so a migration or a field the file lacks doesn't count as this window's change.
+    let before = serde_json::to_value(from_raw(loaded.clone())).ok()?;
+    let out = merged(Some(disk.clone()), &before, serde_json::to_value(cfg).ok()?);
+    Some((from_raw(out), disk))
+}
+
+/// The config file's modified time, looked at most once a second: another process wrote it.
+struct Disk {
+    stamp: Option<std::time::SystemTime>,
+    polled: std::time::Instant,
+}
+
+impl Disk {
+    fn new() -> Self {
+        Self { stamp: Self::now(), polled: std::time::Instant::now() }
+    }
+
+    fn now() -> Option<std::time::SystemTime> {
+        fs::metadata(config_path()).and_then(|m| m.modified()).ok()
+    }
+
+    /// The file changed since the last time this said so. While `busy` (something is being edited) the change waits.
+    fn changed(&mut self, busy: bool) -> bool {
+        if self.polled.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.polled = std::time::Instant::now();
+        let now = Self::now();
+        let hit = now != self.stamp && !busy;
+        if hit {
+            self.stamp = now;
+        }
+        hit
+    }
+}
+
 // ---------------------------------------------------------------- look: Claude Console palette, compact
 
 struct Pal {
@@ -697,72 +742,56 @@ fn win_btn(ui: &mut egui::Ui, kind: Btn) -> egui::Response {
     resp
 }
 
-/// Chrome for a frameless window: thin bar with the window buttons, then the title as the body's heading, 1px outline, height fitted to the content.
-/// `buttons` are laid out right-to-left. Returns the clicked titlebar button.
+/// Chrome for a frameless window, `buttons` laid out right-to-left; returns the clicked titlebar button.
+/// Untitled (the launcher): no bar, margins around the body, and the height follows the content, so there is no dead
+/// space at the bottom. Titled (Settings): a bar with the title on the left and a rule under it, the body filling the
+/// rest edge to edge, and the size left to the user.
 fn window(ui: &mut egui::Ui, title: &str, buttons: &[Btn], body: impl FnOnce(&mut egui::Ui)) -> Option<Btn> {
-    let bar = if title.is_empty() { 0.0 } else { 32.0 };
+    let titled = !title.is_empty();
     const PAD: i8 = 14;
+    const BAR: f32 = 40.0;
     let p = pal(ui);
     let mut clicked = None;
-    if !title.is_empty() {
-    egui::Panel::top(egui::Id::new(("titlebar", title)))
-        .exact_size(bar)
-        .frame(egui::Frame::new().fill(p.bg))
-        .show_separator_line(false)
-        .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    for &b in buttons {
-                        if win_btn(ui, b).clicked() {
-                            clicked = Some(b);
+    if titled {
+        egui::Panel::top(egui::Id::new(("titlebar", title)))
+            .exact_size(BAR)
+            .frame(egui::Frame::new().fill(p.bg))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for &b in buttons {
+                            if win_btn(ui, b).clicked() {
+                                clicked = Some(b);
+                            }
                         }
-                    }
-                    let rest = ui.available_rect_before_wrap();
-                    if ui.interact(rest, ui.id().with("drag"), Sense::drag()).drag_started() {
-                        ui.send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
+                        let rest = ui.available_rect_before_wrap();
+                        if ui.interact(rest, ui.id().with("drag"), Sense::drag()).drag_started() {
+                            ui.send_viewport_cmd(ViewportCommand::StartDrag);
+                        }
+                        ui.painter().text(rest.left_center() + vec2(18.0, 0.0), Align2::LEFT_CENTER, title, FontId::new(18.0, serif()), p.fg);
+                    });
                 });
             });
-        });
     }
+    let margin = if titled { egui::Margin::ZERO } else { egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD } };
     let mut used = 0.0;
-    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: PAD, right: PAD, top: 4, bottom: PAD })).show(ui, |ui| {
-        used = ui
-            .scope(|ui| {
-                if !title.is_empty() {
-                    ui.label(RichText::new(title).family(serif()).size(20.0));
-                    ui.add_space(4.0);
-                }
-                body(ui)
-            })
-            .response
-            .rect
-            .height();
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(margin)).show(ui, |ui| {
+        used = ui.scope(body).response.rect.height();
     });
 
-    // Not resizable, so the window simply follows its content — no dead space at the bottom.
     let screen = ui.ctx().content_rect();
-    let want = (bar + 4.0 + PAD as f32 + used).ceil();
-    if (screen.height() - want).abs() > 1.0 {
-        ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
+    if !titled {
+        // Not resizable, so the window simply follows its content.
+        let want = (4.0 + PAD as f32 + used).ceil();
+        if (screen.height() - want).abs() > 1.0 {
+            ui.send_viewport_cmd(ViewportCommand::InnerSize(vec2(screen.width(), want)));
+        }
     }
     ui.ctx()
         .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("outline")))
         .rect_stroke(screen, 0.0, Stroke::new(1.0, p.border_strong), StrokeKind::Inside);
     clicked
-}
-
-/// "Never fall back to a paid API key", shared by both Settings copies (launcher and tray popup).
-fn no_paid_switch(ui: &mut egui::Ui, cfg: &mut Config) {
-    switch(ui, &mut cfg.no_paid_fallback, "Never fall back to a paid API key")
-        .on_hover_text("A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT, MuseAI) and Ollama stay eligible. Routed sessions only.");
-}
-
-/// "Compress tool output (third-party models)", shared by both Settings copies.
-fn compress_switch(ui: &mut egui::Ui, cfg: &mut Config) {
-    switch(ui, &mut cfg.compress_tool_results, "Compress tool output (third-party models)")
-        .on_hover_text("Lossless cleanup of tool output before it goes to a third-party model: ANSI colours, progress-bar redraws, trailing spaces, runs of identical lines. Never on Claude, never on error results. Routed sessions only.");
 }
 
 /// Toggle switch + label; the whole row is the hit target.
@@ -891,21 +920,13 @@ fn icon_btn(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
 
 // ---------------------------------------------------------------- app
 
-#[derive(Clone, Copy, PartialEq, Default)]
-enum SettingsSub {
-    #[default]
-    Models,
-    Providers,
-}
-
 struct App {
     cfg: Config,
     /// The config file as loaded, so `save` only writes what this window changed.
     loaded: serde_json::Value,
+    /// Watches the file for what the Settings window (or another ccat) saves.
+    disk: Disk,
     cwd: String,
-    settings: bool,
-    settings_sub: SettingsSub,
-    settings_pos: Option<egui::Pos2>,
     folder: String,
     profile: profiles::Bar,
     folder_choice: usize,
@@ -913,10 +934,6 @@ struct App {
     running: (std::time::Instant, bool),
     logo: Option<egui::TextureHandle>,
     folders: Vec<String>,
-    /// The tier whose model picker is open, and the provider it is browsing ("" = official).
-    tiers: TierEditor,
-    /// The Config window's content: providers, accounts, switches.
-    providers: providers_ui::ProvidersEditor,
     err: String,
     claude_list: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
     release_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -1005,12 +1022,8 @@ impl App {
             folders,
             cfg,
             loaded,
+            disk: Disk::new(),
             cwd,
-            settings: false,
-            settings_sub: SettingsSub::Models,
-            settings_pos: None,
-            tiers: TierEditor::default(),
-            providers: Default::default(),
             err: String::new(),
             claude_list,
             release_rx,
@@ -1059,7 +1072,9 @@ impl App {
         }
         if let Some((why, open)) = (0..TIERS.len()).find_map(|t| self.problem(t)) {
             self.err = why;
-            self.settings |= open;
+            if open {
+                settings::open_settings();
+            }
             return;
         }
         self.cfg.recents.retain(|f| *f != self.folder);
@@ -1085,7 +1100,7 @@ impl App {
                     ui.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
                 if icon_btn(ui, Icon::Settings).on_hover_text("Settings").clicked() {
-                    self.settings = !self.settings;
+                    settings::open_settings();
                 }
                 let update = match &self.latest {
                     Some(Ok(tag)) if is_newer(tag, VERSION) => format!("{VERSION} → {tag} available"),
@@ -1223,101 +1238,20 @@ impl eframe::App for App {
             self.latest = Some(r);
             self.release_rx = None;
         }
-        self.providers.poll(&mut self.cfg);
-        if !self.profile.active() && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
+        // What the Settings window saved shows here too (not while the profile menu is open).
+        if self.disk.changed(self.profile.active()) {
+            if let Some((cfg, loaded)) = reload(&self.cfg, &self.loaded) {
+                (self.cfg, self.loaded) = (cfg, loaded);
+            }
+        }
+        if !self.profile.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
             ui.send_viewport_cmd(ViewportCommand::Close);
         }
         window(ui, "", &[], |ui| self.launch_tab(ui, frame));
         let typing = ui.ctx().egui_wants_keyboard_input();
-        if !typing && !self.settings && !self.profile.active() && !self.tiers.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        if !typing && !self.profile.active() && ui.input(|i| i.key_pressed(Key::Enter)) {
             self.launch(ui);
         }
-
-        if self.settings {
-            if self.settings_pos.is_none() {
-                self.settings_pos = ui.input(|i| i.viewport().outer_rect).map(|r| r.right_top() + vec2(8.0, 0.0));
-            }
-            self.settings_window(ui.ctx(), frame);
-        }
-    }
-}
-
-impl App {
-    fn settings_tab(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        let p = pal(ui);
-        ui.add_space(2.0);
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
-            if win_btn(ui, Btn::Close).on_hover_text("Close").clicked() {
-                self.settings = false;
-            }
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                if self.settings_sub == SettingsSub::Models && !self.running.1 {
-                    self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
-                        usage::segmented(ui, &mut self.settings_sub, &[(SettingsSub::Models, "Models"), (SettingsSub::Providers, "Providers")]);
-                    });
-                } else {
-                    usage::segmented(ui, &mut self.settings_sub, &[(SettingsSub::Models, "Models"), (SettingsSub::Providers, "Providers")]);
-                    let drag = ui.available_rect_before_wrap();
-                    if ui.interact(drag, ui.id().with("settings-drag"), Sense::drag()).drag_started() {
-                        ui.send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
-                }
-            });
-        });
-        ui.add_space(8.0);
-
-        if self.settings_sub == SettingsSub::Providers {
-            self.tiers.pick = None;
-            egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(580.0).show(ui, |ui| {
-                self.providers.show(ui, &mut self.cfg, 420.0);
-                ui.add_space(10.0);
-                usage::display_block(ui, &mut self.cfg);
-            });
-            return;
-        }
-
-        let before = self.cfg.tiers.clone();
-        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(580.0).show(ui, |ui| {
-            self.tiers.rows(ui, &mut self.cfg);
-            if self.cfg.tiers != before {
-                self.err.clear();
-            }
-            ui.add_space(6.0);
-            ui.add(egui::Label::new(egui::RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
-            ui.add_space(8.0);
-            let mut wait = !self.cfg.fail_on_limit;
-            ui.horizontal(|ui| {
-                switch(ui, &mut wait, "Wait out usage limits")
-                    .on_hover_text("When every route and fallback of a request is at its usage limit, the request waits until one can run, so an agent pauses instead of stopping. Esc in Claude Code still cancels it. Routed sessions only.");
-            });
-            self.cfg.fail_on_limit = !wait;
-            ui.add_space(6.0);
-            ui.horizontal(|ui| no_paid_switch(ui, &mut self.cfg));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| compress_switch(ui, &mut self.cfg));
-            ui.add_space(10.0);
-            usage::display_block(ui, &mut self.cfg);
-        });
-    }
-
-    /// Providers and tier settings live in their own OS window (an egui immediate viewport).
-    fn settings_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("ccat — Settings")
-            .with_icon(app_icon())
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_inner_size([440.0, 520.0]);
-        if let Some(pos) = self.settings_pos {
-            builder = builder.with_position(pos);
-        }
-        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("providers"), builder, |ui, _| {
-            // Esc cancels a rename in progress before it closes the window.
-            if ui.input(|i| (i.key_pressed(Key::Escape) && !self.providers.active() && !self.tiers.active()) || i.viewport().close_requested()) {
-                self.settings = false;
-            }
-            window(ui, "", &[], |ui| self.settings_tab(ui, frame));
-        });
     }
 }
 
@@ -1336,8 +1270,8 @@ impl Drop for App {
 const SPOOF_ROW: usize = usize::MAX;
 
 /// The four tiers, each: its name and the Spoofing switch, the Claude name it's shown as (while spoofing), its
-/// model and fallbacks numbered in the order they're tried, and "+ New fallback". In the launcher, and in the
-/// usage window's Settings, where a change reaches running sessions.
+/// model and fallbacks numbered in the order they're tried, and "+ New fallback". In the Settings window, where a
+/// change reaches running sessions.
 #[derive(Default)]
 struct TierEditor {
     /// The selector whose dropdown is open: (tier, row).
@@ -1645,7 +1579,7 @@ fn model_groups(providers: &[Provider], typed_and_claude: &(String, Vec<String>)
 
 // ---------------------------------------------------------------- main / spawn
 
-/// The window/taskbar icon: the repo logo, decoded once (the Providers viewport is rebuilt every frame).
+/// The window/taskbar icon: the repo logo, decoded once.
 fn app_icon() -> Arc<egui::IconData> {
     static ICON: std::sync::OnceLock<Arc<egui::IconData>> = std::sync::OnceLock::new();
     ICON.get_or_init(|| Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png is a valid PNG"))).clone()
@@ -1653,7 +1587,7 @@ fn app_icon() -> Arc<egui::IconData> {
 
 fn main() {
     // Everything else is forwarded to claude, so these are the only flags ccat keeps for itself
-    // (the two usage ones are internal: the tray helper and its window).
+    // (the usage and settings ones are internal: the tray helper and its windows).
     match std::env::args().nth(1).as_deref() {
         Some("--version" | "-V") => return println!("ccat {}", &VERSION[1..]),
         #[cfg(windows)]
@@ -1662,6 +1596,7 @@ fn main() {
             let at = |i| std::env::args().nth(i).and_then(|x| x.parse().ok()).unwrap_or(f64::MAX);
             return usage::run_popup((at(2), at(3)));
         }
+        Some(usage::SETTINGS_FLAG) => return settings::run(std::env::args().nth(2)),
         _ => usage::ensure_tray(),
     }
     let cwd =std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
@@ -1762,7 +1697,7 @@ fn retarget(routes: &mut [proxy::Route], tiers: &[Route; 4], providers: &[Provid
     bad
 }
 
-/// Watches the config while a routed session runs: a model switched in ccat (launcher or Settings) reaches this
+/// Watches the config while a routed session runs: a model switched in ccat (Settings) reaches this
 /// session's next request.
 fn follow_config(px: &proxy::Proxy) {
     let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone(), px.no_paid_fallback.clone(), px.compress_tool_results.clone());
@@ -1969,6 +1904,9 @@ mod tests {
         assert_eq!(settings["env"].as_object().unwrap().len(), 1);
         assert!(claude_settings(&serde_json::Map::new(), &[]).as_object().unwrap().is_empty());
     }
+
+    /// Held by the tests that write the test config (a launcher saves on drop; the Settings tests save too).
+    pub(crate) static CONFIG_FILE: Mutex<()> = Mutex::new(());
 
     pub(super) fn live_config() -> Config {
         let text = fs::read_to_string(user_config_path()).expect("Existing ccat config required");
@@ -2214,6 +2152,7 @@ mod tests {
 
     #[test]
     fn muse_account_launcher_and_routing_agreements() {
+        let _files = CONFIG_FILE.lock().unwrap_or_else(|e| e.into_inner()); // each App saves on drop
         let claude: Vec<String> = Vec::new();
         let make_app = |p: Provider| {
             let cfg = Config {
@@ -2225,9 +2164,7 @@ mod tests {
                 cfg,
                 loaded: serde_json::Value::Null,
                 cwd: String::new(),
-                settings: false,
-                settings_sub: SettingsSub::default(),
-                settings_pos: None,
+                disk: Disk::new(),
                 folder: String::new(),
                 profile: profiles::Bar::default(),
                 folder_choice: 0,
@@ -2235,8 +2172,6 @@ mod tests {
                 running: (std::time::Instant::now(), false),
                 logo: None,
                 folders: Vec::new(),
-                tiers: TierEditor::default(),
-                providers: providers_ui::ProvidersEditor::default(),
                 err: String::new(),
                 claude_list: None,
                 release_rx: None,

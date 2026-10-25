@@ -15,6 +15,8 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
 
 pub const TRAY_FLAG: &str = "--ccat-tray";
 pub const POPUP_FLAG: &str = "--ccat-usage";
+/// The Settings window (`--ccat-settings [page]`): its own process, shared by the launcher and the tray.
+pub const SETTINGS_FLAG: &str = "--ccat-settings";
 /// Set on a tray started by Restart: it waits for the old one to let go of the single-tray mutex.
 const RESTART_ENV: &str = "CCAT_TRAY_RESTART";
 
@@ -933,11 +935,11 @@ pub fn run_tray() {
         (icon, tooltip(u, &src, &ag))
     };
     let (icon, tip) = draw(&load_usage());
-    // Right click: Reload, Restart, Quit. Picks reach the loop as WM_APP + 1 with 1, 2, 3.
-    let (reload, restart, quit) = (MenuItem::new("Reload", true, None), MenuItem::new("Restart", true, None), MenuItem::new("Quit ccat", true, None));
+    // Right click: Settings, Reload, Restart, Quit. Picks reach the loop as WM_APP + 1 with 1, 2, 3, 4.
+    let (settings, reload, restart, quit) = (MenuItem::new("Settings", true, None), MenuItem::new("Reload", true, None), MenuItem::new("Restart", true, None), MenuItem::new("Quit ccat", true, None));
     let menu = Menu::new();
-    let _ = menu.append_items(&[&reload, &restart, &PredefinedMenuItem::separator(), &quit]);
-    let ids = [reload.id().clone(), restart.id().clone(), quit.id().clone()];
+    let _ = menu.append_items(&[&settings, &reload, &restart, &PredefinedMenuItem::separator(), &quit]);
+    let ids = [settings.id().clone(), reload.id().clone(), restart.id().clone(), quit.id().clone()];
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if let Some(i) = ids.iter().position(|id| *id == e.id) {
             // SAFETY: posting to our own thread's queue.
@@ -1003,12 +1005,13 @@ pub fn run_tray() {
                 }
             };
             match msg.wParam {
+                1 => crate::settings::open_settings(),
                 // Reload: every account's plan asked again, the ChatGPT login re-read, every source fetched now.
-                1 => {
+                2 => {
                     std::thread::spawn(reload_all);
                 }
                 // Restart: a fresh tray (the installed exe, as it is now), sessions untouched.
-                2 => {
+                3 => {
                     kill_popup();
                     let fresh = std::env::current_exe().and_then(|exe| Command::new(exe).arg(TRAY_FLAG).env(RESTART_ENV, "1").creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn());
                     if fresh.is_ok() {
@@ -1910,7 +1913,6 @@ fn dots(ui: &mut egui::Ui) -> egui::Response {
 enum Tab {
     Usage,
     Analytics,
-    Settings,
 }
 
 /// A row of options in a sunken track, the chosen one raised. Returns whether the choice changed.
@@ -1966,9 +1968,6 @@ fn segmented_layout<T: PartialEq + Copy>(ui: &mut egui::Ui, cur: &mut T, items: 
     changed
 }
 
-/// Height of `display_block`: its gap, heading and four rows.
-const DISPLAY_H: f32 = 14.0 + 20.0 + 4.0 * 30.0 + 4.0;
-
 /// One reorder chip: the name between two chevrons; returns -1 / 1 when the left / right one is clicked.
 fn chip(ui: &mut egui::Ui, name: &str, left: bool, right: bool) -> i32 {
     let p = crate::pal(ui);
@@ -1999,13 +1998,10 @@ fn label(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-/// The bottom of Settings: which usage sources the Usage tab and the tray dial show, and in what order.
+/// Settings → Display: which usage sources the Usage tab and the tray dial show, and in what order.
 pub(crate) fn display_block(ui: &mut egui::Ui, cfg: &mut crate::Config) {
     use crate::ViewMode::{All, Follow};
-    let p = crate::pal(ui);
     ui.spacing_mut().item_spacing.y = 0.0;
-    ui.add_space(14.0);
-    row(ui, 20.0, |ui| ui.label(egui::RichText::new("Display").family(crate::anthropic()).size(14.0).color(p.fg)));
     let modes = [(All, "All"), (Follow, "Follow profile")];
     for (name, mode) in [("Usage view", &mut cfg.usage_view_mode), ("Tray icon", &mut cfg.tray_mode)] {
         ui.push_id(name, |ui| {
@@ -2055,13 +2051,6 @@ fn orange_badge(ui: &mut egui::Ui, text: &str) -> egui::Response {
     resp
 }
 
-/// Settings has two views: the tier pickers, and the providers behind them.
-#[derive(Clone, Copy, PartialEq)]
-enum Sub {
-    Models,
-    Providers,
-}
-
 struct Popup {
     cfg: crate::Config,
     loaded: Value,
@@ -2074,9 +2063,6 @@ struct Popup {
     /// The window's fade-in is off (done on the first frame, before eframe shows it).
     styled: bool,
     tab: Tab,
-    sub: Sub,
-    editor: crate::TierEditor,
-    providers: crate::providers_ui::ProvidersEditor,
     /// Analytics: by model (else by provider), the shown data and the file stamp it was read at, "show more".
     by_model: bool,
     /// What running sessions report (see `live`), read at most once a second; the height of the notes it gives.
@@ -2347,48 +2333,7 @@ impl Popup {
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 
-    fn settings_tab(&mut self, ui: &mut egui::Ui, win: &eframe::Frame) {
-        let p = crate::pal(ui);
-        ui.add_space(10.0);
-        if self.sub == Sub::Providers {
-            self.editor.pick = None; // a picker left open would keep Esc from closing the window
-            row(ui, 26.0, |ui| {
-                segmented(ui, &mut self.sub, &[(Sub::Models, "Models"), (Sub::Providers, "Providers")]);
-            });
-            ui.add_space(8.0);
-            // The window grows with the list up to the screen, then the list scrolls.
-            let room = self.anchor.1 - self.anchor.2 - 2.0 * PAD - HEADER_H - 26.0 - 8.0 - 10.0;
-            self.providers.show(ui, &mut self.cfg, (room - DISPLAY_H).max(120.0));
-            display_block(ui, &mut self.cfg);
-            return;
-        }
-        let sub = &mut self.sub;
-        self.editor.bar.show(ui, &mut self.cfg, win, |ui| {
-            segmented(ui, sub, &[(Sub::Models, "Models"), (Sub::Providers, "Providers")]);
-        });
-        ui.add_space(6.0);
-        ui.spacing_mut().item_spacing.y = 4.0;
-        // With every tier and fallback shown the list can outgrow the screen: it scrolls, Display stays below it.
-        let room = ui.ctx().content_rect().top() + (self.anchor.1 - self.anchor.2) - PAD - ui.cursor().top() - DISPLAY_H;
-        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(room.max(120.0)).show(ui, |ui| {
-            self.editor.rows(ui, &mut self.cfg);
-            ui.add_space(6.0);
-            ui.add(egui::Label::new(egui::RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
-            ui.add_space(8.0);
-            let mut wait = !self.cfg.fail_on_limit;
-            row(ui, 24.0, |ui| crate::switch(ui, &mut wait, "Wait out usage limits"))
-                .on_hover_text("When every route and fallback of a request is at its usage limit, the request waits until one can run, so an agent pauses instead of stopping. Esc in Claude Code still cancels it. Routed sessions only.");
-            self.cfg.fail_on_limit = !wait;
-            ui.add_space(4.0);
-            row(ui, 24.0, |ui| crate::no_paid_switch(ui, &mut self.cfg));
-            ui.add_space(4.0);
-            row(ui, 24.0, |ui| crate::compress_switch(ui, &mut self.cfg));
-        });
-        display_block(ui, &mut self.cfg);
-    }
-
     fn save(&mut self) {
-        crate::profiles::sync(&crate::profiles::dir(), &self.cfg);
         let _ = crate::save(&self.cfg, &self.loaded);
         // What's on disk now: the next save only writes what changes after this.
         self.loaded = serde_json::to_value(&self.cfg).unwrap_or_default();
@@ -2396,7 +2341,7 @@ impl Popup {
 }
 
 impl eframe::App for Popup {
-    fn ui(&mut self, ui: &mut egui::Ui, win: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let p = crate::pal(ui);
         // The other process (or our reload) wrote new data.
@@ -2412,10 +2357,8 @@ impl eframe::App for Popup {
         }
         let focused = ui.input(|i| i.viewport().focused);
         self.focused_once |= focused == Some(true);
-        let esc = !self.editor.active() && !self.providers.active() && ui.input(|i| i.key_pressed(egui::Key::Escape));
-        // Our own file dialog (Import) takes focus, and gives it back a moment after it closes; so does the browser
-        // while a Google account is being added.
-        if esc || (self.focused_once && focused == Some(false) && !self.editor.bar.recent_dialog() && !self.providers.signing_in()) {
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc || (self.focused_once && focused == Some(false)) {
             ui.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -2424,7 +2367,6 @@ impl eframe::App for Popup {
         let h = match self.tab {
             // Usage knows its own height; the notes under it, last frame's.
             Tab::Usage => height(&blocks) + self.notes_h,
-            Tab::Settings if self.editor.active() => self.measured.max(470.0),
             _ => self.measured,
         };
         let h = h.min(self.anchor.1 - self.anchor.2).max(120.0);
@@ -2439,9 +2381,9 @@ impl eframe::App for Popup {
         }
 
         let mut reload = None;
-        let snapshot = |c: &crate::Config| (c.tiers.clone(), c.profile.clone(), c.claude_off, serde_json::to_value(&c.providers).unwrap_or_default(), (c.usage_view_mode, c.tray_mode, c.source_order.clone()), (c.ag_group.clone(), c.show_fable, c.fail_on_limit, c.no_paid_fallback, c.compress_tool_results, [c.analytics_view, c.live_range, c.live_by], c.live_metric, c.live_cumulative));
+        // What this window edits: the Antigravity view and the Analytics options.
+        let snapshot = |c: &crate::Config| (c.ag_group.clone(), [c.analytics_view, c.live_range, c.live_by], c.live_metric, c.live_cumulative);
         let before = snapshot(&self.cfg);
-        self.providers.poll(&mut self.cfg);
         let icon = self.icon.get_or_insert_with(|| icon_texture(&ctx)).clone();
         let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::same(PAD as i8));
         let measured = egui::CentralPanel::default()
@@ -2452,7 +2394,11 @@ impl eframe::App for Popup {
                 row(ui, HEADER_H, |ui| {
                     ui.image((icon.id(), egui::vec2(ICON_H, ICON_H)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        segmented(ui, &mut self.tab, &[(Tab::Settings, "Settings"), (Tab::Analytics, "Analytics"), (Tab::Usage, "Usage")]);
+                        if crate::icon_btn(ui, crate::Icon::Settings).on_hover_text("Settings").clicked() {
+                            crate::settings::open_settings();
+                            ui.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        segmented(ui, &mut self.tab, &[(Tab::Analytics, "Analytics"), (Tab::Usage, "Usage")]);
                     });
                 });
                 let body = ui.vertical(|ui| {
@@ -2464,10 +2410,6 @@ impl eframe::App for Popup {
                         Tab::Analytics => {
                             self.notes_h = 0.0;
                             self.analytics_tab(ui);
-                        }
-                        Tab::Settings => {
-                            self.notes_h = 0.0;
-                            self.settings_tab(ui, win);
                         }
                     }
                 });
@@ -2533,9 +2475,6 @@ pub fn run_popup(click: (f64, f64)) {
                 focused_once: false,
                 styled: false,
                 tab: Tab::Usage,
-                sub: Sub::Models,
-                editor: Default::default(),
-                providers: Default::default(),
                 by_model,
                 live: None,
                 notes_h: 0.0,
@@ -2807,9 +2746,6 @@ mod tests {
             focused_once: false,
             styled: false,
             tab: Tab::Usage,
-            sub: Sub::Models,
-            editor: Default::default(),
-            providers: Default::default(),
             by_model: false,
             live: None,
             notes_h: 0.0,

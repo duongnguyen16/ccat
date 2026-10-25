@@ -7,7 +7,6 @@ use eframe::egui::{self, vec2, Align, Align2, Color32, FontId, Layout, RichText,
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 
 pub fn dir() -> PathBuf {
@@ -195,12 +194,10 @@ pub struct Bar {
     /// The name being typed in the Duplicate / Rename dialog.
     text: String,
     focus: bool,
-    /// When our own file dialog closed: the window lost and regained focus around it.
-    dialog_at: Option<Instant>,
 }
 
 /// Opens `folder` in the file manager.
-fn reveal(folder: &Path) {
+pub(crate) fn reveal(folder: &Path) {
     let _ = fs::create_dir_all(folder);
     #[cfg(windows)]
     let _ = std::process::Command::new("explorer").arg(folder).spawn();
@@ -238,11 +235,6 @@ impl Bar {
     /// A menu, dialog or error is up: Esc and Enter belong to it, and the popup needs room for it.
     pub fn active(&self) -> bool {
         self.menu || self.dialog.is_some()
-    }
-
-    /// Our file dialog closed a moment ago, so a focus loss isn't the user clicking away.
-    pub fn recent_dialog(&self) -> bool {
-        self.dialog_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
     }
 
     /// `title` on the left, the profile button on the right; applying, duplicating, renaming, importing, deleting
@@ -360,7 +352,6 @@ impl Bar {
             Act::Reveal => Ok(reveal(folder)),
             Act::Import => {
                 let picked = rfd::FileDialog::new().set_parent(frame).add_filter("ccat configuration", &["json"]).pick_file();
-                self.dialog_at = Some(Instant::now());
                 match picked {
                     None => Ok(()),
                     Some(path) => {

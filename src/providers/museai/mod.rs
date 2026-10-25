@@ -2,6 +2,8 @@
 //! The legacy localhost URL is a configuration sentinel, never a listening socket.
 mod native;
 mod login;
+mod ui;
+pub(crate) use ui::page;
 
 use crate::common::{self, Failure};
 use crate::usage::{dirs_home, Bar, WEEK};

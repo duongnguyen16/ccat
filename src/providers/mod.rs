@@ -21,7 +21,7 @@ pub const MUSE_NAME: &str = "MuseAI";
 
 /// The kind of provider a route runs on. Official Claude is not a `Provider` record: it is a route with an empty
 /// provider name (`proxy::Upstream::Official`), so `Provider::kind` never answers `Claude`.
-#[allow(dead_code)] // ponytail: the next phases replace the `if p.antigravity …` chains with it
+#[allow(dead_code)] // `Claude` is only named, never built; the Settings sidebar and pages match on the rest
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Claude,
@@ -61,7 +61,6 @@ pub(crate) struct Provider {
 
 impl Provider {
     /// Which provider this record is, from its flags (none set: an Anthropic-compatible endpoint).
-    #[allow(dead_code)] // ponytail: see `Kind`
     pub(crate) fn kind(&self) -> Kind {
         if self.antigravity {
             Kind::Antigravity
