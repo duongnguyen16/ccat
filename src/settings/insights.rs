@@ -485,7 +485,7 @@ fn header(ui: &mut egui::Ui, cols: &[Col]) {
         let (at, align) = if c.right { (rect.left() + x1, Align2::RIGHT_CENTER) } else { (rect.left() + x0, Align2::LEFT_CENTER) };
         ui.painter().text(egui::pos2(at, rect.center().y), align, c.name, FontId::proportional(11.5), p.subtle);
     }
-    ui.painter().hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, p.border));
+    ui.painter().hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, p.hsep));
 }
 
 /// One table row: `cells` per column, and a colour chip before the first when `chip` says. Returns the row's response.
@@ -829,7 +829,7 @@ impl Insights {
                     }
                 }
                 ui.add_space(8.0);
-                ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, p.border));
+                ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, p.hsep));
                 ui.add_space(8.0);
                 toolbar(
                     ui,

@@ -44,7 +44,7 @@ enum Page {
     Muse,
     /// A custom endpoint: its index in `Config::providers`.
     Endpoint(usize),
-    /// Not a page: the sidebar's "+ Add endpoint", which makes one and goes to it.
+    /// Not a page: the sidebar's "Add endpoint", which makes one and goes to it.
     Add,
 }
 
@@ -88,7 +88,7 @@ fn items(cfg: &Config) -> Vec<Item> {
     for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::Endpoint) {
         v.push(provider(Page::Endpoint(i), &p.name, Glyph::Link, p.disabled));
     }
-    v.push(provider(Page::Add, "+ Add endpoint", Glyph::Plus, false));
+    v.push(provider(Page::Add, "Add endpoint", Glyph::Plus, false));
     v
 }
 
@@ -122,6 +122,8 @@ pub(crate) fn style(ui: &mut egui::Ui) {
     style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.0));
     let v = &mut style.visuals;
     v.extreme_bg_color = p.field;
+    // The line egui draws between the side panel and the central panel.
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.vsep);
     v.selection.stroke = egui::Stroke::new(1.0, p.blue.gamma_multiply(0.75));
     let hover = p.btn_hover;
     for (w, fill) in [(&mut v.widgets.inactive, p.btn), (&mut v.widgets.hovered, hover), (&mut v.widgets.active, hover), (&mut v.widgets.open, hover)] {
@@ -392,9 +394,9 @@ impl Settings {
         egui::Panel::left("settings-nav")
             .exact_size(NAV_W)
             .resizable(false)
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 12, right: 12, top: 14, bottom: 8 }))
+            .frame(egui::Frame::new().fill(p.side).inner_margin(egui::Margin { left: 12, right: 12, top: 14, bottom: 8 }))
             .show(ui, |ui| self.sidebar(ui));
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 32, right: 24, top: 0, bottom: 8 })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.content).inner_margin(egui::Margin { left: 32, right: 24, top: 0, bottom: 8 })).show(ui, |ui| {
             // The strip above the page drags the window; the close button floats over its right end.
             let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), TOP_STRIP), Sense::hover());
             drag_window(ui, strip, "pane-drag");
@@ -589,7 +591,7 @@ impl eframe::App for Settings {
             }
         }
         // No title bar: the layout draws the logo, the drag strips and the close button itself.
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal(ui).bg)).show(ui, |ui| self.layout(ui, frame));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal(ui).content)).show(ui, |ui| self.layout(ui, frame));
         crate::outline(ui);
         resize_zones(ui);
         if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
@@ -796,7 +798,7 @@ mod tests {
         assert!(filter(&all, "zzz").is_empty());
         let names: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(names[..7], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Analytics", "History"]);
-        assert_eq!(names[7..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "+ Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!(names[7..], ["Claude", "Antigravity", "ChatGPT", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
         assert_eq!(Page::parse("models", &cfg), Some(Page::Models), "the first word of a label is enough");
         assert_eq!((Page::parse("analytics", &cfg), Page::parse("History", &cfg)), (Some(Page::Analytics), Some(Page::History)));
         assert_eq!(Page::parse("openrouter", &cfg), Some(Page::Endpoint(4)));
