@@ -9,11 +9,17 @@ use crate::proxy::sse::{Stop, Tx};
 use crate::proxy::{Ctx, Fail, SEARCH_MODEL};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     net::TcpStream,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
+
+/// Models Ollama answered "does not support thinking" for: `think` is left out of their requests from then on.
+/// ponytail: per model name for the process lifetime (not per server), so a same-named model elsewhere that does think
+/// loses it until ccat restarts.
+static NO_THINK: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 pub const DEFAULT_URL: &str = "https://ollama.com";
 pub const _LOCAL_URL: &str = "http://localhost:11434";
@@ -429,6 +435,8 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(600)))
+        // The status and body of a refusal are what the caller acts on (a 429 waits, a 400 may be retried).
+        .http_status_as_error(false)
         .build()
         .into();
 
@@ -575,9 +583,22 @@ pub(crate) fn ollama_messages(
         }
     }
 
-    let payload = crate::providers::ollama::chat_body(body, model, true);
+    let mut payload = crate::providers::ollama::chat_body(body, model, true);
+    if NO_THINK.lock().unwrap().contains(model) {
+        payload.as_object_mut().map(|o| o.remove("think"));
+    }
     let key_opt = (!key.trim().is_empty()).then_some(key);
-    let reader = match crate::providers::ollama::open(url, key_opt, &payload) {
+    let opened = match crate::providers::ollama::open(url, key_opt, &payload) {
+        // A model without thinking support rejects `think` with a 400: once more without it, and remembered.
+        Err(f) if f.status == 400 && f.message.contains("does not support thinking") && payload.get("think").is_some() => {
+            common::log(&format!("{model} via Ollama: no thinking support, retrying without `think`"));
+            NO_THINK.lock().unwrap().insert(model.to_string());
+            payload.as_object_mut().map(|o| o.remove("think"));
+            crate::providers::ollama::open(url, key_opt, &payload)
+        }
+        r => r,
+    };
+    let reader = match opened {
         Ok(r) => r,
         Err(f) => {
             common::log(&format!("{model} via Ollama ({url}): {} {}", f.status, f.message));

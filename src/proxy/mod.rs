@@ -360,11 +360,17 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                         Some((r, b)) if *u != Upstream::Official => (r, b),
                         _ => (&req, &body),
                     };
+                    let key = format!("{u:?}");
+                    // The half-open probe is claimed only now, by a try that runs (the verdict can't skip it: a request is never failed untried).
+                    ctx.breaker.allow(&key);
                     let result = run(&mut s, ctx, rq, bd, &asked, u, m, tier, counted, may_fail);
                     // Only a 5xx (or a timeout / connection error, which come back as 502) counts against the provider.
+                    // ponytail: the last try's `Ok` may be an upstream 5xx passed straight through, so it neither trips
+                    // nor closes the breaker: a provider only ever used last stays as it was. `Ok` carries no status.
                     match &result {
-                        Err(f) if f.status >= 500 => ctx.breaker.fail(&format!("{u:?}")),
-                        _ => ctx.breaker.ok(&format!("{u:?}")),
+                        Err(f) if f.status >= 500 => ctx.breaker.fail(&key),
+                        Ok(()) if last => {}
+                        _ => ctx.breaker.ok(&key),
                     }
                     match result {
                         Ok(()) => {
@@ -439,7 +445,8 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
 
 /// The chain a request may try, in order. Each try spends ccat's keys or accounts unless it's Claude: those need the
 /// token. With `no_paid` a fallback that is a custom endpoint (a paid API key) is dropped; the primary never is.
-/// Tries whose breaker is open are skipped, unless that would leave none: a request is never failed untried.
+/// Tries whose breaker is open are skipped, unless that would leave none: a request is never failed untried. Only
+/// looks (`is_open`): the half-open probe is claimed by the serve loop right before a try runs.
 fn pick_tries(chain: Vec<(Upstream, String)>, authed: bool, no_paid: bool, breaker: &breaker::Breaker) -> Vec<(Upstream, String)> {
     let all: Vec<_> = chain
         .into_iter()
@@ -447,7 +454,7 @@ fn pick_tries(chain: Vec<(Upstream, String)>, authed: bool, no_paid: bool, break
         .filter(|(n, (u, _))| (*u == Upstream::Official || authed) && (*n == 0 || !(no_paid && matches!(u, Upstream::Endpoint { .. }))))
         .map(|(_, t)| t)
         .collect();
-    let ready: Vec<_> = all.iter().filter(|(u, _)| breaker.allow(&format!("{u:?}"))).cloned().collect();
+    let ready: Vec<_> = all.iter().filter(|(u, _)| !breaker.is_open(&format!("{u:?}"))).cloned().collect();
     if ready.is_empty() { all } else { ready }
 }
 
@@ -963,6 +970,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_tripped_fallback_is_probed_when_needed_even_after_many_requests_served_by_the_primary() {
+        let b = breaker::Breaker::new(Duration::from_millis(60));
+        let chain = || vec![(ep("A", "u".into()), "a".to_string()), (ep("B", "u".into()), "b".into())];
+        let names = |v: Vec<(Upstream, String)>| v.iter().map(|(_, m)| m.as_str()).collect::<String>();
+        (0..3).for_each(|_| b.fail("B"));
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "a", "B is open");
+        std::thread::sleep(Duration::from_millis(80));
+        for _ in 0..5 {
+            // A answers, B is never claimed: picking must not push B's open time forward.
+            assert_eq!(names(pick_tries(chain(), true, false, &b)), "ab", "cooldown over: B is back in the chain");
+            assert!(b.allow("A"));
+        }
+        assert!(b.allow("B"), "A fails now: B is tried, and it is the probe");
+        assert_eq!(names(pick_tries(chain(), true, false, &b)), "a", "a claimed probe holds the others off");
+    }
+
+    #[test]
+    fn a_last_try_never_wipes_the_failure_count() {
+        let (flaky, flaky_hits) = counted_endpoint(503, "flaky");
+        let good = fake_endpoint(200, "good");
+        let mut sonnet = route("sonnet", &["m@sonnet"], ep("Flaky", flaky.clone()), "m");
+        sonnet.fallbacks = vec![(ep("Good", good), "x".into())];
+        // Flaky is the last (only) try here: its 503 goes straight to Claude Code.
+        let opus = route("opus", &["m@opus"], ep("Flaky", flaky), "m");
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![sonnet, opus], PathBuf::new()).unwrap();
+        let sonnet = || assert_eq!(ask(&proxy).0, 200);
+        let opus = || assert_eq!(post(&proxy, &proxy.token, &json!({ "model": "m@opus", "max_tokens": 10, "messages": [{ "role": "user", "content": "hi" }] })).0, 503);
+        sonnet();
+        opus();
+        sonnet();
+        opus();
+        sonnet();
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 5);
+        sonnet();
+        assert_eq!(flaky_hits.load(Ordering::Relaxed), 5, "three failures as a fallback-able try tripped it, the opus passes in between didn't reset them");
+    }
+
+    #[test]
     fn the_breaker_trips_on_5xx_not_on_usage_limits() {
         let (flaky, flaky_hits) = counted_endpoint(503, "flaky");
         let (busy, busy_hits) = counted_endpoint(429, "busy");
@@ -1104,7 +1149,7 @@ Content-Length: {}
         ];
         let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
         let dirty = "\\u001b[32m   Compiling\\u001b[0m foo   \\n\\n\\n\\n\\n\\n    Finished";
-        let body = |model: &str| format!(r#"{{"model": "{model}", "max_tokens": 9, "messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"e","is_error":true,"content":"{dirty}"}}]}}]}}"#);
+        let body = |model: &str| format!(r#"{{"model": "{model}", "max_tokens": 9, "messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":"Bash","input":{{}}}},{{"type":"tool_use","id":"e","name":"Bash","input":{{}}}},{{"type":"tool_use","id":"r","name":"Read","input":{{}}}}]}},{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"e","is_error":true,"content":"{dirty}"}},{{"type":"tool_result","tool_use_id":"r","content":"{dirty}"}}]}}]}}"#);
         let send = |model: &str| {
             let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
             let res = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token)).send(body(model)).unwrap();
@@ -1112,15 +1157,15 @@ Content-Length: {}
         };
         let results = |seen: &Seen| -> Vec<String> {
             let v: Value = serde_json::from_slice(&seen.lock().unwrap().pop().unwrap().0).unwrap();
-            v["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["content"].as_str().unwrap().to_string()).collect()
+            v["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["content"].as_str().unwrap().to_string()).collect()
         };
         let cleaned = "   Compiling foo\n\n    Finished";
 
         send("m@sonnet");
-        assert_eq!(results(&other_seen), [dirty_text(dirty), dirty_text(dirty)], "off: untouched");
+        assert_eq!(results(&other_seen), [dirty_text(dirty), dirty_text(dirty), dirty_text(dirty)], "off: untouched");
         proxy.compress_tool_results.store(true, Ordering::Relaxed);
         send("m@sonnet");
-        assert_eq!(results(&other_seen), [cleaned.to_string(), dirty_text(dirty)], "on: a third-party route gets clean output, an error result stays");
+        assert_eq!(results(&other_seen), [cleaned.to_string(), dirty_text(dirty), dirty_text(dirty)], "on: a third-party route gets clean Bash output; an error result and a Read result stay");
         send("m@sonnet");
         let first = other_seen.lock().unwrap().last().map(|r| r.0.clone());
         send("m@sonnet");
@@ -2019,6 +2064,41 @@ HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
         assert_eq!(sent["keep_alive"], "30m");
         assert_eq!(sent["messages"][0]["role"], "user");
         assert_eq!(sent["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn ollama_retries_without_think_for_a_model_that_cannot_think_and_remembers_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let req = read_request(&s).unwrap();
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let thinks = body.get("think").is_some();
+                log.lock().unwrap().push(body);
+                let text = if thinks {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"\\\"nothink-model:1b\\\" does not support thinking\"}".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"Plain answer\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":2,\"eval_count\":2}\n".to_string()
+                };
+                let _ = s.write_all(text.as_bytes());
+            }
+        });
+        let routes = vec![route("sonnet", &["claude-sonnet-5-5"], Upstream::Ollama { url, key: String::new() }, "nothink-model:1b")];
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        let req = json!({ "model": "claude-sonnet-5-5", "max_tokens": 9, "stream": true, "thinking": { "type": "enabled", "budget_tokens": 5000 },
+                          "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status == 200 && body.contains("Plain answer"), "{status} {body}");
+        let thinks = || seen.lock().unwrap().iter().map(|b| b.get("think").is_some()).collect::<Vec<_>>();
+        assert_eq!(thinks(), [true, false], "rejected with think, retried once without it");
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert!(status == 200 && body.contains("Plain answer"), "{status} {body}");
+        assert_eq!(thinks(), [true, false, false], "remembered: the next request never sends think");
     }
 
     #[test]

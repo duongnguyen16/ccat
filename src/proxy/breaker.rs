@@ -28,8 +28,14 @@ impl Breaker {
         Breaker { cooldown, state: Mutex::default() }
     }
 
-    /// Whether `key` may be tried now. Open: no. Cooldown over: yes, and the others wait another cooldown, so one
-    /// request probes (ponytail: a probe that never reports back lets the next one through after that).
+    /// Whether `key` is open: tripped and the cooldown not over. Changes nothing, so it can sort a whole chain.
+    pub(crate) fn is_open(&self, key: &str) -> bool {
+        matches!(self.state.lock().unwrap().get(key), Some((_, Some(t))) if Instant::now() < *t)
+    }
+
+    /// Claims `key` for a try that is about to run. Open: no. Cooldown over: yes, and the others wait another
+    /// cooldown, so one request probes (ponytail: a probe that never reports back lets the next one through after
+    /// that). Called only for a try that actually runs, never to filter a chain (see `is_open`).
     pub(crate) fn allow(&self, key: &str) -> bool {
         let mut m = self.state.lock().unwrap();
         let Some((_, open)) = m.get_mut(key) else { return true };
@@ -78,6 +84,19 @@ mod tests {
         assert!(b.allow("a"), "two in a row after a success: still closed");
         b.fail("a");
         assert!(!b.allow("a") && b.allow("b"), "third in a row opens a, only a");
+    }
+
+    #[test]
+    fn is_open_changes_nothing() {
+        let b = Breaker::new(Duration::from_millis(60));
+        assert!(!b.is_open("a"));
+        for _ in 0..3 {
+            b.fail("a");
+        }
+        assert!(b.is_open("a"));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!b.is_open("a") && !b.is_open("a"), "cooldown over, and asking doesn't push it forward");
+        assert!(b.allow("a") && b.is_open("a"), "claiming the probe does");
     }
 
     #[test]

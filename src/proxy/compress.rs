@@ -1,19 +1,34 @@
-//! Lossless-ish cleanup of `tool_result` text for third-party routes (never Claude): ANSI escapes, CR redraws,
+//! Lossless-ish cleanup of command-output `tool_result` text for third-party routes (never Claude): ANSI escapes, CR redraws,
 //! trailing spaces, runs of blank or identical lines. Providers cache the prompt prefix, so this is a PURE,
 //! DETERMINISTIC, IDEMPOTENT function of the text, applied to EVERY tool result on EVERY request (not just the
 //! newest): the same history compresses to the same bytes each turn, and a result that arrives pre-compressed
 //! (RTK as a Bash hook) comes out unchanged. It only cleans, never truncates, summarises or reorders; error results
-//! (`is_error`), images and every other block are left alone.
+//! (`is_error`), images and every other block are left alone. Only results of `COMMAND_TOOLS` are touched: file
+//! contents (Read, Grep…) stay byte-exact, or a later Edit `old_string` would not match the real file.
 //! ponytail: no semantic compression (dedup of similar-but-not-equal lines, log summarising); that needs a heuristic
 //! that can lose what the model needs, so it would be its own opt-in.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
-/// Cleans every tool result's text in `body["messages"]`; the bytes saved.
+/// Tools whose output is a terminal's; every other result (file contents, search hits) is left alone.
+const COMMAND_TOOLS: [&str; 3] = ["Bash", "PowerShell", "BashOutput"];
+
+/// Cleans the text of every command-tool result in `body["messages"]`; the bytes saved. A result is a command's when
+/// its `tool_use_id` names a `tool_use` of `COMMAND_TOOLS`; an unknown or unresolvable id stays as it is.
 pub(crate) fn tool_results(body: &mut Value) -> usize {
-    let blocks = body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten().filter_map(|m| m.get_mut("content")?.as_array_mut()).flatten();
-    blocks
-        .filter(|b| b["type"] == "tool_result" && b["is_error"] != true)
+    let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else { return 0 };
+    let cmd: HashSet<String> = msgs
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == "tool_use" && b["name"].as_str().is_some_and(|n| COMMAND_TOOLS.contains(&n)))
+        .filter_map(|b| b["id"].as_str().map(String::from))
+        .collect();
+    msgs.iter_mut()
+        .filter_map(|m| m.get_mut("content")?.as_array_mut())
+        .flatten()
+        .filter(|b| b["type"] == "tool_result" && b["is_error"] != true && b["tool_use_id"].as_str().is_some_and(|id| cmd.contains(id)))
         .map(|b| match b.get_mut("content") {
             Some(c @ Value::String(_)) => squeeze(c),
             Some(Value::Array(a)) => a.iter_mut().filter(|x| x["type"] == "text").filter_map(|x| x.get_mut("text")).map(squeeze).sum(),
@@ -47,8 +62,11 @@ pub(crate) fn text(s: &str) -> Option<String> {
 
 fn pass(s: &str) -> String {
     let s = strip_escapes(s).replace("\r\n", "\n");
-    // What a terminal shows: after the last `\r` (a trailing one keeps the text before it).
-    let lines: Vec<&str> = s.split('\n').map(|l| l.rsplit('\r').find(|p| !p.is_empty()).unwrap_or("").trim_end()).collect();
+    // What a terminal shows: each `\r`-separated segment overwrites the line from column 0, so chars of a longer
+    // earlier draw beyond the segment's end survive. ponytail: text using a bare CR as its line break (classic Mac
+    // files printed with cat) still renders as a terminal would show it, not as separate lines.
+    let lines: Vec<String> = s.split('\n').map(|l| overwrite(l).trim_end().to_string()).collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
@@ -69,6 +87,16 @@ fn pass(s: &str) -> String {
         out.extend(std::iter::repeat_n(l.to_string(), keep));
     }
     out.join("\n")
+}
+
+/// One line as a terminal shows it after its `\r` redraws.
+fn overwrite(line: &str) -> String {
+    let mut buf: Vec<char> = Vec::new();
+    for seg in line.split('\r') {
+        let n = seg.chars().count();
+        buf.splice(..n.min(buf.len()), seg.chars());
+    }
+    buf.into_iter().collect()
 }
 
 /// Drops CSI (`ESC [ … final`), OSC (`ESC ] … BEL | ESC \`) and the short `ESC`-sequences. No ESC survives.
@@ -124,6 +152,8 @@ mod tests {
         assert_eq!(text("a\r\nb\r\n").unwrap(), "a\nb\n", "CRLF is LF");
         assert_eq!(text("10%\r50%\r100% done\nnext").unwrap(), "100% done\nnext", "a redraw keeps the last text");
         assert_eq!(text("work\r\r\nok").unwrap(), "work\nok", "a trailing CR keeps the line");
+        assert_eq!(text("progress 100%   \rdone\nx").unwrap(), "doneress 100%\nx", "a shorter redraw leaves the rest of the line");
+        assert_eq!(text("abcd  \rX\nq").unwrap(), "Xbcd\nq", "overwrite from column 0, then trailing spaces go");
     }
 
     #[test]
@@ -170,8 +200,10 @@ mod tests {
     #[test]
     fn tool_results_in_a_request() {
         let dirty = "\x1b[31mred\x1b[0m   \n\n\n\n\nend";
+        let uses = |ids: &[(&str, &str)]| json!({"role":"assistant","content":ids.iter().map(|(id, name)| json!({"type":"tool_use","id":id,"name":name,"input":{}})).collect::<Vec<_>>()});
         let mut body = json!({"model":"m","messages":[
             {"role":"user","content":"\x1b[31mnot a tool result\x1b[0m"},
+            uses(&[("1","Bash"),("2","PowerShell"),("3","Bash"),("4","Bash")]),
             {"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"1","content":dirty},
                 {"type":"tool_result","tool_use_id":"2","content":[{"type":"text","text":dirty},{"type":"image","source":{"type":"base64","data":"\x1b[1m"}}]},
@@ -182,17 +214,36 @@ mod tests {
         let saved = tool_results(&mut body);
         let cleaned = "red\n\nend";
         assert_eq!(saved, 2 * (dirty.len() - cleaned.len()));
-        let blocks = &body["messages"][1]["content"];
+        let blocks = &body["messages"][2]["content"];
         assert_eq!(blocks[0]["content"], cleaned);
         assert_eq!(blocks[1]["content"][0]["text"], cleaned);
-        assert_eq!(blocks[1]["content"][1], before["messages"][1]["content"][1]["content"][1], "images are left alone");
-        assert_eq!(blocks[2], before["messages"][1]["content"][2], "an error result is left alone");
-        assert_eq!(blocks[3], before["messages"][1]["content"][3], "no content: no key added");
-        assert_eq!(blocks[4], before["messages"][1]["content"][4], "only tool results");
+        assert_eq!(blocks[1]["content"][1], before["messages"][2]["content"][1]["content"][1], "images are left alone");
+        assert_eq!(blocks[2], before["messages"][2]["content"][2], "an error result is left alone");
+        assert_eq!(blocks[3], before["messages"][2]["content"][3], "no content: no key added");
+        assert_eq!(blocks[4], before["messages"][2]["content"][4], "only tool results");
         assert_eq!(body["messages"][0], before["messages"][0]);
         let again = body.clone();
         assert_eq!(tool_results(&mut body), 0);
         assert_eq!(body, again, "a second request with the same history changes nothing more");
+    }
+
+    #[test]
+    fn only_command_tool_results_are_cleaned() {
+        let dirty = "a  \nb\n\n\n\n\nc";
+        let mut body = json!({"messages":[
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"b","name":"BashOutput","input":{}},
+                {"type":"tool_use","id":"r","name":"Read","input":{}},
+                {"type":"tool_use","id":"g","name":"Grep","input":{}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"b","content":dirty},
+                {"type":"tool_result","tool_use_id":"r","content":dirty},
+                {"type":"tool_result","tool_use_id":"g","content":[{"type":"text","text":dirty}]},
+                {"type":"tool_result","tool_use_id":"orphan","content":dirty}]}]});
+        assert_eq!(tool_results(&mut body), dirty.len() - "a\nb\n\nc".len());
+        let c = &body["messages"][1]["content"];
+        assert_eq!(c[0]["content"], "a\nb\n\nc");
+        assert_eq!((c[1]["content"].as_str(), c[2]["content"][0]["text"].as_str(), c[3]["content"].as_str()), (Some(dirty), Some(dirty), Some(dirty)), "Read, Grep and unresolvable ids are byte-exact");
     }
 
     /// A cargo build with colours and a progress bar redrawn on one line.

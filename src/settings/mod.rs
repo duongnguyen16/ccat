@@ -12,7 +12,7 @@ use providers::ProvidersEditor;
 use std::time::Duration;
 
 /// The window's title, which is also how a second request finds the first (see `win::raise`).
-const TITLE: &str = "ccat Settings";
+pub(crate) const TITLE: &str = "ccat Settings";
 const NAV_W: f32 = 220.0;
 /// The widest the page's text and rows go, however wide the window.
 const PANE_W: f32 = 720.0;
@@ -307,10 +307,10 @@ impl Settings {
 
     fn tokens(&mut self, ui: &mut egui::Ui) {
         heading(ui, "Token saving");
-        setting(ui, "Compress tool output (third-party models)", "Lossless cleanup of tool output before it goes to a third-party model: ANSI colours, progress-bar redraws, trailing spaces, runs of identical lines. Never on Claude, never on error results. Routed sessions only.", |ui| {
+        setting(ui, "Compress tool output (third-party models)", "Lossless cleanup of command output (Bash/PowerShell) before it goes to a third-party model: ANSI colours, progress-bar redraws, trailing spaces, runs of identical lines. Never on Claude, never on error results, never on file contents (Read, Grep). Routed sessions only.", |ui| {
             switch(ui, &mut self.cfg.compress_tool_results, "");
         });
-        paragraph(ui, "", "Build logs and test runs are mostly noise. Cleaning them up before they are sent means fewer tokens used and more room left in the model's context window, without changing what the output says.");
+        paragraph(ui, "", "Build logs and test runs (command output) are mostly noise. Cleaning them up before they are sent means fewer tokens used and more room left in the model's context window, without changing what the output says.");
         paragraph(ui, "Prompt cache", "ccat keeps each provider's prompt prefix byte-stable, and Claude requests are forwarded exactly as Claude Code sent them, so each provider's own prompt cache keeps hitting. Nothing to set.");
     }
 
@@ -358,8 +358,38 @@ impl eframe::App for Settings {
         if crate::window(ui, "Settings", &[Btn::Close], |ui| self.layout(ui, frame)) == Some(Btn::Close) {
             ui.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        resize_zones(ui);
         if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
             self.save();
+        }
+    }
+}
+
+/// Thin hit zones along the borderless window's edges and corners: the matching resize cursor, and a drag hands
+/// the resize to the OS. Corners are registered last so they win over the edges they overlap.
+/// ponytail: no zone shrinks for the title bar's close button, whose top 5 px resize instead.
+fn resize_zones(ui: &mut egui::Ui) {
+    use egui::{pos2, CursorIcon as C, Rect, ResizeDirection as D};
+    const E: f32 = 5.0;
+    let r = ui.ctx().content_rect();
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    let zones = [
+        (D::North, C::ResizeVertical, Rect::from_min_max(pos2(l, t), pos2(rt, t + E))),
+        (D::South, C::ResizeVertical, Rect::from_min_max(pos2(l, b - E), pos2(rt, b))),
+        (D::West, C::ResizeHorizontal, Rect::from_min_max(pos2(l, t), pos2(l + E, b))),
+        (D::East, C::ResizeHorizontal, Rect::from_min_max(pos2(rt - E, t), pos2(rt, b))),
+        (D::NorthWest, C::ResizeNwSe, Rect::from_min_max(pos2(l, t), pos2(l + 2.0 * E, t + 2.0 * E))),
+        (D::NorthEast, C::ResizeNeSw, Rect::from_min_max(pos2(rt - 2.0 * E, t), pos2(rt, t + 2.0 * E))),
+        (D::SouthWest, C::ResizeNeSw, Rect::from_min_max(pos2(l, b - 2.0 * E), pos2(l + 2.0 * E, b))),
+        (D::SouthEast, C::ResizeNwSe, Rect::from_min_max(pos2(rt - 2.0 * E, b - 2.0 * E), pos2(rt, b))),
+    ];
+    for (n, (dir, cursor, rect)) in zones.into_iter().enumerate() {
+        let resp = ui.interact(rect, ui.id().with(("resize", n)), Sense::drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if resp.drag_started() {
+            ui.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
         }
     }
 }
@@ -376,6 +406,7 @@ pub fn run(page: Option<String>) {
             .with_title(TITLE)
             .with_icon(crate::app_icon())
             .with_decorations(false)
+            .with_resizable(true)
             .with_inner_size([900.0, 620.0])
             .with_min_inner_size([680.0, 440.0]),
         centered: true,

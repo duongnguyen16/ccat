@@ -157,10 +157,15 @@ pub(crate) fn upstream_body(body: &Value, raw: &[u8], model: &str, endpoint: boo
     }
     let keeps = |b: &Value| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:"));
     let blocks = || body["messages"].as_array().into_iter().flatten().filter_map(|m| m["content"].as_array()).flatten();
+    let clean = body["model"] == model && blocks().all(keeps);
+    // The official route forwards Claude Code's exact bytes: no copy of the body unless it must be rewritten.
+    if clean && !endpoint {
+        return raw.to_vec();
+    }
     let mut body = body.clone();
-    // Only an endpoint loses the billing line: the official route forwards Claude Code's exact bytes.
+    // Only an endpoint loses the billing line.
     let billed = endpoint && strip_billing(&mut body);
-    if !billed && body["model"] == model && blocks().all(keeps) {
+    if clean && !billed {
         return raw.to_vec();
     }
     body["model"] = json!(model);

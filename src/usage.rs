@@ -740,7 +740,7 @@ mod win {
         },
         UI::{
             HiDpi::GetDpiForSystem,
-            WindowsAndMessaging::{GetSystemMetrics, SystemParametersInfoW, SM_CXSMICON, SPI_GETWORKAREA},
+            WindowsAndMessaging::{FindWindowW, GetSystemMetrics, GetWindowThreadProcessId, SystemParametersInfoW, SM_CXSMICON, SPI_GETWORKAREA},
         },
     };
 
@@ -779,13 +779,26 @@ mod win {
         }
     }
 
-    /// Other running processes with this exe's file name, not counting `skip`.
+    /// Other running processes with this exe's file name, not counting `skip` or the Settings window's.
     pub fn others(skip: &[u32]) -> usize {
         pids(skip).map_or(1, |p| p.len()) // can't tell: assume someone still needs the tray
     }
 
+    /// The Settings process, found by its window (it isn't the tray's child, so the tray can't track its pid like the
+    /// popup's): it is a tool window, not a session, so it neither keeps the tray alive nor counts at Quit.
+    /// ponytail: a Settings process still starting (no window yet) counts as a session for that moment.
+    fn settings_pid() -> Option<u32> {
+        // SAFETY: a top-level window found by its title; asking for its owner pid takes one valid out pointer.
+        unsafe {
+            let hwnd = FindWindowW(std::ptr::null(), wide(crate::settings::TITLE).as_ptr());
+            let mut pid = 0;
+            (!hwnd.is_null() && GetWindowThreadProcessId(hwnd, &mut pid) != 0 && pid != 0).then_some(pid)
+        }
+    }
+
     /// Their ids; `None` when the processes can't be listed.
     pub fn pids(skip: &[u32]) -> Option<Vec<u32>> {
+        let settings = settings_pid();
         let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).unwrap_or_default();
         let mut n = Vec::new();
         // SAFETY: a process snapshot walked with a correctly sized entry, then closed.
@@ -800,7 +813,7 @@ mod win {
             while ok {
                 let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
                 let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
-                if name == me && e.th32ProcessID != std::process::id() && !skip.contains(&e.th32ProcessID) {
+                if name == me && e.th32ProcessID != std::process::id() && !skip.contains(&e.th32ProcessID) && Some(e.th32ProcessID) != settings {
                     n.push(e.th32ProcessID);
                 }
                 ok = Process32NextW(snap, &mut e) != 0;

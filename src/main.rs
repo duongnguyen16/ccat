@@ -96,8 +96,8 @@ struct Config {
     /// Routed requests never fall back to a custom endpoint (a paid API key); a tier's own primary still runs.
     /// Off by default.
     no_paid_fallback: bool,
-    /// Routed requests to third-party models get their tool results cleaned (ANSI, progress redraws, repeated
-    /// lines); never Claude. Off by default.
+    /// Routed requests to third-party models get their command output (Bash/PowerShell results) cleaned (ANSI,
+    /// progress redraws, repeated lines); file contents and never Claude. Off by default.
     compress_tool_results: bool,
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
@@ -1224,9 +1224,22 @@ impl eframe::App for App {
             self.claude_list = None;
         }
         if let Some(found) = self.plans.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            // `merged` works per top-level field, so a stale `providers` copy would overwrite what Settings saved
+            // meanwhile: start from the file, apply the plans, and save now instead of on Drop.
+            if let Some((cfg, loaded)) = reload(&self.cfg, &self.loaded) {
+                (self.cfg, self.loaded) = (cfg, loaded);
+            }
+            let mut changed = false;
             for a in self.cfg.providers.iter_mut().flat_map(|p| p.accounts.iter_mut()) {
                 if let Some((_, plan)) = found.iter().find(|(e, _)| *e == a.email) {
+                    changed |= a.plan != *plan;
                     a.plan = plan.clone();
+                }
+            }
+            if changed {
+                match save(&self.cfg, &self.loaded) {
+                    Ok(()) => (self.loaded, self.disk) = (serde_json::to_value(&self.cfg).unwrap_or_default(), Disk::new()),
+                    Err(e) => eprintln!("ccat: could not save settings: {e}"),
                 }
             }
             self.plans = None;
