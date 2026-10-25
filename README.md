@@ -197,7 +197,7 @@ claude ──► ccat proxy (127.0.0.1, random port, per-launch token)
              └─ /mcp                  ──► generate_image (Gemini image model)
 ```
 
-- Official Claude requests are forwarded byte-for-byte as Claude Code sent them. Only when a tier swaps the model, or another provider's thinking must be dropped, is the body rewritten, keeping key order.
+- Official Claude request bodies are forwarded byte-for-byte as Claude Code sent them, with its headers (hop-by-hop ones aside). Only when a tier swaps the model, or another provider's thinking must be dropped, is the body rewritten, keeping key order.
 
 - The proxy binds to `127.0.0.1` only, on a random port. Antigravity and endpoint tiers spend your accounts and keys, so they answer only requests carrying the token generated for that launch (sent as an `x-ccat-token` header). Official tiers carry only the caller's own login.
 - Several ccat sessions can run at once: each has its own proxy, which follows model changes in the config; the config is saved atomically and merged field by field, and log lines carry the process id. Token counts for **Analytics** go to `tokens.jsonl` next to the config, one line per request.

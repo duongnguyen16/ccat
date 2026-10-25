@@ -114,7 +114,7 @@ pub(crate) fn respond_error(s: &mut TcpStream, f: &Failure) {
     respond(s, f.status, &json!({ "type": "error", "error": { "type": error_kind(f.status), "message": f.message } }), &extra);
 }
 
-/// Drops Claude Code's per-request billing line (`cch=` changes every turn) from `system`, so an endpoint's prompt
+/// Drops Claude Code's per-request billing line (its `cch=` value is per request, unverified whether it varies) from `system`, so an endpoint's prompt
 /// cache sees a stable prefix. A text block left empty goes whole (Anthropic rejects empty ones); other blocks,
 /// `cache_control` included, stay as they were. Whether anything changed is returned.
 /// ponytail: a removed block's own `cache_control` goes with it; Claude Code puts none on the billing block.

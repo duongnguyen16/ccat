@@ -311,7 +311,7 @@ impl Settings {
             switch(ui, &mut self.cfg.compress_tool_results, "");
         });
         paragraph(ui, "", "Build logs and test runs (command output) are mostly noise. Cleaning them up before they are sent means fewer tokens used and more room left in the model's context window, without changing what the output says.");
-        paragraph(ui, "Prompt cache", "ccat keeps each provider's prompt prefix byte-stable, and Claude requests are forwarded exactly as Claude Code sent them, so each provider's own prompt cache keeps hitting. Nothing to set.");
+        paragraph(ui, "Prompt cache", "ccat keeps each provider's prompt prefix byte-stable, and Claude request bodies are forwarded exactly as Claude Code sent them, so each provider's own prompt cache keeps hitting. Nothing to set.");
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
