@@ -495,17 +495,14 @@ impl Settings {
 
     fn models(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let p = pal(ui);
-        heading(ui, "Models & tiers");
         ui.scope(|ui| {
             ui.set_max_width(ui.available_width().min(TIERS_W));
-            group(ui, |ui, g| {
-                g.item(ui, |ui| {
-                    self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
-                        ui.label(RichText::new("Configuration").size(14.0));
-                    });
-                });
-                self.tiers.rows(ui, g, &mut self.cfg);
+            // The page title with the profile selector on its right.
+            self.tiers.bar.show(ui, &mut self.cfg, frame, |ui| {
+                ui.label(title("Models & tiers"));
             });
+            ui.add_space(8.0);
+            self.tiers.rows(ui, &mut self.cfg);
             ui.add(egui::Label::new(RichText::new("Changes reach running ccat sessions within seconds, and every next launch. Claude names and context windows stay as each session started. A session launched with every tier on Claude and no fallback runs plain claude: relaunch it to switch.").size(11.0).color(p.subtle)).wrap());
         });
     }
