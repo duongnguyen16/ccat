@@ -420,7 +420,8 @@ struct Slot {
 }
 
 pub struct Pool {
-    accounts: Vec<Account>,
+    /// Grows while the session runs (see `add`), never shrinks or reorders: indices stay valid. Readers take a snapshot.
+    accounts: RwLock<Arc<Vec<Account>>>,
     /// Emails the pool must not use; shared so a running session follows the Providers switches.
     pub disabled: Arc<RwLock<HashSet<String>>>,
     /// (sticky account index, per-account state)
@@ -434,15 +435,37 @@ impl Pool {
     pub fn new(mut accounts: Vec<Account>) -> Pool {
         accounts.sort_by_key(|a| rank(&a.plan));
         let slots = accounts.iter().map(|_| Slot::default()).collect();
-        Pool { accounts, disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
+        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
+    }
+
+    /// The accounts now; held, it keeps the indices it had (the pool only grows).
+    fn accounts(&self) -> Arc<Vec<Account>> {
+        self.accounts.read().unwrap().clone()
+    }
+
+    /// Accounts signed in while the session runs join after the others; those it already has are skipped.
+    /// ponytail: appended, not ranked by plan: the account in use keeps winning, so its prompt cache stays warm.
+    /// The next launch sorts them.
+    pub fn add(&self, accounts: &[Account]) {
+        let mut g = self.state.lock().unwrap();
+        let mut all = (*self.accounts()).clone();
+        for a in accounts {
+            if !all.iter().any(|b| b.email == a.email) {
+                log(&format!("{} joins the Antigravity pool", a.email));
+                all.push(a.clone());
+                // Its slot exists before the account shows: an index from any snapshot has one.
+                g.1.push(Slot::default());
+            }
+        }
+        *self.accounts.write().unwrap() = Arc::new(all);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty()
+        self.accounts().is_empty()
     }
 
     fn off(&self, i: usize) -> bool {
-        self.disabled.read().unwrap().contains(&self.accounts[i].email)
+        self.disabled.read().unwrap().contains(&self.accounts()[i].email)
     }
 
     /// Valid access token for account `i`. Refreshing under the lock keeps refreshes single-flight.
@@ -453,13 +476,13 @@ impl Pool {
                 return Ok(t.clone());
             }
         }
-        let (t, life) = refresh(&self.accounts[i].refresh)?;
+        let (t, life) = refresh(&self.accounts()[i].refresh)?;
         g.1[i].token = Some((t.clone(), Instant::now() + life));
         Ok(t)
     }
 
     pub fn block(&self, i: usize, fam: &'static str, secs: u64) {
-        log(&format!("{} blocked for {fam} for {secs}s", self.accounts[i].email));
+        log(&format!("{} blocked for {fam} for {secs}s", self.accounts()[i].email));
         let mut g = self.state.lock().unwrap();
         g.1[i].blocked.insert(fam, Instant::now() + Duration::from_secs(secs));
         g.1[i].since.insert(fam, unix_now());
@@ -468,7 +491,7 @@ impl Pool {
     /// Lifts `email`'s block for `fam` when usage fetched at `fetched` (after the block was set) shows quota again:
     /// a reset the block's own guess didn't know of. True if one was lifted.
     pub fn unblock(&self, email: &str, fam: &str, fetched: u64) -> bool {
-        let Some(i) = self.accounts.iter().position(|a| a.email == email) else { return false };
+        let Some(i) = self.accounts().iter().position(|a| a.email == email) else { return false };
         let mut g = self.state.lock().unwrap();
         let s = &mut g.1[i];
         let live = s.blocked.get(fam).is_some_and(|t| *t > Instant::now()) && s.since.get(fam).is_some_and(|t| *t < fetched);
@@ -489,7 +512,8 @@ impl Pool {
     /// Returns the account index used and the raw SSE reader.
     pub fn stream(&self, model: &str, request: &Value, beta: bool) -> Result<(usize, Box<dyn BufRead + Send>), Failure> {
         let fam = family(model);
-        let n = self.accounts.len();
+        let accounts = self.accounts();
+        let n = accounts.len();
         if n == 0 {
             return Err(fail(403, "No Antigravity accounts. Add one in ccat → Config."));
         }
@@ -501,7 +525,7 @@ impl Pool {
             if self.off(i) || self.blocked_for(i, fam).is_some() {
                 continue;
             }
-            let who = &self.accounts[i].email;
+            let who = &accounts[i].email;
             let mut token = match self.token(i, false) {
                 Ok(t) => t,
                 Err(e) => {
@@ -512,7 +536,7 @@ impl Pool {
                 }
             };
             let mut body = request.clone();
-            body["project"] = json!(self.accounts[i].project);
+            body["project"] = json!(accounts[i].project);
             let body = body.to_string();
             let (mut ep, mut refreshed) = (0, false);
             while ep < self.endpoints.len() {
@@ -591,12 +615,13 @@ impl Pool {
 
     /// One non-streaming JSON call (e.g. `countTokens`) on the sticky account. No quota rotation: callers have a fallback.
     pub fn post(&self, path: &str, body: &Value) -> Result<Value, Failure> {
-        if self.accounts.is_empty() {
+        let n = self.accounts().len();
+        if n == 0 {
             return Err(fail(403, "No Antigravity accounts."));
         }
         // The sticky account, or the first one that's on when it was turned off.
         let sticky = self.state.lock().unwrap().0;
-        let Some(i) = std::iter::once(sticky).chain(0..self.accounts.len()).find(|&i| !self.off(i)) else {
+        let Some(i) = std::iter::once(sticky).chain(0..n).find(|&i| !self.off(i)) else {
             return Err(fail(403, "Every Antigravity account is turned off."));
         };
         let token = self.token(i, false).map_err(|e| fail(403, e))?;
@@ -629,13 +654,14 @@ impl Pool {
     }
 
     fn all_blocked(&self, fam: &str) -> Failure {
-        let soonest = (0..self.accounts.len()).filter_map(|i| self.blocked_for(i, fam)).min().unwrap_or(Duration::from_secs(60));
+        let n = self.accounts().len();
+        let soonest = (0..n).filter_map(|i| self.blocked_for(i, fam)).min().unwrap_or(Duration::from_secs(60));
         let secs = soonest.as_secs().max(1);
         Failure {
             status: 429,
             message: format!(
                 "All {} Antigravity account(s) are out of {fam} quota; the next frees up in {}m{}s.",
-                self.accounts.len(),
+                n,
                 secs / 60,
                 secs % 60
             ),
@@ -669,13 +695,31 @@ impl Pool {
         let accounts: Vec<Account> = emails.iter().map(|e| Account { email: e.to_string(), refresh: String::new(), project: format!("p-{e}"), plan: String::new(), disabled: false }).collect();
         let far = Instant::now() + Duration::from_secs(3600);
         let slots = emails.iter().map(|e| Slot { token: Some((e.to_string(), far)), ..Default::default() }).collect();
-        Pool { accounts, disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: vec![endpoint.to_string()], ua: "test".into() }
+        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: vec![endpoint.to_string()], ua: "test".into() }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounts_signed_in_later_join_after_the_others() {
+        let pool = Pool::fake("http://127.0.0.1:1", &["a", "b"]);
+        pool.state.lock().unwrap().0 = 1;
+        let acc = |e: &str| Account { email: e.into(), ..Default::default() };
+        pool.add(&[acc("b"), acc("c"), acc("a")]);
+        let emails: Vec<_> = pool.accounts().iter().map(|a| a.email.clone()).collect();
+        assert_eq!(emails, ["a", "b", "c"], "appended once, the others keep their places");
+        let g = pool.state.lock().unwrap();
+        assert_eq!(g.1.len(), 3, "a slot each");
+        assert_eq!(g.0, 1, "the sticky account stays b");
+        drop(g);
+        let empty = Pool::new(Vec::new());
+        empty.add(&[acc("d")]);
+        assert!(!empty.is_empty());
+        assert!(!empty.off(0));
+    }
 
     #[test]
     fn durations() {
@@ -705,7 +749,8 @@ mod tests {
     fn cheaper_plans_go_first() {
         let acc = |e: &str, plan: &str| Account { email: e.into(), plan: plan.into(), ..Default::default() };
         let pool = Pool::new(vec![acc("pro", "g1-pro-tier"), acc("unknown", ""), acc("plus", "g1-plus-tier"), acc("free", "free-tier"), acc("free2", "free-tier")]);
-        let order: Vec<&str> = pool.accounts.iter().map(|a| a.email.as_str()).collect();
+        let accounts = pool.accounts();
+        let order: Vec<&str> = accounts.iter().map(|a| a.email.as_str()).collect();
         assert_eq!(order, ["free", "free2", "unknown", "plus", "pro"]);
         assert_eq!((plan_label("free-tier"), plan_label("g1-pro-tier"), plan_label("")), ("Free", "Pro", ""));
     }

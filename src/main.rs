@@ -346,7 +346,7 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
     let name = name.trim();
     if name.is_empty() {
         Err("Give it a name.".into())
-    } else if name.eq_ignore_ascii_case(AG_NAME) || name.eq_ignore_ascii_case(GPT_NAME) {
+    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) {
         Err("That is a built-in provider's name.".into())
     } else if providers.iter().enumerate().any(|(n, p)| n != i && p.name.eq_ignore_ascii_case(name)) {
         Err("Another provider already has that name.".into())
@@ -1711,7 +1711,7 @@ fn retarget(routes: &mut [proxy::Route], tiers: &[Route; 4], providers: &[Provid
 }
 
 /// Watches the config while a routed session runs: a model switched in ccat (Settings) reaches this
-/// session's next request.
+/// session's next request, and a Google account signed in joins its pool.
 fn follow_config(px: &proxy::Proxy) {
     let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone(), px.no_paid_fallback.clone(), px.compress_tool_results.clone());
     let stamp = || fs::metadata(config_path()).and_then(|m| m.modified()).ok();
@@ -1740,6 +1740,7 @@ fn follow_config(px: &proxy::Proxy) {
             let mut next = routes.read().unwrap().clone();
             let bad = retarget(&mut next, &cfg.tiers, &cfg.providers, &cfg.claude_models, cfg.claude_off);
             *disabled.write().unwrap() = off_accounts(&cfg.providers);
+            px.add_accounts(cfg.providers.iter().find(|p| p.antigravity).map_or(&[], |p| &p.accounts));
             let gpt = cfg.providers.iter().find(|p| p.chatgpt);
             *chatgpt.write().unwrap() = gpt.map(|p| p.chatgpt_accounts.clone()).unwrap_or_default();
             *chatgpt_models.write().unwrap() = gpt.map(|p| p.chatgpt_models.clone()).unwrap_or_default();
@@ -1784,7 +1785,8 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
         }
         {
             // Every account, used or not at launch: a tier can be switched to Antigravity while the session runs, and
-            // an account turned on again joins. Those turned off are told to the pool, which skips them.
+            // an account turned on again joins (one signed in later joins too, see `follow_config`). Those turned off are
+            // told to the pool, which skips them.
             let mut accounts = l.providers.iter().find(|p| p.antigravity).map(|p| p.accounts.clone()).unwrap_or_default();
             // Launched before the launcher learned every plan: ask now, in parallel (it orders the rotation).
             std::thread::scope(|s| {
@@ -2335,6 +2337,9 @@ mod tests {
         assert!(check_rename(&all, 1, "  ").is_err(), "an empty name would read as the official login");
         assert!(check_rename(&all, 1, "mine").is_err(), "taken, whatever the case");
         assert!(check_rename(&all, 2, "antigravity").is_err(), "the built-in's name is reserved");
+        for b in ["chatgpt", "OLLAMA", "museai"] {
+            assert!(check_rename(&all, 2, b).is_err(), "{b}: every built-in's name is reserved");
+        }
     }
 
     #[test]

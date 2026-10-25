@@ -100,5 +100,5 @@ pub(crate) fn page(ed: &mut ProvidersEditor, ui: &mut egui::Ui, cfg: &mut Config
         note(ui, "No Google accounts yet. Use + to add one.", p.subtle);
     }
     ui.add_space(6.0);
-    note(ui, "A Google account added while a session runs joins it on the next launch.", p.subtle);
+    note(ui, "A Google account added while a session runs joins it, after the accounts it already uses.", p.subtle);
 }
