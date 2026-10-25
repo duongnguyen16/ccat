@@ -50,7 +50,9 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 - **Antigravity Web Search.** Claude Code's `WebSearch` runs as Google Search grounding, and the results come back as Anthropic web-search blocks, so citations and follow-up `WebFetch` work as usual. Grounding only runs on Gemini, so a search asked of a Claude or GPT route is delegated to Gemini Flash and the result goes back to the model you picked.
 - **Image generation and editing.** ccat registers an `antigravity` MCP server with Claude Code. Its `generate_image` tool uses Gemini's image model and can take existing images as references. Files are saved relative to your project folder.
 - **Account pool with failover.** Add as many Google accounts as you like. Requests stick to one account and move to the next when Google reports quota exhaustion. Quota is tracked per model family (Gemini, Claude, GPT), so an account out of Claude quota still serves Gemini. Retry delays are read from Google's error.
-- **A provider per tier, switchable while it runs.** Fable, Opus, Sonnet and Haiku each pick their own `provider / model`: for example Fable and Opus on your official Claude login, Sonnet on Antigravity, Haiku on OpenRouter. Change a tier in the usage window's **Settings** and running sessions use it from their next request. Each tier can also have a **fallback**, tried once when its provider is down or out of quota. A whole setup of the four tiers is a **configuration**: switch, duplicate, rename, import or delete them from the button above the tiers (in the launcher and in Settings); each is a small file in `%APPDATA%\ccat\profiles\`. Claude tiers keep Claude Code's own login and plan limits; the local proxy only forwards them. **Settings → Providers** lists Claude Code, Antigravity (with each Google account) and your endpoints, each with an on/off switch: off hides it from the pickers and stops routing to it, live in running sessions.
+- **A provider per tier, switchable while it runs.** Fable, Opus, Sonnet and Haiku each pick their own `provider / model`: for example Fable and Opus on your official Claude login, Sonnet on Antigravity, Haiku on OpenRouter. Change a tier under **Settings → Models & tiers** and running sessions use it from their next request. Each tier can also have an ordered **fallback chain**, tried in turn when its provider is down or out of quota. A whole setup of the four tiers is a **configuration**: switch, duplicate, rename, import or delete them from the button above the tiers (in the launcher and in Settings); each is a small file in `%APPDATA%\ccat\profiles\`. Claude tiers keep Claude Code's own login and plan limits; the local proxy only forwards them. The provider pages (**Settings → Claude**, **Antigravity**, **ChatGPT**, **Ollama**, **MuseAI** and each endpoint) have an on/off switch: off hides it from the pickers and stops routing to it, live in running sessions.
+- **Routing safeguards.** **Settings → Routing** has *Wait out usage limits* (when every route and fallback of a request is at its limit, the request waits instead of failing; Esc still cancels) and *Never fall back to a paid API key* (custom endpoints are skipped as fallbacks; a tier's own first choice still runs). A circuit breaker skips a provider for 30 s after 3 consecutive 5xx or timeouts, then lets one request probe it; 429s never trip it, and if every route is skipped all of them are tried.
+- **Token saving.** **Settings → Token saving** has an opt-in *Compress tool output (third-party models)*: a lossless cleanup of Bash/PowerShell command output only (ANSI colours, progress redraws rendered like a terminal, trailing spaces, runs of identical lines). It is deterministic, so provider prompt caches keep hitting, and it never touches Claude, error results or file reads.
 - **Claude names for any model.** A non-official tier can be presented to Claude Code under a Claude model name. Claude Code then applies that model's catalog entry (context window, thinking), while the request still goes to the real model.
 - **Faithful translation.** Streaming and non-streaming Messages ↔ Cloud Code `streamGenerateContent`, thinking blocks and their signatures (safe across model switches and resumed sessions), and tool schemas normalized to what every Antigravity model family accepts.
 - **Quota status line.** One PowerShell script feeds both status lines: in `agy` it records the quota Antigravity hands it, and in Claude Code it shows that quota next to context use and your Claude plan limits, as smooth bars:
@@ -61,7 +63,7 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 
   The Gemini bucket shows in `agy`'s line only. The Claude/GPT bucket (`◇`) appears only when a tier runs a non-Gemini model on Antigravity.
 
-- **Usage tray (Windows).** While any ccat runs, one tray icon shows your quota as a dial: Claude's 5-hour percent above, Antigravity's below, each inside a half ring of its weekly use (one source alone takes the whole dial). Click it for the window: **Usage** lists every Claude limit and Antigravity's Gemini and Claude groups (all Google accounts combined or one at a time), **Analytics** charts the tokens ccat's proxy has seen per day by model or provider, and **Settings** switches tier models and configurations live. However many ccat sessions run, there is one icon and one window. Claude's numbers come from Claude Code's own login, which ccat reads but never refreshes.
+- **Usage tray (Windows).** While any ccat runs, one tray icon shows your quota as a dial: Claude's 5-hour percent above, Antigravity's below, each inside a half ring of its weekly use (one source alone takes the whole dial). Click it for the window: **Usage** lists every Claude limit and Antigravity's Gemini and Claude groups (all Google accounts combined or one at a time), and **Analytics** charts the tokens ccat's proxy has seen per day by model or provider. Its gear button, like the launcher's settings button and the icon's right-click **Settings**, opens the Settings window (`ccat --ccat-settings [page]`, one instance), where tier models and configurations switch live. However many ccat sessions run, there is one icon and one usage window. Claude's numbers come from Claude Code's own login, which ccat reads but never refreshes.
 - **Stays current.** The backend gates newer models on the client version, so ccat reports the live Antigravity release version, and the list of Claude model names comes from [models.dev](https://models.dev), checked at most every six hours.
 
 ## Providers
@@ -71,15 +73,15 @@ What Antigravity (the IDE / `agy` CLI) offers, and where ccat stands on each:
 | **Claude** (official)                      | Your normal Claude Code login. A tier left at Claude with Claude Code's pick changes nothing; all four there is plain `claude`.                                                                                     |
 | **Google Antigravity**                     | Sign in with one or more Google accounts in the browser. ccat provisions the Cloud Code project, lists the models your accounts can use, and serves them through a local proxy while Claude Code runs.            |
 | **ChatGPT**                                | Your ChatGPT Plus/Pro plan behind Claude Code: the GPT models Codex uses, signed in the way Codex signs in. See [ChatGPT](#chatgpt) and [ccat vs Codex](#ccat-vs-codex).                                         |
-| **Ollama**                                 | Run local models (Qwen, Llama, DeepSeek) through Ollama. ccat translates Anthropic Messages to Ollama's OpenAI Chat Completions API with 64k context and thinking/tool support. No API key needed.            |
-| **MuseAI**                                 | Sign in with your MuseAI account in Chrome (the **+** under **Settings → Providers → MuseAI**). ccat bridges Anthropic Messages to Meta's Hatch VM Gateway with isolated sessions and buffered replies. |
-| **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. |
+| **Ollama**                                 | Run local models (Qwen, Llama, DeepSeek) through Ollama. ccat translates Anthropic Messages to Ollama's native `/api/chat` with a fixed 64k `num_ctx` and `keep_alive` 30m (the OpenAI-compatible API ignores both), effort mapped to low/medium/high thinking (models without thinking support are retried without it), and tool support. No key needed for a local Ollama. |
+| **MuseAI**                                 | Sign in with your MuseAI account in Chrome (the **+** under **Settings → MuseAI**). ccat bridges Anthropic Messages to Meta's Hatch VM Gateway with isolated sessions and buffered replies. |
+| **Anthropic-compatible endpoint** (custom) | Any server that speaks the Anthropic Messages API: OpenRouter, an API gateway, a local model server. Set a URL and key, **Fetch model list** (Anthropic- or OpenAI-style `/v1/models`), or type custom model ids. Claude Code's per-request billing line is stripped from the system prompt so the endpoint's prompt cache sees a stable prefix. |
 
-Providers are connections: add, rename, turn off and delete them in **Settings → Providers** (or **Config** in the launcher), then pick `provider / model` for each tier in the launcher. With every tier on Claude and no fallback, ccat runs plain `claude`, straight to Anthropic; anything else goes through the local proxy, which is what lets a session switch models and fall back while it runs.
+Providers are connections: add, rename, turn off and delete them in **Settings** (the sidebar lists Claude, the built-ins and each endpoint, plus **+ Add endpoint**; the launcher's settings button opens it), then pick `provider / model` for each tier in the launcher. With every tier on Claude and no fallback, ccat runs plain `claude`, straight to Anthropic; anything else goes through the local proxy, which is what lets a session switch models and fall back while it runs.
 
 ## ChatGPT
 
-Use your ChatGPT plan, not an API key, for the GPT models. ccat shares **Codex CLI's login**: sign in with `codex login` (the **+** under **Settings → Providers → ChatGPT** opens a terminal for it) and that account shows up in ccat, with its plan. ccat reads Codex's `~/.codex/auth.json` fresh on every request and never refreshes, writes or signs it out — Codex keeps it fresh whenever it runs.
+Use your ChatGPT plan, not an API key, for the GPT models. ccat shares **Codex CLI's login**: sign in with `codex login` (the **+** under **Settings → ChatGPT** opens a terminal for it) and that account shows up in ccat, with its plan. ccat reads Codex's `~/.codex/auth.json` fresh on every request and never refreshes, writes or signs it out — Codex keeps it fresh whenever it runs.
 
 Why not a sign-in of ccat's own: a second sign-in with Codex's login client makes OpenAI revoke the earlier sessions, which signs you out of Codex on every device. Sharing the one session avoids that. Requests go to the Codex backend (`chatgpt.com/backend-api/codex`), the way Codex CLI sends them; OpenAI doesn't officially support that for other apps, so it may change. If the login is revoked or expires, ccat says so ("run `codex login`") instead of retrying.
 
@@ -128,7 +130,7 @@ MuseAI runs inside ccat using native Rust HTTPS, Noise WebSocket encryption and 
 | **Image & video generation** | Deferred | Out of scope | Low priority for core coding workflows; focused on coding agent loops. |
 
 ### Technical Architecture
-- **Native gateway**: `src/museai/native.rs` owns HTTPS authentication and each Noise connection. Chat does not spawn Python or Chromium. Protocol attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
+- **Native gateway**: `src/providers/museai/native.rs` owns HTTPS authentication and each Noise connection. Chat does not spawn Python or Chromium. Protocol attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
 - **GUI Management**: Providers view offers a one-click **+** sign-in action in Chrome with automatic account discovery, session validation, and model refresh.
 
 Unit-test builds store ccat configuration under a process-specific temporary directory, including launcher shutdown saves. They never save test profiles to the installed app's configuration. Live Muse checks are opt-in: `cargo test live_native_ -- --ignored --test-threads=1`. These checks use the existing Muse login, spend a few requests and delete their temporary remote sessions.
@@ -157,7 +159,7 @@ cd ccat
 cargo install --path .
 ```
 
-Check it with `ccat --version`. Then run `ccat` in any terminal: add your first provider under **Config**, pick a folder and press **Launch**.
+Check it with `ccat --version`. Then run `ccat` in any terminal: add your first provider in **Settings**, pick a folder and press **Launch**.
 
 Developed and used on Windows. The UI (egui) and the proxy are cross-platform, but macOS and Linux are untested.
 
@@ -195,10 +197,19 @@ claude ──► ccat proxy (127.0.0.1, random port, per-launch token)
              └─ /mcp                  ──► generate_image (Gemini image model)
 ```
 
+- Official Claude requests are forwarded byte-for-byte as Claude Code sent them. Only when a tier swaps the model, or another provider's thinking must be dropped, is the body rewritten, keeping key order.
+
 - The proxy binds to `127.0.0.1` only, on a random port. Antigravity and endpoint tiers spend your accounts and keys, so they answer only requests carrying the token generated for that launch (sent as an `x-ccat-token` header). Official tiers carry only the caller's own login.
 - Several ccat sessions can run at once: each has its own proxy, which follows model changes in the config; the config is saved atomically and merged field by field, and log lines carry the process id. Token counts for **Analytics** go to `tokens.jsonl` next to the config, one line per request.
 - Config, including the Google refresh tokens, is stored in `%APPDATA%\ccat\config.json` (`$XDG_CONFIG_HOME/ccat` or `~/.config/ccat` elsewhere). Keep that file private.
 - Proxy logs go to `antigravity.log` next to the config, since Claude Code owns the terminal while ccat runs.
+
+### Source layout
+
+- `src/proxy/`: `mod` (routing, fallback chains, breaker use), `http`, `sse`, `compress` (tool-output cleanup), `breaker`.
+- `src/providers/`: `claude`, `endpoint`, `antigravity/`, `chatgpt/`, `ollama`, `museai/`. Each owns its auth, translation, pooling, web search, usage and its Settings page.
+- `src/settings/`: the Settings window, its sidebar and the provider editor state its provider pages share.
+- `src/common.rs`: helpers shared across the above.
 
 ## Notes
 
