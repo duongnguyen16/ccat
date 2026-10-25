@@ -16,6 +16,10 @@ use std::{
 };
 
 use crate::common::{agent, fail, log, log_path, random_hex, Failure};
+use crate::usage::{parse_time, Bar, FIVE_HOURS, WEEK};
+
+pub(crate) mod mcp;
+pub(crate) mod proxy;
 
 const ENDPOINTS: [&str; 2] = ["https://daily-cloudcode-pa.googleapis.com", "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 // Antigravity's public desktop OAuth client; base64 only so secret scanners leave it alone.
@@ -636,6 +640,24 @@ impl Pool {
             retry_after: Some(secs),
         }
     }
+}
+
+// ---------------------------------------------------------------- usage
+
+/// Bars from `retrieveUserQuotaSummary`: per group (Gemini, Claude & GPT), its 5-hour and weekly buckets.
+pub fn parse_ag(v: &Value) -> Vec<Bar> {
+    let mut bars = Vec::new();
+    for b in v["groups"].as_array().into_iter().flatten().flat_map(|g| g["buckets"].as_array().into_iter().flatten()) {
+        let id = b["bucketId"].as_str().unwrap_or("");
+        // The second group is Claude, Sonnet and GPT-OSS; Claude is what anyone here uses it for.
+        let group = if id.starts_with("gemini") { "Gemini" } else { "Claude" };
+        let (window, label) = if b["window"] == "5h" || id.ends_with("5h") { (FIVE_HOURS, "5hr") } else { (WEEK, "Weekly") };
+        let used = (1.0 - b["remainingFraction"].as_f64().unwrap_or(1.0)) * 100.0;
+        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window, ..Default::default() });
+    }
+    // Session before weekly within a group, as in the Claude section.
+    bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
+    bars
 }
 
 #[cfg(test)]

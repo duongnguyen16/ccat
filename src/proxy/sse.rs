@@ -4,7 +4,7 @@
 
 use super::http::error_kind;
 use super::Ctx;
-use crate::antigravity::family;
+use crate::providers::antigravity::family;
 use crate::common::{self, Failure};
 use serde_json::{json, Value};
 use std::{
@@ -17,12 +17,12 @@ use std::{
 
 /// Tokens one image costs. ponytail: a flat middle-of-the-road figure (Gemini 3 default resolution ≈1120, a
 /// ~1000px Claude image ≈1300); size images properly if `/context` ever needs to be exact for screenshots.
-pub(super) const IMAGE_TOKENS: u64 = 1100;
+pub(crate) const IMAGE_TOKENS: u64 = 1100;
 /// Before the first real response: the classic bytes/4.
-pub(super) const DEFAULT_RATIO: f64 = 0.25;
+pub(crate) const DEFAULT_RATIO: f64 = 0.25;
 
 /// Text bytes and image count of an Anthropic request: base64 media (`data`) would swamp a bytes-per-token ratio.
-pub(super) fn weigh(v: &Value) -> (u64, u64) {
+pub(crate) fn weigh(v: &Value) -> (u64, u64) {
     match v {
         Value::Object(m) => m.iter().fold((0, 0), |(b, i), (k, v)| match (k.as_str(), v) {
             ("data", Value::String(_)) => (b, i + 1),
@@ -39,7 +39,7 @@ pub(super) fn weigh(v: &Value) -> (u64, u64) {
 
 impl Ctx {
     /// Remembers how a real request of `fam` tokenized; a moving average so one odd turn doesn't swing it.
-    pub(super) fn learn(&self, fam: &'static str, req: &Value, prompt_tokens: u64) {
+    pub(crate) fn learn(&self, fam: &'static str, req: &Value, prompt_tokens: u64) {
         let (bytes, images) = weigh(req);
         if bytes == 0 || prompt_tokens == 0 {
             return;
@@ -50,7 +50,7 @@ impl Ctx {
         g.insert(fam, next);
     }
 
-    pub(super) fn estimate(&self, fam: &str, req: &Value) -> u64 {
+    pub(crate) fn estimate(&self, fam: &str, req: &Value) -> u64 {
         let (bytes, images) = weigh(req);
         let r = self.ratio.lock().unwrap().get(fam).copied().unwrap_or(DEFAULT_RATIO);
         (bytes as f64 * r).round() as u64 + images * IMAGE_TOKENS
@@ -59,18 +59,18 @@ impl Ctx {
 
 /// Signatures handed to Claude Code are tagged with the model family that made them, so a resumed session
 /// on another model (or Anthropic's own signatures) never reaches Google as a "corrupted" signature.
-pub(super) fn tag(fam: &str, sig: &str) -> String {
+pub(crate) fn tag(fam: &str, sig: &str) -> String {
     format!("ag:{fam}:{sig}")
 }
 
-pub(super) fn untag<'a>(sig: Option<&'a str>, fam: &str) -> Option<&'a str> {
+pub(crate) fn untag<'a>(sig: Option<&'a str>, fam: &str) -> Option<&'a str> {
     let s = sig?.strip_prefix("ag:")?.strip_prefix(fam)?.strip_prefix(':')?;
     let base64 = !s.is_empty() && s.len() % 4 == 0 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
     base64.then_some(s)
 }
 
 /// Anthropic content: a string or a block array.
-pub(super) fn blocks(content: &Value) -> Vec<Value> {
+pub(crate) fn blocks(content: &Value) -> Vec<Value> {
     match content {
         Value::String(t) => vec![json!({ "type": "text", "text": t })],
         Value::Array(a) => a.clone(),
@@ -121,49 +121,49 @@ pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
 }
 
 #[derive(Debug)]
-pub(super) enum Stop {
+pub(crate) enum Stop {
     /// Nothing reached Claude Code yet: try again (optionally blocking the account for that many seconds).
     Retry(Failure, Option<u64>),
     /// The client hung up, or the error already went out as an SSE `error` event.
     Gone,
 }
 
-pub(super) struct Tx<'a> {
-    pub(super) out: Option<&'a mut TcpStream>,
-    pub(super) sigs: &'a Mutex<HashMap<String, String>>,
-    pub(super) model: String,
-    pub(super) fam: &'static str,
-    pub(super) id: String,
+pub(crate) struct Tx<'a> {
+    pub(crate) out: Option<&'a mut TcpStream>,
+    pub(crate) sigs: &'a Mutex<HashMap<String, String>>,
+    pub(crate) model: String,
+    pub(crate) fam: &'static str,
+    pub(crate) id: String,
     /// Some content was produced (and, when streaming, sent).
-    pub(super) started: bool,
-    pub(super) blocks: Vec<Value>,
-    pub(super) open: Option<&'static str>,
+    pub(crate) started: bool,
+    pub(crate) blocks: Vec<Value>,
+    pub(crate) open: Option<&'static str>,
     /// Signature for the open thinking block (already tagged: `ag:…` or `oa:…`), emitted as `signature_delta` when it closes.
-    pub(super) sig: String,
+    pub(crate) sig: String,
     /// Leading whitespace held back so an empty answer can still be retried.
-    pub(super) pending: String,
-    pub(super) usage: (u64, u64, u64),
-    pub(super) finish: Option<String>,
-    pub(super) finish_note: String,
-    pub(super) stop_reason: &'static str,
+    pub(crate) pending: String,
+    pub(crate) usage: (u64, u64, u64),
+    pub(crate) finish: Option<String>,
+    pub(crate) finish_note: String,
+    pub(crate) stop_reason: &'static str,
     /// Google Search grounding: the queries run and the pages cited, (url, title), replayed as Anthropic web-search blocks.
-    pub(super) queries: Vec<String>,
-    pub(super) links: Vec<(String, String)>,
+    pub(crate) queries: Vec<String>,
+    pub(crate) links: Vec<(String, String)>,
     // ---- ChatGPT (Responses API) only
     /// Arguments streamed so far into the open function call.
-    pub(super) args: String,
+    pub(crate) args: String,
     /// `response.completed` / `response.incomplete` arrived.
-    pub(super) done: bool,
-    pub(super) max_tokens: bool,
+    pub(crate) done: bool,
+    pub(crate) max_tokens: bool,
     /// Tools go out in a namespace, so a returned call name may carry its prefix.
-    pub(super) wrap: bool,
+    pub(crate) wrap: bool,
     /// What an `unsupported_capability` failure named (`error.param`): the caller may retry without it.
-    pub(super) param: String,
+    pub(crate) param: String,
 }
 
 impl<'a> Tx<'a> {
     /// `model` is what runs; replies name `shown`, the model Claude Code asked for.
-    pub(super) fn new(model: &str, shown: &str, out: Option<&'a mut TcpStream>, sigs: &'a Mutex<HashMap<String, String>>) -> Self {
+    pub(crate) fn new(model: &str, shown: &str, out: Option<&'a mut TcpStream>, sigs: &'a Mutex<HashMap<String, String>>) -> Self {
         Tx {
             out,
             sigs,
@@ -189,7 +189,7 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub(super) fn usage_json(&self) -> Value {
+    pub(crate) fn usage_json(&self) -> Value {
         let (prompt, cached, output) = self.usage;
         let mut u = json!({ "input_tokens": prompt - cached, "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0, "output_tokens": output });
         if !self.queries.is_empty() {
@@ -198,12 +198,12 @@ impl<'a> Tx<'a> {
         u
     }
 
-    pub(super) fn send(&mut self, name: &str, data: Value) -> Result<(), Stop> {
+    pub(crate) fn send(&mut self, name: &str, data: Value) -> Result<(), Stop> {
         let Some(s) = self.out.as_deref_mut() else { return Ok(()) };
         write!(s, "event: {name}\ndata: {data}\n\n").and_then(|_| s.flush()).map_err(|_| Stop::Gone)
     }
 
-    pub(super) fn begin(&mut self) -> Result<(), Stop> {
+    pub(crate) fn begin(&mut self) -> Result<(), Stop> {
         if self.started {
             return Ok(());
         }
@@ -218,7 +218,7 @@ impl<'a> Tx<'a> {
         self.send("message_start", json!({ "type": "message_start", "message": message }))
     }
 
-    pub(super) fn close(&mut self) -> Result<(), Stop> {
+    pub(crate) fn close(&mut self) -> Result<(), Stop> {
         let Some(kind) = self.open.take() else { return Ok(()) };
         let index = self.blocks.len() - 1;
         if kind == "tool" {
@@ -234,7 +234,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Opens a `text` or `thinking` block unless one of that kind is open.
-    pub(super) fn open_block(&mut self, kind: &'static str) -> Result<(), Stop> {
+    pub(crate) fn open_block(&mut self, kind: &'static str) -> Result<(), Stop> {
         if self.open != Some(kind) {
             self.close()?;
             self.begin()?;
@@ -246,7 +246,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    pub(super) fn delta(&mut self, kind: &'static str, text: &str) -> Result<(), Stop> {
+    pub(crate) fn delta(&mut self, kind: &'static str, text: &str) -> Result<(), Stop> {
         self.open_block(kind)?;
         let index = self.blocks.len() - 1;
         let block = &mut self.blocks[index][kind];
@@ -255,7 +255,7 @@ impl<'a> Tx<'a> {
         self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": delta }))
     }
 
-    pub(super) fn text(&mut self, text: &str) -> Result<(), Stop> {
+    pub(crate) fn text(&mut self, text: &str) -> Result<(), Stop> {
         if !self.started && text.trim().is_empty() {
             self.pending.push_str(text);
             return Ok(());
@@ -265,7 +265,7 @@ impl<'a> Tx<'a> {
     }
 
     /// A `tool_use` (or `server_tool_use`) block, sent whole: Cloud Code hands over function calls complete.
-    pub(super) fn tool(&mut self, kind: &str, id: String, name: &str, args: Value) -> Result<(), Stop> {
+    pub(crate) fn tool(&mut self, kind: &str, id: String, name: &str, args: Value) -> Result<(), Stop> {
         self.close()?;
         self.begin()?;
         let index = self.blocks.len();
@@ -277,7 +277,7 @@ impl<'a> Tx<'a> {
     }
 
     /// A function call opens a `tool_use` block; its arguments stream into it.
-    pub(super) fn call_start(&mut self, id: &str, name: &str) -> Result<(), Stop> {
+    pub(crate) fn call_start(&mut self, id: &str, name: &str) -> Result<(), Stop> {
         self.close()?;
         self.begin()?;
         let index = self.blocks.len();
@@ -288,7 +288,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    pub(super) fn call_args(&mut self, part: &str) -> Result<(), Stop> {
+    pub(crate) fn call_args(&mut self, part: &str) -> Result<(), Stop> {
         if self.open != Some("tool") || part.is_empty() {
             return Ok(());
         }
@@ -297,13 +297,13 @@ impl<'a> Tx<'a> {
         self.send("content_block_delta", json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": part } }))
     }
 
-    pub(super) fn heartbeat(&mut self) -> Result<(), Stop> {
+    pub(crate) fn heartbeat(&mut self) -> Result<(), Stop> {
         self.begin()?;
         self.send("ping", json!({"type":"ping"}))
     }
 
     /// OpenAI-compatible Chat Completions SSE stream -> Anthropic events.
-    pub(super) fn run_openai_chat(&mut self, reader: Box<dyn BufRead + Send>, provider: &str) -> Result<(), Stop> {
+    pub(crate) fn run_openai_chat(&mut self, reader: Box<dyn BufRead + Send>, provider: &str) -> Result<(), Stop> {
         let mut in_think = false;
         let mut current_tool_idx: Option<u64> = None;
 
@@ -437,7 +437,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Fails the request: retryable while nothing was sent, otherwise an SSE `error` event (overloaded → Claude Code retries).
-    pub(super) fn fail(&mut self, f: Failure, block: Option<u64>) -> Stop {
+    pub(crate) fn fail(&mut self, f: Failure, block: Option<u64>) -> Stop {
         if self.started && self.out.is_some() {
             // Overloaded makes Claude Code retry; a client error must not, or it retries a dead request for ever.
             let kind = match f.status {
@@ -452,11 +452,35 @@ impl<'a> Tx<'a> {
         Stop::Retry(f, block)
     }
 
-    pub(super) fn message(&self) -> Value {
+    pub(crate) fn message(&self) -> Value {
         json!({
             "id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": self.blocks,
             "stop_reason": self.stop_reason, "stop_sequence": null, "usage": self.usage_json(),
         })
+    }
+
+    /// Grounding comes back as metadata, not as a tool call; Claude Code's WebSearch reads it from these two blocks.
+    /// ponytail: one search block for all queries, with the cited pages; links are Google's redirect URLs, not resolved.
+    pub(crate) fn search_results(&mut self) -> Result<(), Stop> {
+        if self.queries.is_empty() && self.links.is_empty() {
+            return Ok(());
+        }
+        if self.queries.is_empty() {
+            self.queries.push(String::new());
+        }
+        let id = format!("srvtoolu_{}", common::random_hex(12));
+        self.tool("server_tool_use", id.clone(), "web_search", json!({ "query": self.queries.join("; ") }))?;
+        let results: Vec<Value> = self
+            .links
+            .iter()
+            .map(|(url, title)| json!({ "type": "web_search_result", "url": url, "title": title, "encrypted_content": "", "page_age": null }))
+            .collect();
+        let block = json!({ "type": "web_search_tool_result", "tool_use_id": id, "content": results });
+        let index = self.blocks.len();
+        self.send("content_block_start", json!({ "type": "content_block_start", "index": index, "content_block": block }))?;
+        self.send("content_block_stop", json!({ "type": "content_block_stop", "index": index }))?;
+        self.blocks.push(block);
+        Ok(())
     }
 }
 

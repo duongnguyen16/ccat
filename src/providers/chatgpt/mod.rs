@@ -7,10 +7,13 @@
 //! share these accounts, so refreshes (the refresh token rotates; using an old one is a terminal error) are serialised
 //! across processes by a lock file. The UI process signs in and out; the proxy only reads.
 
+pub(crate) mod proxy;
+
 use crate::{
     common::{agent, log, Failure},
     now,
 };
+use crate::usage::{plan_name, Bar, FIVE_HOURS, WEEK};
 use base64::{
     engine::general_purpose::URL_SAFE_NO_PAD as B64U,
     Engine,
@@ -786,6 +789,71 @@ impl Pool {
             return Err(with_reset(classify(status, &code, &message, &param), &serde_json::from_str(&text).unwrap_or_default()));
         }
     }
+}
+
+// ---------------------------------------------------------------- usage
+
+/// (plan, bars) from `/backend-api/wham/usage`: its primary (5-hour) and secondary (weekly) rate-limit windows.
+pub fn parse_wham(v: &Value, now: u64) -> (String, Vec<Bar>) {
+    let window = |w: &Value, label: &str, default: u64| {
+        let used = w["used_percent"].as_f64()?;
+        let resets = w["reset_at"].as_u64().filter(|r| *r > 0).or_else(|| w["reset_after_seconds"].as_u64().map(|s| now + s)).unwrap_or(0);
+        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default), ..Default::default() })
+    };
+    let limit = &v["rate_limit"];
+    let bars = [window(&limit["primary_window"], "Session (5hr)", FIVE_HOURS), window(&limit["secondary_window"], "Weekly (7 day)", WEEK)].into_iter().flatten().collect();
+    (plan_name(v["plan_type"].as_str().unwrap_or(""), ""), bars)
+}
+
+/// Whether there is a login to ask with: a ChatGPT account signed in to ccat (Codex CLI's own login is not used).
+pub(crate) fn gpt_has_login(cfg: &crate::Config) -> bool {
+    cfg.providers.iter().filter(|p| p.chatgpt).flat_map(|p| &p.chatgpt_accounts).any(|a| a.codex() && a.usable())
+}
+
+/// The usage call, with each login in turn (ccat's own Codex-route accounts first, then Codex CLI's, read only) until one
+/// answers. Tokens and the account id are never logged.
+pub(crate) fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (String, u64)> {
+    let mut logins: Vec<(String, String, bool)> = Vec::new();
+    for a in cfg.providers.iter().filter(|p| p.chatgpt).flat_map(|p| &p.chatgpt_accounts).filter(|a| a.codex() && a.usable()) {
+        let login = if a.cli() { codex_cli_tokens().ok_or_else(String::new) } else { codex_token(&a.key) };
+        if let Ok((t, id)) = login {
+            logins.push((t, id, true));
+        }
+    }
+    let mut last = ("ChatGPT sign-in expired: sign in again in Settings → Providers.".to_string(), 0);
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
+    for (token, id, _) in logins {
+        let sent = agent
+            .get(WHAM_USAGE)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("ChatGPT-Account-Id", id)
+            .header("User-Agent", "codex-cli")
+            .header("Accept", "application/json")
+            .call();
+        let mut res = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                last = (format!("Can't reach ChatGPT: {e}"), 0);
+                continue;
+            }
+        };
+        let status = res.status().as_u16();
+        let retry = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+        let body = res.body_mut().read_to_string().unwrap_or_default();
+        match status {
+            200 => match serde_json::from_str::<Value>(&body) {
+                Ok(v) => return Ok(parse_wham(&v, now())),
+                Err(e) => last = (format!("Unreadable answer: {e}"), 0),
+            },
+            401 | 403 => last = ("ChatGPT login expired: sign in again in ccat.".into(), 0),
+            429 => {
+                let wait = retry.unwrap_or(300).max(60);
+                return Err((format!("Rate limited, trying again in {} min.", wait.div_ceil(60)), wait));
+            }
+            s => last = (format!("ChatGPT answered {s}."), 0),
+        }
+    }
+    Err(last)
 }
 
 #[cfg(test)]

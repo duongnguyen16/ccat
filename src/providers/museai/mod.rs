@@ -3,11 +3,15 @@
 mod native;
 mod login;
 
-use crate::common::Failure;
+use crate::common::{self, Failure};
+use crate::usage::{dirs_home, Bar, WEEK};
+use crate::proxy::http::{record, respond, respond_error, Req};
+use crate::proxy::sse::{Stop, Tx};
+use crate::proxy::{Ctx, Fail};
 use native::{fail, Gateway};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fs, io::{self, BufRead, BufReader, Read, Cursor}, path::{Path, PathBuf}, process::Command,
+use std::{fs, io::{self, BufRead, BufReader, Read, Cursor}, net::TcpStream, path::{Path, PathBuf}, process::Command,
     sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc::{self, Receiver, SyncSender}}, time::{Duration, Instant}};
 
 // Keep saved provider configurations working without rewriting the user's config.
@@ -343,9 +347,111 @@ fn remote_open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box
     Ok(Box::new(BufReader::new(response.into_body().into_reader())))
 }
 
+// ---------------------------------------------------------------- usage
+
+pub(crate) fn parse_muse(v: &Value) -> (String, Vec<Bar>) {
+    let obs = v.get("observedState").or_else(|| v.get("sourceAnalysis").and_then(|s| s.get("observedState"))).unwrap_or(v);
+    let plan = obs["tier"].as_str().unwrap_or("Free plan").to_string();
+    let reset = obs["resetDisplayString"].as_str().unwrap_or("");
+    let reset = reset.strip_prefix("Weekly limit resets ").map(|s| format!("Resets {s}")).unwrap_or_else(|| reset.into());
+    (plan, vec![
+        Bar { label: "Weekly (7 day)".into(), used: obs["weeklyUsagePercent"].as_f64().unwrap_or(0.0), window: WEEK, reset_label: reset, ..Default::default() },
+        Bar { label: "Additional tokens".into(), used: obs["additionalTokensUsagePercent"].as_f64().unwrap_or(0.0), reset_label: obs["additionalTokensExpiration"].as_str().unwrap_or("").into(), ..Default::default() },
+    ])
+}
+
+/// Reads MuseAI quota and reset text from the existing local session cache.
+pub(crate) fn fetch_muse(_p: &crate::Provider) -> Result<(String, Vec<Bar>), String> {
+    // Read synced live usage from ~/.config/muse-cli/usage.json
+    let usage_path = dirs_home().join(".config").join("muse-cli").join("usage.json");
+    if let Ok(content) = fs::read_to_string(&usage_path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&content) {
+            return Ok(parse_muse(&v));
+        }
+    }
+
+    let cookie_file = dirs_home().join(".config").join("muse-cli").join("cookies.txt");
+    if !cookie_file.exists() {
+        return Err("No MuseAI account found. Use + in Settings → Providers to sign in.".into());
+    }
+
+    Err("Usage not yet synced. Sign in via + in Providers or run a query.".into())
+}
+
+// ---------------------------------------------------------------- proxy: Anthropic → OpenAI Chat Completions
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn muse_messages(
+    s: &mut TcpStream,
+    ctx: &Ctx,
+    _req: &Req,
+    body: &Value,
+    asked: &str,
+    model: &str,
+    url: &str,
+    key: &str,
+    tier: &str,
+    may_fail: Fail,
+) -> Result<(), Failure> {
+    if model.is_empty() {
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
+    }
+    let stream = body["stream"].as_bool().unwrap_or(false);
+
+    let payload = crate::providers::museai::chat_body(body, model, true);
+    let key_opt = (!key.trim().is_empty()).then_some(key);
+    let reader = match crate::providers::museai::open(url, key_opt, &payload) {
+        Ok(r) => r,
+        Err(f) => {
+            common::log(&format!("{model} via MuseAI ({url}): {} {}", f.status, f.message));
+            if may_fail.takes(f.status) {
+                return Err(f);
+            }
+            respond_error(s, &f);
+            return Ok(());
+        }
+    };
+
+    let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+    match tx.run_openai_chat(reader, "MuseAI") {
+        Ok(()) => {
+            let msg = tx.message();
+            let prompt = tx.usage.0;
+            drop(tx);
+            record(tier, crate::providers::MUSE_NAME, model, &msg["usage"]);
+            ctx.learn("muse", body, prompt);
+            if !stream {
+                respond(s, 200, &msg, "");
+            }
+            Ok(())
+        }
+        Err(Stop::Retry(f, _)) if may_fail.takes(f.status) => Err(f),
+        Err(Stop::Retry(f, _)) => {
+            respond_error(s, &f);
+            Ok(())
+        }
+        Err(Stop::Gone) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn muse_usage_preserves_reset_text_without_plan_or_balance_rows() {
+        let observed = serde_json::json!({"tier":"Free plan","weeklyUsagePercent":1.0,"resetDisplayString":"Weekly limit resets on Oct 28","additionalTokensBalance":"1B tokens left","additionalTokensUsagePercent":0.0,"additionalTokensExpiration":"Never expires"});
+        for value in [observed.clone(), serde_json::json!({"observedState":observed}), serde_json::json!({"sourceAnalysis":{"observedState":observed}})] {
+            let (plan, bars) = parse_muse(&value);
+            assert_eq!(plan, "Free plan");
+            assert!(bars.iter().all(|bar| bar.part.is_empty()));
+            assert_eq!(bars[0].used, 1.0);
+            assert_eq!(bars[0].reset_label, "Resets on Oct 28");
+            assert_eq!(bars[1].label, "Additional tokens");
+            assert_eq!(bars[1].reset_label, "Never expires");
+        }
+    }
 
     #[test]
     #[ignore = "validates a private local request fixture supplied as CCAT_CAPTURED_REQUEST"]

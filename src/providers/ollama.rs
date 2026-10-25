@@ -2,10 +2,15 @@
 //! Protocol: translates Anthropic Messages API -> Ollama `/v1/chat/completions`, streaming SSE chunks,
 //! quota/balance tracking via `/api/balance`, and web search via `/api/web_search`.
 
-use crate::common::Failure;
+use crate::common::{self, Failure};
+use crate::providers::antigravity::proxy::messages;
+use crate::proxy::http::{record, respond, respond_error, Req};
+use crate::proxy::sse::{Stop, Tx};
+use crate::proxy::{Ctx, Fail, SEARCH_MODEL};
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader},
+    net::TcpStream,
     time::Duration,
 };
 
@@ -453,6 +458,100 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
             message: format!("Ollama returned {status}: {err_body}"),
             retry_after: None,
         })
+    }
+}
+
+// ---------------------------------------------------------------- proxy: Anthropic → OpenAI Chat Completions
+
+/// An Ollama route: the request goes to Ollama's local OpenAI-compatible endpoint.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ollama_messages(
+    s: &mut TcpStream,
+    ctx: &Ctx,
+    _req: &Req,
+    body: &Value,
+    asked: &str,
+    model: &str,
+    url: &str,
+    key: &str,
+    tier: &str,
+    may_fail: Fail,
+) -> Result<(), Failure> {
+    if model.is_empty() {
+        respond_error(s, &Failure { status: 400, message: "no model in request".into(), retry_after: None });
+        return Ok(());
+    }
+    let stream = body["stream"].as_bool().unwrap_or(false);
+
+    // WebSearch support:
+    // If an Ollama Cloud API key is available, query Ollama's native web search endpoint!
+    // Otherwise, delegate to Gemini Flash if Antigravity is active.
+    if crate::proxy::web_search(body).is_some() {
+        let q = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| {
+            if let Some(s) = m["content"].as_str() {
+                Some(s.to_string())
+            } else if let Some(arr) = m["content"].as_array() {
+                arr.iter().find_map(|b| b["text"].as_str()).map(String::from)
+            } else {
+                None
+            }
+        }).unwrap_or_default();
+
+        if !key.trim().is_empty() {
+            if let Ok(links) = crate::providers::ollama::web_search(url, key, &q) {
+                let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+                tx.queries = vec![q];
+                tx.links = links;
+                let _ = tx.search_results();
+                let _ = tx.begin();
+                let (usage, stop) = (tx.usage_json(), "end_turn");
+                let _ = tx.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }));
+                let _ = tx.send("message_stop", json!({ "type": "message_stop" }));
+                if !stream {
+                    let msg = tx.message();
+                    respond(s, 200, &msg, "");
+                }
+                return Ok(());
+            }
+        }
+        if !ctx.pool.is_empty() {
+            return messages(s, ctx, body, asked, SEARCH_MODEL.to_string(), tier, may_fail);
+        }
+    }
+
+    let payload = crate::providers::ollama::chat_body(body, model, true);
+    let key_opt = (!key.trim().is_empty()).then_some(key);
+    let reader = match crate::providers::ollama::open(url, key_opt, &payload) {
+        Ok(r) => r,
+        Err(f) => {
+            common::log(&format!("{model} via Ollama ({url}): {} {}", f.status, f.message));
+            if may_fail.takes(f.status) {
+                return Err(f);
+            }
+            respond_error(s, &f);
+            return Ok(());
+        }
+    };
+
+    let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+    match tx.run_openai_chat(reader, "Ollama") {
+        Ok(()) => {
+            let msg = tx.message();
+            let prompt = tx.usage.0;
+            drop(tx);
+            record(tier, crate::providers::OLLAMA_NAME, model, &msg["usage"]);
+            ctx.learn("ollama", body, prompt);
+            if !stream {
+                respond(s, 200, &msg, "");
+            }
+            Ok(())
+        }
+        Err(Stop::Retry(f, _)) if may_fail.takes(f.status) => Err(f),
+        Err(Stop::Retry(f, _)) => {
+            respond_error(s, &f);
+            Ok(())
+        }
+        Err(Stop::Gone) => Ok(()),
     }
 }
 

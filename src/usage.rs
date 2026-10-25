@@ -4,7 +4,11 @@
 //! Claude: Claude Code's own login (read only, never refreshed here) against `/api/oauth/usage`.
 //! Antigravity: `retrieveUserQuotaSummary` per Google account.
 
-use crate::{antigravity, chatgpt};
+use crate::providers::antigravity::parse_ag;
+use crate::providers::chatgpt::{fetch_chatgpt, gpt_has_login};
+use crate::providers::claude::{claude_login, claude_set_up, fetch_claude};
+use crate::providers::museai::fetch_muse;
+use crate::antigravity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
@@ -39,8 +43,8 @@ fn reload_all() {
 const POLL_SECS: u64 = 180;
 /// The reload buttons can't go faster than this.
 const RELOAD_SECS: u64 = 30;
-const FIVE_HOURS: u64 = 5 * 3600;
-const WEEK: u64 = 7 * 24 * 3600;
+pub(crate) const FIVE_HOURS: u64 = 5 * 3600;
+pub(crate) const WEEK: u64 = 7 * 24 * 3600;
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -292,29 +296,12 @@ pub fn reset_text(resets: u64, now: u64, pct: Option<u8>) -> String {
 
 // ---------------------------------------------------------------- Claude
 
-/// Claude Code's login as it left it: (access token, plan name). Read only: refreshing it here could race Claude
-/// Code and sign it out, and while ccat runs Claude Code keeps it fresh itself.
-fn claude_login() -> Option<Result<(String, String), String>> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| dirs_home().join(".claude"));
-    let v: Value = serde_json::from_str(&fs::read_to_string(dir.join(".credentials.json")).ok()?).ok()?;
-    let o = &v["claudeAiOauth"];
-    let token = o["accessToken"].as_str().filter(|t| !t.is_empty())?.to_string();
-    let plan = plan_name(o["subscriptionType"].as_str().unwrap_or(""), o["rateLimitTier"].as_str().unwrap_or(""));
-    let expired = o["expiresAt"].as_u64().is_some_and(|ms| ms / 1000 <= now());
-    Some(if expired { Err(format!("{plan}|Login expired: start Claude Code to refresh it.")) } else { Ok((token, plan)) })
-}
-
 pub(crate) fn dirs_home() -> PathBuf {
     PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap_or_default())
 }
 
-/// Claude Code is signed in to a claude.ai plan (an API-key setup has no plan quota to show).
-pub fn claude_set_up() -> bool {
-    claude_login().is_some()
-}
-
 /// "team" → "Team", "max" + "default_claude_max_20x" → "Max 20x".
-fn plan_name(kind: &str, tier: &str) -> String {
+pub(crate) fn plan_name(kind: &str, tier: &str) -> String {
     let mut name: String = kind.chars().take(1).flat_map(char::to_uppercase).chain(kind.chars().skip(1)).collect();
     if kind == "max" {
         if let Some(x) = tier.rsplit('_').next().filter(|x| x.ends_with('x')) {
@@ -324,183 +311,7 @@ fn plan_name(kind: &str, tier: &str) -> String {
     name
 }
 
-/// Bars from `/api/oauth/usage`: its `limits` list (session, weekly, per-model weekly), or the older top-level fields.
-pub fn parse_claude(v: &Value) -> Vec<Bar> {
-    let bar = |label: String, used: f64, resets: &Value, window| Bar { label, used, resets: resets.as_str().map_or(0, parse_time), window, ..Default::default() };
-    let mut bars: Vec<Bar> = v["limits"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|l| {
-            let used = l["percent"].as_f64().unwrap_or(0.0);
-            match (l["kind"].as_str()?, l["scope"]["model"]["display_name"].as_str()) {
-                ("session", _) => Some(bar("Session (5hr)".into(), used, &l["resets_at"], FIVE_HOURS)),
-                ("weekly_all", _) => Some(bar("Weekly (7 day)".into(), used, &l["resets_at"], WEEK)),
-                ("weekly_scoped", Some(model)) => Some(bar(format!("Weekly {model}"), used, &l["resets_at"], WEEK)),
-                _ => None,
-            }
-        })
-        .collect();
-    if bars.is_empty() {
-        for (key, label, window) in [("five_hour", "Session (5hr)", FIVE_HOURS), ("seven_day", "Weekly (7 day)", WEEK)] {
-            if let Some(used) = v[key]["utilization"].as_f64() {
-                bars.push(bar(label.into(), used, &v[key]["resets_at"], window));
-            }
-        }
-    }
-    bars
-}
-
-/// `claude-code/<version>` of the installed CLI, asked once.
-fn user_agent() -> &'static str {
-    static UA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    UA.get_or_init(|| {
-        let mut cmd = std::process::Command::new("claude");
-        cmd.arg("--version");
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // CREATE_NO_WINDOW
-        let out = cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
-        let version = out.split_whitespace().next().filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())).unwrap_or("2.1.303");
-        format!("claude-code/{version}")
-    })
-}
-
-fn fetch_claude(token: &str) -> Result<Vec<Bar>, (String, u64)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
-    let mut res = agent
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", user_agent())
-        .call()
-        .map_err(|e| (format!("Can't reach Anthropic: {e}"), 0))?;
-    let status = res.status().as_u16();
-    let retry = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-    let body = res.body_mut().read_to_string().unwrap_or_default();
-    match status {
-        200 => serde_json::from_str(&body).map(|v| parse_claude(&v)).map_err(|e| (format!("Unreadable answer: {e}"), 0)),
-        401 => Err(("Login expired: start Claude Code to refresh it.".into(), 0)),
-        429 => {
-            let wait = retry.unwrap_or(300).max(60);
-            Err((format!("Rate limited, trying again in {} min.", wait.div_ceil(60)), wait))
-        }
-        s => Err((format!("Anthropic answered {s}."), 0)),
-    }
-}
-
-// ---------------------------------------------------------------- ChatGPT
-
-/// (plan, bars) from `/backend-api/wham/usage`: its primary (5-hour) and secondary (weekly) rate-limit windows.
-pub fn parse_wham(v: &Value, now: u64) -> (String, Vec<Bar>) {
-    let window = |w: &Value, label: &str, default: u64| {
-        let used = w["used_percent"].as_f64()?;
-        let resets = w["reset_at"].as_u64().filter(|r| *r > 0).or_else(|| w["reset_after_seconds"].as_u64().map(|s| now + s)).unwrap_or(0);
-        Some(Bar { label: label.into(), used, resets, window: w["limit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(default), ..Default::default() })
-    };
-    let limit = &v["rate_limit"];
-    let bars = [window(&limit["primary_window"], "Session (5hr)", FIVE_HOURS), window(&limit["secondary_window"], "Weekly (7 day)", WEEK)].into_iter().flatten().collect();
-    (plan_name(v["plan_type"].as_str().unwrap_or(""), ""), bars)
-}
-
-/// Whether there is a login to ask with: a ChatGPT account signed in to ccat (Codex CLI's own login is not used).
-fn gpt_has_login(cfg: &crate::Config) -> bool {
-    cfg.providers.iter().filter(|p| p.chatgpt).flat_map(|p| &p.chatgpt_accounts).any(|a| a.codex() && a.usable())
-}
-
-/// The usage call, with each login in turn (ccat's own Codex-route accounts first, then Codex CLI's, read only) until one
-/// answers. Tokens and the account id are never logged.
-fn fetch_chatgpt(cfg: &crate::Config) -> Result<(String, Vec<Bar>), (String, u64)> {
-    let mut logins: Vec<(String, String, bool)> = Vec::new();
-    for a in cfg.providers.iter().filter(|p| p.chatgpt).flat_map(|p| &p.chatgpt_accounts).filter(|a| a.codex() && a.usable()) {
-        let login = if a.cli() { chatgpt::codex_cli_tokens().ok_or_else(String::new) } else { chatgpt::codex_token(&a.key) };
-        if let Ok((t, id)) = login {
-            logins.push((t, id, true));
-        }
-    }
-    let mut last = ("ChatGPT sign-in expired: sign in again in Settings → Providers.".to_string(), 0);
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
-    for (token, id, _) in logins {
-        let sent = agent
-            .get(chatgpt::WHAM_USAGE)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("ChatGPT-Account-Id", id)
-            .header("User-Agent", "codex-cli")
-            .header("Accept", "application/json")
-            .call();
-        let mut res = match sent {
-            Ok(r) => r,
-            Err(e) => {
-                last = (format!("Can't reach ChatGPT: {e}"), 0);
-                continue;
-            }
-        };
-        let status = res.status().as_u16();
-        let retry = res.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-        let body = res.body_mut().read_to_string().unwrap_or_default();
-        match status {
-            200 => match serde_json::from_str::<Value>(&body) {
-                Ok(v) => return Ok(parse_wham(&v, now())),
-                Err(e) => last = (format!("Unreadable answer: {e}"), 0),
-            },
-            401 | 403 => last = ("ChatGPT login expired: sign in again in ccat.".into(), 0),
-            429 => {
-                let wait = retry.unwrap_or(300).max(60);
-                return Err((format!("Rate limited, trying again in {} min.", wait.div_ceil(60)), wait));
-            }
-            s => last = (format!("ChatGPT answered {s}."), 0),
-        }
-    }
-    Err(last)
-}
-
-// ---------------------------------------------------------------- MuseAI
-
-fn parse_muse(v: &Value) -> (String, Vec<Bar>) {
-    let obs = v.get("observedState").or_else(|| v.get("sourceAnalysis").and_then(|s| s.get("observedState"))).unwrap_or(v);
-    let plan = obs["tier"].as_str().unwrap_or("Free plan").to_string();
-    let reset = obs["resetDisplayString"].as_str().unwrap_or("");
-    let reset = reset.strip_prefix("Weekly limit resets ").map(|s| format!("Resets {s}")).unwrap_or_else(|| reset.into());
-    (plan, vec![
-        Bar { label: "Weekly (7 day)".into(), used: obs["weeklyUsagePercent"].as_f64().unwrap_or(0.0), window: WEEK, reset_label: reset, ..Default::default() },
-        Bar { label: "Additional tokens".into(), used: obs["additionalTokensUsagePercent"].as_f64().unwrap_or(0.0), reset_label: obs["additionalTokensExpiration"].as_str().unwrap_or("").into(), ..Default::default() },
-    ])
-}
-
-/// Reads MuseAI quota and reset text from the existing local session cache.
-fn fetch_muse(_p: &crate::Provider) -> Result<(String, Vec<Bar>), String> {
-    // Read synced live usage from ~/.config/muse-cli/usage.json
-    let usage_path = dirs_home().join(".config").join("muse-cli").join("usage.json");
-    if let Ok(content) = fs::read_to_string(&usage_path) {
-        if let Ok(v) = serde_json::from_str::<Value>(&content) {
-            return Ok(parse_muse(&v));
-        }
-    }
-
-    let cookie_file = dirs_home().join(".config").join("muse-cli").join("cookies.txt");
-    if !cookie_file.exists() {
-        return Err("No MuseAI account found. Use + in Settings → Providers to sign in.".into());
-    }
-
-    Err("Usage not yet synced. Sign in via + in Providers or run a query.".into())
-}
-
 // ---------------------------------------------------------------- Antigravity
-
-/// Bars from `retrieveUserQuotaSummary`: per group (Gemini, Claude & GPT), its 5-hour and weekly buckets.
-pub fn parse_ag(v: &Value) -> Vec<Bar> {
-    let mut bars = Vec::new();
-    for b in v["groups"].as_array().into_iter().flatten().flat_map(|g| g["buckets"].as_array().into_iter().flatten()) {
-        let id = b["bucketId"].as_str().unwrap_or("");
-        // The second group is Claude, Sonnet and GPT-OSS; Claude is what anyone here uses it for.
-        let group = if id.starts_with("gemini") { "Gemini" } else { "Claude" };
-        let (window, label) = if b["window"] == "5h" || id.ends_with("5h") { (FIVE_HOURS, "5hr") } else { (WEEK, "Weekly") };
-        let used = (1.0 - b["remainingFraction"].as_f64().unwrap_or(1.0)) * 100.0;
-        bars.push(Bar { label: format!("{group} ({label})"), used: used.clamp(0.0, 100.0), resets: b["resetTime"].as_str().map_or(0, parse_time), window, ..Default::default() });
-    }
-    // Session before weekly within a group, as in the Claude section.
-    bars.sort_by_key(|b| (!b.label.starts_with("Gemini"), b.window));
-    bars
-}
 
 /// Google access tokens live an hour: kept per refresh token so a poll every few minutes doesn't refresh each time.
 fn google_token(refresh: &str) -> Result<String, String> {
@@ -2739,20 +2550,9 @@ pub fn run_popup(click: (f64, f64)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::chatgpt::parse_wham;
+    use crate::providers::claude::parse_claude;
 
-    #[test]
-    fn muse_usage_preserves_reset_text_without_plan_or_balance_rows() {
-        let observed = serde_json::json!({"tier":"Free plan","weeklyUsagePercent":1.0,"resetDisplayString":"Weekly limit resets on Oct 28","additionalTokensBalance":"1B tokens left","additionalTokensUsagePercent":0.0,"additionalTokensExpiration":"Never expires"});
-        for value in [observed.clone(), serde_json::json!({"observedState":observed}), serde_json::json!({"sourceAnalysis":{"observedState":observed}})] {
-            let (plan, bars) = parse_muse(&value);
-            assert_eq!(plan, "Free plan");
-            assert!(bars.iter().all(|bar| bar.part.is_empty()));
-            assert_eq!(bars[0].used, 1.0);
-            assert_eq!(bars[0].reset_label, "Resets on Oct 28");
-            assert_eq!(bars[1].label, "Additional tokens");
-            assert_eq!(bars[1].reset_label, "Never expires");
-        }
-    }
     use serde_json::json;
 
     #[test]
@@ -2819,24 +2619,6 @@ mod tests {
         assert!(reset_text(now + 3 * 86_400, now, Some(25)).starts_with("25% free on "));
         assert!(reset_text(now + 7 * 86_400, now, Some(25)).contains("25% free on "));
         assert!(reset_text(now + 7 * 86_400, now, Some(25)).contains("/"));
-    }
-
-    #[test]
-    fn claude_limits_become_bars() {
-        // The Team account's real answer (Oct 2026): session, weekly, and a weekly limit scoped to Fable.
-        let v = json!({ "five_hour": { "utilization": 39.0, "resets_at": "2026-10-19T11:50:00.349366+00:00" }, "limits": [
-            { "kind": "session", "group": "session", "percent": 39, "resets_at": "2026-10-19T11:50:00.349366+00:00", "scope": null },
-            { "kind": "weekly_all", "group": "weekly", "percent": 35, "resets_at": "2026-10-24T21:00:00.349441+00:00", "scope": null },
-            { "kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-10-24T21:00:00.349681+00:00",
-              "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null } } ] });
-        let bars = parse_claude(&v);
-        let labels: Vec<&str> = bars.iter().map(|b| b.label.as_str()).collect();
-        assert_eq!(labels, ["Session (5hr)", "Weekly (7 day)", "Weekly Fable"]);
-        assert_eq!((bars[0].used, bars[0].window, bars[0].resets), (39.0, FIVE_HOURS, 1_792_410_600));
-        let old = parse_claude(&json!({ "five_hour": { "utilization": 48.0, "resets_at": null }, "seven_day": { "utilization": 64.0 } }));
-        assert_eq!(old.iter().map(|b| b.used).collect::<Vec<_>>(), [48.0, 64.0], "older answers without `limits`");
-        assert_eq!(plan_name("team", "default_claude_max_5x"), "Team");
-        assert_eq!(plan_name("max", "default_claude_max_20x"), "Max 20x");
     }
 
     fn ag_summary(gemini_5h: f64, gemini_week: f64) -> Value {

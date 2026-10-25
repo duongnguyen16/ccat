@@ -13,10 +13,10 @@ use std::{
 const MAX_BODY: usize = 64 << 20;
 
 /// The official API: requests go there with the login Claude Code itself sends.
-pub(super) const ANTHROPIC_API: &str = "https://api.anthropic.com";
+pub(crate) const ANTHROPIC_API: &str = "https://api.anthropic.com";
 
 /// The official API, or in tests a fake one.
-pub(super) fn anthropic_api() -> String {
+pub(crate) fn anthropic_api() -> String {
     #[cfg(test)]
     if let Some(u) = super::tests::FAKE_API.lock().unwrap().clone() {
         return u;
@@ -24,24 +24,24 @@ pub(super) fn anthropic_api() -> String {
     ANTHROPIC_API.into()
 }
 
-pub(super) struct Req {
-    pub(super) method: String,
-    pub(super) path: String,
-    pub(super) headers: Vec<(String, String)>,
-    pub(super) body: Vec<u8>,
+pub(crate) struct Req {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Req {
-    pub(super) fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 }
 
-pub(super) fn bad(msg: &str) -> io::Error {
+pub(crate) fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
-pub(super) fn read_request(s: &TcpStream) -> io::Result<Req> {
+pub(crate) fn read_request(s: &TcpStream) -> io::Result<Req> {
     let mut r = BufReader::new(s);
     let mut line = String::new();
     r.read_line(&mut line)?;
@@ -86,7 +86,7 @@ pub(super) fn read_request(s: &TcpStream) -> io::Result<Req> {
     Ok(req)
 }
 
-pub(super) fn respond(s: &mut TcpStream, status: u16, body: &Value, extra: &str) {
+pub(crate) fn respond(s: &mut TcpStream, status: u16, body: &Value, extra: &str) {
     let body = body.to_string();
     let _ = write!(
         s,
@@ -96,7 +96,7 @@ pub(super) fn respond(s: &mut TcpStream, status: u16, body: &Value, extra: &str)
     );
 }
 
-pub(super) fn error_kind(status: u16) -> &'static str {
+pub(crate) fn error_kind(status: u16) -> &'static str {
     match status {
         400 => "invalid_request_error",
         401 => "authentication_error",
@@ -109,7 +109,7 @@ pub(super) fn error_kind(status: u16) -> &'static str {
     }
 }
 
-pub(super) fn respond_error(s: &mut TcpStream, f: &Failure) {
+pub(crate) fn respond_error(s: &mut TcpStream, f: &Failure) {
     let extra = f.retry_after.map(|r| format!("Retry-After: {r}\r\n")).unwrap_or_default();
     respond(s, f.status, &json!({ "type": "error", "error": { "type": error_kind(f.status), "message": f.message } }), &extra);
 }
@@ -120,7 +120,7 @@ pub(super) fn respond_error(s: &mut TcpStream, f: &Failure) {
 /// number formatting, escapes); only a rewrite re-serializes `body` (which keeps its key order).
 /// ponytail: an assistant turn that was nothing but such thinking would be left empty; Claude Code always follows
 /// thinking with text or a tool call, so it hasn't come up.
-pub(super) fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
+pub(crate) fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
     if body.is_null() {
         return Vec::new();
     }
@@ -142,14 +142,14 @@ pub(super) fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
 /// Token usage read off an answer as it passes through: SSE `message_start` / `message_delta` events, or a plain
 /// JSON message. The highest value seen per field wins (`output_tokens` grows through the stream).
 #[derive(Default)]
-pub(super) struct Meter {
+pub(crate) struct Meter {
     sse: bool,
     tail: Vec<u8>,
     usage: Map<String, Value>,
 }
 
 impl Meter {
-    pub(super) fn feed(&mut self, bytes: &[u8]) {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
         if !self.sse {
             // A whole JSON message; past a few MB it isn't one worth counting.
             if self.tail.len() < 8 << 20 {
@@ -166,7 +166,7 @@ impl Meter {
         }
     }
 
-    pub(super) fn take(&mut self, v: &Value) {
+    pub(crate) fn take(&mut self, v: &Value) {
         let u = if v["message"]["usage"].is_object() { &v["message"]["usage"] } else { &v["usage"] };
         for (k, n) in u.as_object().into_iter().flatten().filter(|(_, n)| n.is_u64()) {
             if self.usage.get(k).and_then(Value::as_u64) < n.as_u64() {
@@ -175,7 +175,7 @@ impl Meter {
         }
     }
 
-    pub(super) fn finish(mut self) -> Value {
+    pub(crate) fn finish(mut self) -> Value {
         if !self.sse {
             if let Ok(v) = serde_json::from_slice::<Value>(&self.tail) {
                 self.take(&v);
@@ -187,7 +187,7 @@ impl Meter {
 
 /// One line per answered request in `tokens.jsonl` next to the config: when, which tier and provider, which model,
 /// and the tokens. Only routed launches pass through the proxy, so only they are counted. (Kept for future builds.)
-pub(super) fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
+pub(crate) fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
     let n = |k: &str| usage[k].as_u64().unwrap_or(0);
     if cfg!(test) || n("input_tokens") + n("output_tokens") + n("cache_read_input_tokens") == 0 {
         return;
@@ -205,7 +205,7 @@ pub(super) fn record(tier: &str, provider: &str, model: &str, usage: &Value) {
 /// and the answer, SSE included, streams back as it arrives, rate-limit headers and all. With `meter` (tier,
 /// provider, model) the answer's token usage goes to the token log.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: Fail) -> Result<(), Failure> {
+pub(crate) fn forward(s: &mut TcpStream, agent: &ureq::Agent, req: &Req, base: &str, key: Option<&str>, body: Vec<u8>, meter: Option<(&str, &str, &str)>, may_fail: Fail) -> Result<(), Failure> {
     let mut b = ureq::http::Request::builder().method(req.method.as_str()).uri(format!("{base}{}", req.path));
     for (k, v) in &req.headers {
         let hop = matches!(k.as_str(), "host" | "content-length" | "connection" | "transfer-encoding" | "accept-encoding" | "x-ccat-token");

@@ -2,17 +2,17 @@
 //! Overrides live only in the child process env; no Claude config file is read or written.
 //! An Antigravity provider is served by an in-process proxy (see `proxy`), so ccat stays alive while claude runs.
 
-mod antigravity;
-mod chatgpt;
 mod common;
 mod live;
-mod mcp;
-pub(crate) mod museai;
-pub(crate) mod ollama;
 mod profiles;
+mod providers;
 mod providers_ui;
 mod proxy;
 mod usage;
+
+use providers::{antigravity, chatgpt, museai, ollama, Provider, AG_NAME, GPT_NAME, MUSE_NAME, OLLAMA_NAME};
+use providers::claude::fetch_claude_models;
+use providers::endpoint::fetch_models;
 
 use eframe::egui::{
     self, vec2, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Key, Layout,
@@ -20,7 +20,7 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -37,41 +37,6 @@ pub const TIERS: [(&str, &str, &str); 4] = [
 ];
 /// How the official provider (Claude Code's own login, `Route::provider` "") shows in the UI.
 const OFFICIAL: &str = "Claude";
-/// The built-in profile's fixed name; every other profile is an Anthropic-compatible endpoint.
-pub const AG_NAME: &str = "Antigravity";
-/// The built-in ChatGPT provider's fixed name.
-pub const GPT_NAME: &str = "ChatGPT";
-/// The built-in Ollama provider's fixed name.
-pub const OLLAMA_NAME: &str = "Ollama";
-/// The built-in MuseAI provider's fixed name.
-pub const MUSE_NAME: &str = "MuseAI";
-
-/// A connection: an Anthropic-compatible endpoint (`url` + `key`) or the built-in Antigravity account pool.
-#[derive(Serialize, Deserialize, Default, Clone)]
-#[serde(default)]
-struct Provider {
-    name: String,
-    url: String,
-    key: String,
-    models: Vec<String>,
-    custom: Vec<String>,
-    /// Served through the local proxy from `accounts` instead of `url` + `key`.
-    antigravity: bool,
-    accounts: Vec<antigravity::Account>,
-    /// Served through the local proxy from the ChatGPT plan (`chatgpt_accounts`; their tokens live in files, see `chatgpt`).
-    chatgpt: bool,
-    chatgpt_accounts: Vec<chatgpt::ChatgptAccount>,
-    /// What the last model fetch learned of each ChatGPT model; `models` holds just the slugs.
-    chatgpt_models: Vec<chatgpt::ChatgptModel>,
-    /// Served through the local proxy from local Ollama instance (`/v1/chat/completions`).
-    ollama: bool,
-    /// Served through the local proxy from MuseAI via local sidecar engine.
-    muse: bool,
-    #[serde(default)]
-    muse_account: Option<crate::museai::Account>,
-    /// Turned off in the Providers view: not offered in the pickers, not used for routing.
-    disabled: bool,
-}
 
 /// Where one tier runs: a provider by name ("" = official Claude), its model ("" = Claude Code's own pick, official
 /// only), and the Claude name Claude Code is told instead ("" = the real id). A `modelOverrides` entry sends the
@@ -160,45 +125,6 @@ const REFRESH_SECS: u64 = 6 * 3600;
 
 pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-/// Extract all model costs from models.dev and cache to pricing.json for the Live cost tab.
-fn save_pricing_cache(v: &serde_json::Value) {
-    let mut map: HashMap<&str, [f64; 4]> = HashMap::new();
-    if let Some(obj) = v.as_object() {
-        for prov in obj.values() {
-            if let Some(models) = prov.get("models").and_then(|m| m.as_object()) {
-                for (id, m) in models {
-                    if let Some(cost) = m.get("cost").and_then(|c| c.as_object()) {
-                        let num = |k: &str| cost.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        map.insert(id.as_str(), [num("input"), num("output"), num("cache_read"), num("cache_write")]);
-                    }
-                }
-            }
-        }
-    }
-    if !map.is_empty() {
-        if let Ok(json) = serde_json::to_string(&map) {
-            let _ = fs::write(config_path().with_file_name("pricing.json"), json);
-        }
-    }
-}
-
-/// Current Claude model ids, newest first, from models.dev (public, no key).
-fn fetch_claude_models() -> Result<Vec<String>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
-    let body = agent.get("https://models.dev/api.json").call().map_err(|e| e.to_string())?.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    save_pricing_cache(&v);
-    let mut models: Vec<(&str, &str)> = v["anthropic"]["models"]
-        .as_object()
-        .ok_or("models.dev has no anthropic models")?
-        .iter()
-        .filter(|(id, _)| id.starts_with("claude-"))
-        .map(|(id, m)| (id.as_str(), m["release_date"].as_str().unwrap_or("")))
-        .collect();
-    models.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    Ok(models.into_iter().map(|(id, _)| id.to_string()).collect())
 }
 
 const REPO_URL: &str = "https://github.com/duongnguyen16/ccat";
@@ -574,28 +500,6 @@ fn merged(disk: Option<serde_json::Value>, loaded: &serde_json::Value, mine: ser
         }
     }
     out
-}
-
-fn models_endpoint(url: &str) -> String {
-    let base = url.trim().trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base);
-    format!("{base}/v1/models?limit=1000")
-}
-
-/// Works for Anthropic-style and OpenAI-style `/v1/models`: both return `{ data: [{ id }] }`.
-fn fetch_models(url: &str, key: &str) -> Result<Vec<String>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
-    let mut res = agent
-        .get(&models_endpoint(url))
-        .header("x-api-key", key)
-        .header("authorization", format!("Bearer {key}"))
-        .header("anthropic-version", "2023-06-01")
-        .call()
-        .map_err(|e| e.to_string())?;
-    let body = res.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
-    let data = v["data"].as_array().ok_or("response has no `data` array")?;
-    Ok(data.iter().filter_map(|m| m["id"].as_str().map(bare_id)).collect())
 }
 
 // ---------------------------------------------------------------- look: Claude Console palette, compact
@@ -1932,7 +1836,7 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
                     // and any tier may become one while the session runs. Without a login, the token stands in.
                     let mine = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok().filter(|h| !h.trim().is_empty()).map_or(String::new(), |h| h + "\n");
                     env.push(("ANTHROPIC_CUSTOM_HEADERS", format!("{mine}x-ccat-token: {}", px.token)));
-                    if !usage::claude_set_up() {
+                    if !providers::claude::claude_set_up() {
                         env.push(("ANTHROPIC_AUTH_TOKEN", px.token.clone()));
                     }
                     env.push(("ANTHROPIC_BASE_URL", px.url.clone()));
@@ -2072,12 +1976,6 @@ mod tests {
         assert_eq!(selector_text("OR", "claude-opus-5-5", &claude, &all), "claude-opus-5-5 (OR)");
         assert_eq!(selector_text("OR", "only-here", &claude, &all), "only-here");
         assert_eq!(selector_text("", "claude-haiku-4-5", &claude, &all), "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn endpoint_normalizes_v1() {
-        assert_eq!(models_endpoint("https://x.io/"), "https://x.io/v1/models?limit=1000");
-        assert_eq!(models_endpoint("https://x.io/api/v1"), "https://x.io/api/v1/models?limit=1000");
     }
 
     #[test]
