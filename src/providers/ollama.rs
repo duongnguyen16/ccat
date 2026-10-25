@@ -635,7 +635,7 @@ pub(crate) fn ollama_messages(
 // ---------------------------------------------------------------- settings page
 
 /// Settings → Ollama: its on/off switch, the URL (local, or Ollama Cloud) and key, and the model list.
-pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config) {
+pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed) {
     use crate::settings::providers::{count, head, name, note, row, INDENT};
     use eframe::egui::{self, RichText, Sense, TextEdit};
     let p = crate::pal(ui);
@@ -684,6 +684,10 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
     });
     if pr.models.is_empty() && pr.custom.is_empty() {
         note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
+    }
+    // Only an Ollama Cloud key has an allowance to show.
+    if crate::usage::ollama_active(cfg) {
+        feed.limits(ui, 3, "", &feed.usage.ollama.bars, feed.usage.ollama.fetched, &feed.usage.ollama.error);
     }
 }
 

@@ -159,11 +159,13 @@ struct Settings {
     query: String,
     tiers: TierEditor,
     providers: ProvidersEditor,
+    /// `usage.json` as the provider pages' limits blocks show it.
+    feed: usage::Feed,
 }
 
 impl Settings {
     fn new(cfg: Config, loaded: serde_json::Value) -> Self {
-        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default() }
+        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new() }
     }
 
     /// Takes in what another process saved (the launcher, a second Settings, a session's model switch), unless
@@ -253,11 +255,11 @@ impl Settings {
                     usage::display_block(ui, &mut self.cfg);
                 }
                 Page::About => self.about(ui),
-                Page::Claude => claude::page(ui, &mut self.cfg),
-                Page::Antigravity => antigravity::page(&mut self.providers, ui, &mut self.cfg),
-                Page::ChatGpt => chatgpt::page(&mut self.providers, ui, &mut self.cfg),
-                Page::Ollama => ollama::page(&mut self.providers, ui, &mut self.cfg),
-                Page::Muse => museai::page(&mut self.providers, ui, &mut self.cfg),
+                Page::Claude => claude::page(ui, &mut self.cfg, &self.feed),
+                Page::Antigravity => antigravity::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
+                Page::ChatGpt => chatgpt::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
+                Page::Ollama => ollama::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
+                Page::Muse => museai::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::Endpoint(i) => {
                     if let Some(act) = endpoint::page(&mut self.providers, ui, &mut self.cfg, i) {
                         let deleted = matches!(act, providers::Act::Delete(_));
@@ -345,6 +347,7 @@ impl eframe::App for Settings {
         ctx.request_repaint_after(Duration::from_secs(1));
         let editing = self.providers.active() || self.providers.signing_in() || self.tiers.active() || ctx.egui_wants_keyboard_input();
         self.sync(editing);
+        self.feed.poll();
         let before = serde_json::to_value(&self.cfg).unwrap_or_default();
         self.providers.poll(&ctx, &mut self.cfg);
         // Esc belongs to a rename or a picker first, then to the search box, then it closes the window.
