@@ -1,5 +1,5 @@
 //! The Anthropic SSE writer (`Tx`) every translated provider streams through, the OpenAI-chat stream parser
-//! Ollama and MuseAI share, and the request helpers all translations need: signature tags, content blocks,
+//! MuseAI uses, and the request helpers all translations need: signature tags, content blocks,
 //! tool declarations and the token estimate.
 
 use super::http::error_kind;

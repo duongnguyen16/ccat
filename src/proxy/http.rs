@@ -114,22 +114,55 @@ pub(crate) fn respond_error(s: &mut TcpStream, f: &Failure) {
     respond(s, f.status, &json!({ "type": "error", "error": { "type": error_kind(f.status), "message": f.message } }), &extra);
 }
 
+/// Drops Claude Code's per-request billing line (`cch=` changes every turn) from `system`, so an endpoint's prompt
+/// cache sees a stable prefix. A text block left empty goes whole (Anthropic rejects empty ones); other blocks,
+/// `cache_control` included, stay as they were. Whether anything changed is returned.
+/// ponytail: a removed block's own `cache_control` goes with it; Claude Code puts none on the billing block.
+fn strip_billing(body: &mut Value) -> bool {
+    let billing = super::FILTERED_SYSTEM_LINES[0];
+    let is = |l: &str| l.trim_start().starts_with(billing);
+    let strip = |t: &str| t.split('\n').any(is).then(|| t.split('\n').filter(|l| !is(l)).collect::<Vec<_>>().join("\n"));
+    let mut hit = false;
+    match body.get_mut("system") {
+        Some(Value::String(t)) => {
+            if let Some(new) = strip(t) {
+                (hit, *t) = (true, new);
+            }
+        }
+        Some(Value::Array(blocks)) => blocks.retain_mut(|b| match b["text"].as_str().and_then(strip) {
+            Some(new) => {
+                let keep = !new.trim().is_empty();
+                (hit, b["text"]) = (true, json!(new));
+                keep
+            }
+            None => true,
+        }),
+        _ => {}
+    }
+    if hit && match &body["system"] { Value::String(t) => t.trim().is_empty(), Value::Array(a) => a.is_empty(), _ => false } {
+        body.as_object_mut().map(|o| o.remove("system"));
+    }
+    hit
+}
+
 /// The request body for an official or endpoint route: the tier's real model, and no thinking blocks another
 /// provider signed (Antigravity's `ag:` and ChatGPT's `oa:` tags, or none at all): Anthropic rejects a signature it didn't make.
 /// When neither applies the original bytes go on untouched, so the request is exactly what Claude Code sent (key order,
 /// number formatting, escapes); only a rewrite re-serializes `body` (which keeps its key order).
 /// ponytail: an assistant turn that was nothing but such thinking would be left empty; Claude Code always follows
 /// thinking with text or a tool call, so it hasn't come up.
-pub(crate) fn upstream_body(body: &Value, raw: &[u8], model: &str) -> Vec<u8> {
+pub(crate) fn upstream_body(body: &Value, raw: &[u8], model: &str, endpoint: bool) -> Vec<u8> {
     if body.is_null() {
         return Vec::new();
     }
     let keeps = |b: &Value| b["type"] != "thinking" || b["signature"].as_str().is_some_and(|s| !s.is_empty() && !s.starts_with("ag:") && !s.starts_with("oa:"));
     let blocks = || body["messages"].as_array().into_iter().flatten().filter_map(|m| m["content"].as_array()).flatten();
-    if body["model"] == model && blocks().all(keeps) {
+    let mut body = body.clone();
+    // Only an endpoint loses the billing line: the official route forwards Claude Code's exact bytes.
+    let billed = endpoint && strip_billing(&mut body);
+    if !billed && body["model"] == model && blocks().all(keeps) {
         return raw.to_vec();
     }
-    let mut body = body.clone();
     body["model"] = json!(model);
     for m in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
         if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {

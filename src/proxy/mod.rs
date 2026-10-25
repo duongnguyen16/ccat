@@ -131,7 +131,7 @@ pub enum Upstream {
     Antigravity,
     /// The ChatGPT plan: Anthropic Messages translated to the Responses API.
     ChatGPT,
-    /// Ollama model server (Cloud or Local): Anthropic Messages translated to OpenAI Chat Completions.
+    /// Ollama model server (Cloud or Local): Anthropic Messages translated to Ollama's native `/api/chat`.
     Ollama { url: String, key: String },
     /// MuseAI Hatch Gateway VM via local sidecar: Anthropic Messages translated to OpenAI Chat Completions.
     MuseAI { url: String, key: String },
@@ -425,12 +425,12 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
     match up {
         Upstream::Official => {
             let meter = counted.then_some((tier, "Claude", model));
-            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body, &req.body, model), meter, may_fail)
+            forward(s, &ctx.http, req, &anthropic_api(), None, upstream_body(body, &req.body, model, false), meter, may_fail)
         }
         Upstream::Endpoint { name, url, key } => {
             let base = url.trim().trim_end_matches('/');
             let meter = counted.then_some((tier, name.as_str(), model));
-            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body, &req.body, model), meter, may_fail)
+            forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body, &req.body, model, true), meter, may_fail)
         }
         Upstream::Antigravity if !counted => {
             crate::providers::antigravity::proxy::count_tokens(s, ctx, body, model);
@@ -909,7 +909,9 @@ pub(crate) mod tests {
         });
         let routes = vec![route("sonnet", &["m@sonnet"], Upstream::Endpoint { name: "OR".into(), url, key: "ek".into() }, "vendor/m")];
         let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
-        let body = json!({ "model": "m@sonnet[1m]", "max_tokens": 10, "stream": true, "messages": [
+        let body = json!({ "model": "m@sonnet[1m]", "max_tokens": 10, "stream": true,
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cc_version=2; cch=7;" },
+                       { "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }], "messages": [
             { "role": "user", "content": "hi" },
             { "role": "assistant", "content": [
                 { "type": "thinking", "thinking": "from gemini", "signature": "ag:gemini:U0lH" },
@@ -938,6 +940,7 @@ pub(crate) mod tests {
         assert_eq!(seen["beta"], "interleaved-thinking-2025-05-14", "the login's beta flag stays home");
         assert_eq!(seen["token"], "-", "the proxy token stays home");
         assert_eq!(seen["body"]["model"], "vendor/m");
+        assert_eq!(seen["body"]["system"], json!([{ "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }]), "the per-request billing block is gone, the rest as it was");
         let kept: Vec<&str> = seen["body"]["messages"][1]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
         assert_eq!(kept, ["from anthropic", "hello"], "thinking another provider signed is dropped");
     }
@@ -1448,11 +1451,36 @@ Content-Length: {}
     }
 
     #[test]
+    fn billing_line_is_stripped_for_endpoints_only() {
+        let sent = |body: &Value, endpoint: bool| upstream_body(body, body.to_string().as_bytes(), "m", endpoint);
+        let billing = "x-anthropic-billing-header: cc_version=2; cch=abc;";
+        // Its own block: the whole block goes, the others stay byte-equal and in order.
+        let body = json!({ "model": "m", "system": [{ "type": "text", "text": billing }, { "type": "text", "text": "You are Claude Code.", "cache_control": { "type": "ephemeral" } }, { "type": "text", "text": "More" }], "messages": [] });
+        let got: Value = serde_json::from_slice(&sent(&body, true)).unwrap();
+        assert_eq!(got["system"], json!([body["system"][1], body["system"][2]]));
+        assert_eq!(got["messages"], json!([]));
+        // Official keeps the very same bytes.
+        assert_eq!(sent(&body, false), body.to_string().as_bytes());
+        // Sharing a block with real text: only the line goes.
+        let mixed = json!({ "model": "m", "system": [{ "type": "text", "text": format!("{billing}\nSecond line"), "cache_control": { "type": "ephemeral" } }] });
+        let got: Value = serde_json::from_slice(&sent(&mixed, true)).unwrap();
+        assert_eq!(got["system"], json!([{ "type": "text", "text": "Second line", "cache_control": { "type": "ephemeral" } }]));
+        // A string system; one holding only the line leaves no `system` at all.
+        let got: Value = serde_json::from_slice(&sent(&json!({ "model": "m", "system": format!("Intro\n{billing}\nEnd") }), true)).unwrap();
+        assert_eq!(got["system"], "Intro\nEnd");
+        let got: Value = serde_json::from_slice(&sent(&json!({ "model": "m", "system": billing, "max_tokens": 1 }), true)).unwrap();
+        assert!(got.get("system").is_none() && got["max_tokens"] == 1);
+        // Nothing to strip: Claude Code's own bytes.
+        let raw = br#"{"model": "m",  "system":[{"type":"text","text":"Agent SDK identity stays"}]}"#;
+        assert_eq!(upstream_body(&serde_json::from_slice(raw).unwrap(), raw, "m", true), raw);
+    }
+
+    #[test]
     fn oa_thinking_never_reaches_anthropic_or_endpoints() {
         let body = json!({ "model": "x", "messages": [{ "role": "assistant", "content": [
             { "type": "thinking", "thinking": "a", "signature": "oa:eyJ9" }, { "type": "thinking", "thinking": "b", "signature": "ag:claude:QUJD" },
             { "type": "thinking", "thinking": "c", "signature": "EqQBCkg" }, { "type": "text", "text": "t" }] }] });
-        let sent: Value = serde_json::from_slice(&upstream_body(&body, body.to_string().as_bytes(), "claude-x")).unwrap();
+        let sent: Value = serde_json::from_slice(&upstream_body(&body, body.to_string().as_bytes(), "claude-x", true)).unwrap();
         let kept: Vec<&str> = sent["messages"][0]["content"].as_array().unwrap().iter().map(|b| b["thinking"].as_str().or(b["text"].as_str()).unwrap()).collect();
         assert_eq!(kept, ["c", "t"]);
         assert_eq!(untag(Some("oa:eyJ9"), "gpt"), None, "an Antigravity family never takes a ChatGPT signature");
@@ -1791,8 +1819,8 @@ Content-Length: {}
                 log.lock().unwrap().push(body);
                 let text = "\
 HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello from Ollama\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5}}\n\
-data: [DONE]\n\n";
+{\"message\":{\"role\":\"assistant\",\"content\":\"Hello from Ollama\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":20,\"eval_count\":5}\n";
                 let _ = s.write_all(text.as_bytes());
             }
         });
@@ -1820,6 +1848,7 @@ data: [DONE]\n\n";
         let sent = &requests[0];
         assert_eq!(sent["model"], "qwen2.5-coder:32b");
         assert_eq!(sent["options"]["num_ctx"], 65536, "Ollama num_ctx configured");
+        assert_eq!(sent["keep_alive"], "30m");
         assert_eq!(sent["messages"][0]["role"], "user");
         assert_eq!(sent["messages"][0]["content"], "hi");
     }

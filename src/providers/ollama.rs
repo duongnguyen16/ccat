@@ -1,6 +1,6 @@
 //! Ollama provider: Ollama Cloud (https://ollama.com) and local Ollama model serving for Claude Code.
-//! Protocol: translates Anthropic Messages API -> Ollama `/v1/chat/completions`, streaming SSE chunks,
-//! quota/balance tracking via `/api/balance`, and web search via `/api/web_search`.
+//! Protocol: translates Anthropic Messages API -> Ollama's native `/api/chat` (NDJSON stream: the OpenAI-compatible
+//! `/v1` ignores `num_ctx` and `keep_alive`), quota/balance tracking via `/api/balance`, and web search via `/api/web_search`.
 
 use crate::common::{self, Failure};
 use crate::providers::antigravity::proxy::messages;
@@ -9,6 +9,7 @@ use crate::proxy::sse::{Stop, Tx};
 use crate::proxy::{Ctx, Fail, SEARCH_MODEL};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader},
     net::TcpStream,
     time::Duration,
@@ -17,9 +18,11 @@ use std::{
 pub const DEFAULT_URL: &str = "https://ollama.com";
 pub const _LOCAL_URL: &str = "http://localhost:11434";
 
-/// Normalize base URL ensuring http/https scheme and stripped trailing slashes.
+/// Normalize base URL ensuring http/https scheme, stripped trailing slashes and any `/v1` saved for the old
+/// OpenAI-compatible route (every call here is under `/api`).
 pub fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
     if trimmed.is_empty() {
         return DEFAULT_URL.to_string();
     }
@@ -200,6 +203,12 @@ pub fn web_search(base_url: &str, key: &str, query: &str) -> Result<Vec<(String,
     Ok(links)
 }
 
+/// How long Ollama keeps the model (and its KV cache, the prompt-cache hit) loaded after a request. Default is 5 min.
+const KEEP_ALIVE: &str = "30m";
+/// Context window, the same on every request: a different `num_ctx` reloads the model and drops its cache.
+/// Ollama's default is too small for Claude Code's prompt; only the native API honours this, not `/v1`.
+const NUM_CTX: u64 = 65536;
+
 /// Lines injected by Claude Code or Agent SDK that degrade prompt caching or cause issues on local models.
 const FILTERED_LINES: [&str; 2] = [
     "x-anthropic-billing-header:",
@@ -216,7 +225,7 @@ fn clean_text(text: &str) -> String {
     out.join("\n")
 }
 
-/// Convert an Anthropic Messages request body to an OpenAI Chat Completions payload for Ollama.
+/// Convert an Anthropic Messages request body to an Ollama native `/api/chat` payload.
 pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
@@ -238,6 +247,16 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
             "content": system_text,
         }));
     }
+
+    // Ollama matches a tool result to its call by function name, not id.
+    let names: HashMap<&str, &str> = body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .filter(|b| b["type"] == "tool_use")
+        .filter_map(|b| Some((b["id"].as_str()?, b["name"].as_str()?)))
+        .collect();
 
     // 2. Messages
     if let Some(msgs) = body["messages"].as_array() {
@@ -270,15 +289,14 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
                             }
                         }
                         Some("tool_use") => {
-                            let id = b["id"].as_str().unwrap_or("");
-                            let name = b["name"].as_str().unwrap_or("");
-                            let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
                             tool_calls.push(json!({
-                                "id": id,
+                                "id": b["id"].as_str().unwrap_or(""),
                                 "type": "function",
                                 "function": {
-                                    "name": name,
-                                    "arguments": input.to_string(),
+                                    "index": tool_calls.len(),
+                                    "name": b["name"].as_str().unwrap_or(""),
+                                    // an object here, not the JSON string the OpenAI schema wants
+                                    "arguments": b.get("input").cloned().unwrap_or_else(|| json!({})),
                                 }
                             }));
                         }
@@ -286,37 +304,28 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
                     }
                 }
 
-                let mut assistant_msg = json!({ "role": "assistant" });
-                if !text_parts.is_empty() {
-                    assistant_msg["content"] = json!(text_parts.join(""));
-                } else if tool_calls.is_empty() {
-                    assistant_msg["content"] = json!("");
-                }
+                let mut assistant_msg = json!({ "role": "assistant", "content": text_parts.join("") });
                 if !tool_calls.is_empty() {
                     assistant_msg["tool_calls"] = json!(tool_calls);
                 }
                 messages.push(assistant_msg);
             } else {
                 // user turn: can contain text, image, and tool_result blocks
-                let mut user_content_parts = Vec::new();
+                let mut texts = Vec::new();
+                let mut images = Vec::new();
                 let mut tool_results = Vec::new();
 
                 for b in blocks {
                     match b["type"].as_str() {
                         Some("text") => {
                             if let Some(t) = b["text"].as_str() {
-                                user_content_parts.push(json!({ "type": "text", "text": t }));
+                                texts.push(t);
                             }
                         }
                         Some("image") => {
                             let src = &b["source"];
                             if src["type"] == "base64" {
-                                let media = src["media_type"].as_str().unwrap_or("image/png");
-                                let data = src["data"].as_str().unwrap_or("");
-                                user_content_parts.push(json!({
-                                    "type": "image_url",
-                                    "image_url": { "url": format!("data:{media};base64,{data}") }
-                                }));
+                                images.push(src["data"].as_str().unwrap_or(""));
                             }
                         }
                         Some("tool_result") => {
@@ -328,33 +337,24 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
                             } else {
                                 b["content"].to_string()
                             };
-                            tool_results.push((call_id.to_string(), content_str));
+                            let mut result = json!({ "role": "tool", "tool_call_id": call_id, "content": content_str });
+                            if let Some(name) = names.get(call_id) {
+                                result["tool_name"] = json!(name);
+                            }
+                            tool_results.push(result);
                         }
                         _ => {}
                     }
                 }
 
-                // In OpenAI schema, tool responses are separate messages with role: "tool"
-                for (call_id, res_text) in tool_results {
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": res_text,
-                    }));
-                }
+                messages.extend(tool_results);
 
-                if !user_content_parts.is_empty() {
-                    if user_content_parts.len() == 1 && user_content_parts[0]["type"] == "text" {
-                        messages.push(json!({
-                            "role": "user",
-                            "content": user_content_parts[0]["text"].as_str().unwrap_or(""),
-                        }));
-                    } else {
-                        messages.push(json!({
-                            "role": "user",
-                            "content": user_content_parts,
-                        }));
+                if !texts.is_empty() || !images.is_empty() {
+                    let mut user = json!({ "role": "user", "content": texts.join("\n") });
+                    if !images.is_empty() {
+                        user["images"] = json!(images);
                     }
+                    messages.push(user);
                 }
             }
         }
@@ -364,25 +364,24 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
         "model": model,
         "messages": messages,
         "stream": stream,
-        "options": {
-            // Ollama default is 2048 which truncates Claude Code context; 65536 gives plenty of room
-            "num_ctx": 65536,
-        }
+        "keep_alive": KEEP_ALIVE,
+        "options": { "num_ctx": NUM_CTX },
     });
 
     if let Some(max_tokens) = body.get("max_tokens").and_then(Value::as_u64) {
-        payload["max_tokens"] = json!(max_tokens);
+        payload["options"]["num_predict"] = json!(max_tokens);
     }
     if let Some(temp) = body.get("temperature").and_then(Value::as_f64) {
         payload["options"]["temperature"] = json!(temp);
     }
 
-    // Thinking effort (low, medium, high, max)
+    // Thinking effort: /api/chat takes only low, medium or high, so Claude Code's xhigh and max ask for high.
     let effort = body["output_config"]["effort"]
         .as_str()
         .or_else(|| body["reasoning_effort"].as_str());
     if let Some(e) = effort {
-        payload["reasoning_effort"] = json!(e.to_lowercase());
+        let e = e.to_lowercase();
+        payload["think"] = json!(if matches!(e.as_str(), "low" | "medium") { e.as_str() } else { "high" });
     } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
         let e = if budget <= 1024 {
             "low"
@@ -391,7 +390,7 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
         } else {
             "high"
         };
-        payload["reasoning_effort"] = json!(e);
+        payload["think"] = json!(e);
     }
 
     // 3. Tools
@@ -424,9 +423,9 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
     payload
 }
 
-/// Open an HTTP connection to Ollama's `/v1/chat/completions` endpoint.
+/// Open an HTTP connection to Ollama's native `/api/chat` endpoint (NDJSON stream).
 pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dyn BufRead + Send>, Failure> {
-    let url = format!("{}/v1/chat/completions", normalize_url(base_url));
+    let url = format!("{}/api/chat", normalize_url(base_url));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(600)))
@@ -436,7 +435,7 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     let mut req = agent
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream");
+        .header("Accept", "application/x-ndjson");
 
     if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
         req = req.header("Authorization", format!("Bearer {k}"));
@@ -461,9 +460,66 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     }
 }
 
-// ---------------------------------------------------------------- proxy: Anthropic → OpenAI Chat Completions
+// ---------------------------------------------------------------- proxy: Anthropic → Ollama /api/chat
 
-/// An Ollama route: the request goes to Ollama's local OpenAI-compatible endpoint.
+impl Tx<'_> {
+    /// Ollama's native NDJSON chat stream -> Anthropic events. Tool calls arrive whole; the last line says
+    /// `done_reason: "stop"` even after one, so a call seen means `tool_use`.
+    pub(crate) fn run_ollama_chat(&mut self, reader: Box<dyn BufRead + Send>) -> Result<(), Stop> {
+        let (mut calls, mut done) = (false, false);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => return Err(self.fail(Failure { status: 502, message: format!("Ollama stream broke: {e}"), retry_after: None }, Some(0))),
+            };
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(e) = v["error"].as_str() {
+                return Err(self.fail(Failure { status: 500, message: format!("Ollama: {e}"), retry_after: None }, None));
+            }
+            let m = &v["message"];
+            if let Some(t) = m["thinking"].as_str().filter(|t| !t.is_empty()) {
+                self.delta("thinking", t)?;
+            }
+            if let Some(t) = m["content"].as_str().filter(|t| !t.is_empty()) {
+                self.text(t)?;
+            }
+            for tc in m["tool_calls"].as_array().into_iter().flatten() {
+                let f = &tc["function"];
+                let id = tc["id"].as_str().filter(|s| !s.is_empty()).map_or_else(|| format!("call_{}", common::random_hex(12)), String::from);
+                let args = match &f["arguments"] {
+                    Value::String(s) => serde_json::from_str(s).ok(),
+                    a => Some(a.clone()),
+                }
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+                self.tool("tool_use", id, f["name"].as_str().unwrap_or(""), args)?;
+                calls = true;
+            }
+            if v["done"] == true {
+                let n = |k: &str| v[k].as_u64().unwrap_or(0);
+                // `prompt_eval_count` includes the tokens served from the KV cache (the cached count is a subset).
+                let prompt = n("prompt_eval_count");
+                self.usage = (prompt, n("prompt_eval_cached_count").min(prompt), n("eval_count"));
+                self.stop_reason = if calls { "tool_use" } else if v["done_reason"] == "length" { "max_tokens" } else { "end_turn" };
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            return Err(self.fail(Failure { status: 502, message: "Ollama stream ended before `done`".into(), retry_after: None }, Some(0)));
+        }
+
+        self.close()?;
+        self.begin()?;
+        let (usage, stop) = (self.usage_json(), self.stop_reason);
+        self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
+        self.send("message_stop", json!({ "type": "message_stop" }))
+    }
+}
+
+/// An Ollama route: the request goes to Ollama's native `/api/chat`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ollama_messages(
     s: &mut TcpStream,
@@ -534,7 +590,7 @@ pub(crate) fn ollama_messages(
     };
 
     let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
-    match tx.run_openai_chat(reader, "Ollama") {
+    match tx.run_ollama_chat(reader) {
         Ok(()) => {
             let msg = tx.message();
             let prompt = tx.usage.0;
@@ -594,69 +650,120 @@ mod tests {
         assert_eq!(bars[3].part, "$5.50");
     }
 
+
     #[test]
-    fn test_chat_body_system_and_messages() {
+    fn url_saved_for_the_v1_route_still_works() {
+        assert_eq!(normalize_url("http://localhost:11434/v1"), "http://localhost:11434");
+        assert_eq!(normalize_url("https://ollama.com/v1/"), "https://ollama.com");
+    }
+
+    #[test]
+    fn chat_body_is_native_and_stable() {
         let req = json!({
-            "system": "You are a helpful assistant.\nx-anthropic-billing-header: test",
-            "messages": [
-                { "role": "user", "content": "Hello" }
-            ],
+            "system": [{ "type": "text", "text": "x-anthropic-billing-header: cch=1;" }, { "type": "text", "text": "You are helpful." }],
+            "messages": [{ "role": "user", "content": "Hello" }],
             "max_tokens": 1024,
             "thinking": { "type": "enabled", "budget_tokens": 5000 }
         });
         let body = chat_body(&req, "gpt-oss:120b", true);
         assert_eq!(body["model"], "gpt-oss:120b");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["keep_alive"], "30m");
         assert_eq!(body["options"]["num_ctx"], 65536);
-        assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(body["reasoning_effort"], "medium");
-
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[0]["content"], "You are a helpful assistant.");
-        assert_eq!(msgs[1]["role"], "user");
-        assert_eq!(msgs[1]["content"], "Hello");
+        assert_eq!(body["options"]["num_predict"], 1024);
+        assert_eq!(body["think"], "medium");
+        assert!(body.get("max_tokens").is_none() && body.get("reasoning_effort").is_none(), "no OpenAI-only fields");
+        assert_eq!(body["messages"], json!([{ "role": "system", "content": "You are helpful." }, { "role": "user", "content": "Hello" }]));
+        // Another request must not move what keeps the model loaded.
+        let other = chat_body(&json!({ "messages": [{ "role": "user", "content": "x" }], "max_tokens": 5 }), "gpt-oss:120b", true);
+        assert_eq!((&other["keep_alive"], &other["options"]["num_ctx"]), (&body["keep_alive"], &body["options"]["num_ctx"]));
+        assert!(other.get("think").is_none());
     }
 
     #[test]
-    fn test_chat_body_tool_use_and_result() {
+    fn chat_body_tool_round_trip_and_images() {
         let req = json!({
             "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "text", "text": "Let me run bash" },
-                        { "type": "tool_use", "id": "call_1", "name": "Bash", "input": { "command": "ls" } }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "tool_result", "tool_use_id": "call_1", "content": "file1.txt" }
-                    ]
-                }
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "Let me run bash" },
+                    { "type": "tool_use", "id": "call_1", "name": "Bash", "input": { "command": "ls" } },
+                    { "type": "tool_use", "id": "call_2", "name": "Read", "input": { "path": "a" } }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "call_1", "content": "file1.txt" },
+                    { "type": "tool_result", "tool_use_id": "call_2", "content": [{ "type": "text", "text": "A" }, { "type": "text", "text": "B" }] },
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } }
+                ] }
             ],
-            "tools": [
-                {
-                    "name": "Bash",
-                    "description": "Run bash",
-                    "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } }
-                }
-            ]
+            "tools": [{ "name": "Bash", "description": "Run bash", "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }]
         });
-        let body = chat_body(&req, "deepseek-v4-pro", true);
+        let body = chat_body(&req, "qwen3", true);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["content"], "Let me run bash");
         assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "Bash");
-        assert_eq!(msgs[1]["role"], "tool");
-        assert_eq!(msgs[1]["tool_call_id"], "call_1");
-        assert_eq!(msgs[1]["content"], "file1.txt");
+        assert_eq!(msgs[0]["tool_calls"][0]["function"]["arguments"], json!({ "command": "ls" }), "an object, not a JSON string");
+        assert_eq!(msgs[0]["tool_calls"][1]["function"]["index"], 1);
+        assert_eq!((msgs[1]["role"].as_str(), msgs[1]["tool_name"].as_str(), msgs[1]["content"].as_str()), (Some("tool"), Some("Bash"), Some("file1.txt")));
+        assert_eq!((msgs[2]["tool_name"].as_str(), msgs[2]["content"].as_str()), (Some("Read"), Some("AB")));
+        assert_eq!(msgs[3], json!({ "role": "user", "content": "what is this?", "images": ["QUJD"] }), "bare base64, no data: URL");
 
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "Bash");
+    }
+
+    fn run(ndjson: &str) -> (Value, (u64, u64, u64)) {
+        let sigs = std::sync::Mutex::new(HashMap::new());
+        let mut tx = Tx::new("qwen3", "claude-sonnet-5-5", None, &sigs);
+        tx.run_ollama_chat(Box::new(std::io::Cursor::new(ndjson.to_string()))).unwrap();
+        (tx.message(), tx.usage)
+    }
+
+    #[test]
+    fn ndjson_text_thinking_and_usage() {
+        let (msg, usage) = run("\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"hm\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"m\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"lo\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":20,\"prompt_eval_cached_count\":12,\"eval_count\":5}\n");
+        assert_eq!(msg["stop_reason"], "end_turn");
+        let c = msg["content"].as_array().unwrap();
+        assert_eq!((c[0]["type"].as_str(), c[0]["thinking"].as_str()), (Some("thinking"), Some("hmm")));
+        assert_eq!((c[1]["type"].as_str(), c[1]["text"].as_str()), (Some("text"), Some("Hello")));
+        assert_eq!(usage, (20, 12, 5));
+        assert_eq!((msg["usage"]["input_tokens"].as_u64(), msg["usage"]["cache_read_input_tokens"].as_u64(), msg["usage"]["output_tokens"].as_u64()), (Some(8), Some(12), Some(5)));
+    }
+
+    #[test]
+    fn ndjson_tool_call_and_length() {
+        let (msg, _) = run("\
+{\"message\":{\"role\":\"assistant\",\"content\":\"On it.\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"index\":0,\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}},{\"id\":\"call_7\",\"function\":{\"index\":1,\"name\":\"Read\",\"arguments\":{\"path\":\"a\"}}}]},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":9,\"eval_count\":3}\n");
+        assert_eq!(msg["stop_reason"], "tool_use", "Ollama says `stop` after a call");
+        let c = msg["content"].as_array().unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0]["text"], "On it.");
+        assert_eq!((c[1]["type"].as_str(), c[1]["name"].as_str(), &c[1]["input"]), (Some("tool_use"), Some("Bash"), &json!({ "command": "ls" })));
+        assert!(c[1]["id"].as_str().unwrap().starts_with("call_"), "an id made up when Ollama sends none");
+        assert_eq!(c[2]["id"], "call_7");
+
+        let (msg, _) = run("{\"message\":{\"content\":\"cut\"},\"done\":false}\n{\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"length\",\"prompt_eval_count\":4,\"eval_count\":64}\n");
+        assert_eq!(msg["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn ndjson_cut_short_or_failed_is_an_error() {
+        let sigs = std::sync::Mutex::new(HashMap::new());
+        let mut tx = Tx::new("qwen3", "m", None, &sigs);
+        let cut: Box<dyn BufRead + Send> = Box::new(BufReader::new(&b"{\"message\":{\"content\":\"a\"},\"done\":false}\n"[..]));
+        assert!(tx.run_ollama_chat(cut).is_err());
+        let mut tx = Tx::new("qwen3", "m", None, &sigs);
+        let err: Box<dyn BufRead + Send> = Box::new(BufReader::new(&b"{\"error\":\"model not found\"}\n"[..]));
+        assert!(matches!(tx.run_ollama_chat(err), Err(Stop::Retry(f, _)) if f.message.contains("model not found")));
     }
 }

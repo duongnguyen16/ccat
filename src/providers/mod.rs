@@ -49,7 +49,7 @@ pub(crate) struct Provider {
     pub(crate) chatgpt_accounts: Vec<chatgpt::ChatgptAccount>,
     /// What the last model fetch learned of each ChatGPT model; `models` holds just the slugs.
     pub(crate) chatgpt_models: Vec<chatgpt::ChatgptModel>,
-    /// Served through the local proxy from local Ollama instance (`/v1/chat/completions`).
+    /// Served through the local proxy from local Ollama instance (`/api/chat`).
     pub(crate) ollama: bool,
     /// Served through the local proxy from MuseAI via local sidecar engine.
     pub(crate) muse: bool,

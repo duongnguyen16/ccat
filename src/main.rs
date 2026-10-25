@@ -1020,6 +1020,8 @@ impl App {
                 _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{}” has every account turned off.", p.name), true)),
                 _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable()) => Some((format!("“{}”: no account has plan usage granted; sign in again.", p.name), true)),
                 _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
+                // A local Ollama needs no key; Ollama Cloud's is only required by the server.
+                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{}” needs a URL.", p.name), true)),
                 _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{}” needs a URL and a key.", p.name), true)),
                 _ => None,
             }
@@ -2267,6 +2269,11 @@ mod tests {
         app.cfg.tiers[0] = route("OR", "m", "");
         assert_eq!(app.problem(0), Some(("“OR” needs a URL and a key.".into(), true)));
         assert!(target("OR", "m", &[keyless], &claude, 0, "").is_none());
+
+        // 7. A local Ollama needs only its URL (the route is named MuseAI here only because `make_app` routes to it).
+        let local = Provider { name: MUSE_NAME.into(), ollama: true, url: "http://localhost:11434".into(), ..Default::default() };
+        assert_eq!(make_app(local.clone()).problem(0), None);
+        assert_eq!(make_app(Provider { url: " ".into(), ..local }).problem(0), Some(("“MuseAI” needs a URL.".into(), true)));
     }
 
     #[test]
