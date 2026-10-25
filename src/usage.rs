@@ -1361,11 +1361,46 @@ pub(crate) struct Feed {
     stamp: Option<std::time::SystemTime>,
     polled: std::time::Instant,
     busy: [std::sync::Arc<std::sync::atomic::AtomicBool>; 5],
+    /// Per provider: its token stats, the `tokens.jsonl` stamp and day they were read at, and when that was last looked at.
+    stats: std::cell::RefCell<HashMap<String, (Stats, Option<std::time::SystemTime>, i64, std::time::Instant)>>,
 }
 
 impl Feed {
     pub(crate) fn new() -> Self {
-        Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default() }
+        Self { stamp: usage_stamp(), usage: load_usage(), polled: std::time::Instant::now(), busy: Default::default(), stats: Default::default() }
+    }
+
+    /// A provider page's header card: its tokens per day by model over the last `DAYS`, counted from `tokens.jsonl`
+    /// records whose provider is `provider`. The file is looked at every 3 seconds and read again only when it changed.
+    pub(crate) fn analytics(&self, ui: &mut egui::Ui, provider: &str) {
+        let (p, today) = (crate::pal(ui), local_day(now()));
+        let mut cache = self.stats.borrow_mut();
+        if cache.get(provider).is_none_or(|e| e.3.elapsed() > Duration::from_secs(3)) {
+            let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
+            if cache.get(provider).is_none_or(|e| e.1 != stamp || e.2 != today) {
+                let text = fs::read_to_string(tokens_path()).unwrap_or_default();
+                cache.insert(provider.to_string(), (load_stats(&text, true, today, Some(provider)), stamp, today, std::time::Instant::now()));
+            } else if let Some(e) = cache.get_mut(provider) {
+                e.3 = std::time::Instant::now();
+            }
+        }
+        let st = &cache[provider].0;
+        crate::settings::card(ui, |ui| {
+            row(ui, SECTION_H, |ui| {
+                ui.label(egui::RichText::new("Tokens by model").family(crate::anthropic()).size(16.0).color(p.fg));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("Last {DAYS} days")).size(11.5).color(p.subtle)));
+            });
+            if st.keys.is_empty() {
+                ui.label(egui::RichText::new("No usage through ccat yet").size(11.5).color(p.subtle));
+                return;
+            }
+            chart(ui, st, 120.0);
+            ui.add_space(8.0);
+            let id = ui.id().with(("more-models", provider));
+            let mut more = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            legend(ui, st, &mut more);
+            ui.data_mut(|d| d.insert_temp(id, more));
+        });
     }
 
     /// Re-reads `usage.json` when someone wrote it (the other process, or a reload here); looked at once a second.
@@ -1384,7 +1419,6 @@ impl Feed {
     /// `spawn_refresh`); a failed fetch shows its error over the last bars, greyed out.
     pub(crate) fn limits(&self, ui: &mut egui::Ui, which: usize, plan: &str, bars: &[Bar], fetched: u64, error: &str) {
         let (p, now) = (crate::pal(ui), now());
-        ui.add_space(14.0);
         row(ui, SECTION_H, |ui| {
             ui.label(egui::RichText::new("Your usage limits").family(crate::anthropic()).size(16.0).color(p.fg));
             if !plan.is_empty() {
@@ -1406,19 +1440,13 @@ impl Feed {
     }
 }
 
-/// A small block under an account row: no header, indented, `off` (a disabled account) and failed fetches greyed out.
+/// A small block under an account row, in the account's card: no header, `off` (a disabled account) and failed fetches greyed out.
 pub(crate) fn account_limits(ui: &mut egui::Ui, bars: &[Bar], error: &str, off: bool) {
     let (p, now) = (crate::pal(ui), now());
-    ui.horizontal_top(|ui| {
-        ui.add_space(crate::settings::providers::INDENT);
-        ui.vertical(|ui| {
-            if !error.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(11.5).color(p.danger)).truncate()).on_hover_text(error);
-            }
-            limit_rows(ui, bars, now, off || !error.is_empty(), true);
-            ui.add_space(10.0);
-        });
-    });
+    if !error.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new(error.replace(['\n', '\r'], " ")).size(11.5).color(p.danger)).truncate()).on_hover_text(error);
+    }
+    limit_rows(ui, bars, now, off || !error.is_empty(), true);
 }
 
 /// "Updated 3m ago".
@@ -1669,14 +1697,15 @@ pub fn fmt_tokens(n: f64) -> String {
     format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
 }
 
-fn load_stats(text: &str, by_model: bool, today: i64) -> Stats {
+/// `provider`: only the records of that provider (a provider page's own usage), else all of them.
+fn load_stats(text: &str, by_model: bool, today: i64, provider: Option<&str>) -> Stats {
     let first = today - DAYS + 1;
     let mut st = Stats { first, ..Default::default() };
     let mut totals: HashMap<String, (u64, u64)> = HashMap::new();
     let mut by_day: Vec<(i64, String, u64)> = Vec::new();
     for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
         let day = local_day(v["t"].as_u64().unwrap_or(0));
-        if day < first || day > today {
+        if day < first || day > today || provider.is_some_and(|p| v["provider"].as_str() != Some(p)) {
             continue;
         }
         let n = |k: &str| v[k].as_u64().unwrap_or(0);
@@ -1710,9 +1739,9 @@ fn day_label(day: i64) -> String {
 }
 
 /// Stacked bars, one per day, with the day's breakdown on hover.
-fn chart(ui: &mut egui::Ui, st: &Stats) {
+fn chart(ui: &mut egui::Ui, st: &Stats, height: f32) {
     let p = crate::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(34.0, 6.0), rect.max - egui::vec2(0.0, 18.0));
     let day_total = |d: i64| (0..st.keys.len()).map(|i| st.cells.get(&(d, i)).copied().unwrap_or(0)).sum::<u64>();
     let max = (0..DAYS).map(day_total).max().unwrap_or(0).max(1) as f64;
@@ -1781,7 +1810,7 @@ fn legend(ui: &mut egui::Ui, st: &Stats, more: &mut bool) {
             // Numbers first, from the right; the name takes what's left and is cut short if it must be.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let share = (input + output) as f64 / total as f64 * 100.0;
-                ui.add_sized([42.0, 18.0], egui::Label::new(egui::RichText::new(format!("{share:.1}%")).size(12.0).color(p.fg)));
+                ui.allocate_ui_with_layout(egui::vec2(42.0, 18.0), egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new(format!("{share:.1}%")).size(12.0).color(p.fg)));
                 ui.label(egui::RichText::new(format!("{} in · {} out", fmt_tokens(*input as f64), fmt_tokens(*output as f64))).size(11.5).color(p.muted));
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::Label::new(egui::RichText::new(name).size(12.5).color(p.fg)).truncate()).on_hover_text(name);
@@ -2304,7 +2333,7 @@ impl Popup {
         let stamp = fs::metadata(tokens_path()).and_then(|m| m.modified()).ok();
         if self.stats.as_ref().is_none_or(|(_, b, s)| *b != self.by_model || *s != stamp) {
             let text = fs::read_to_string(tokens_path()).unwrap_or_default();
-            self.stats = Some((load_stats(&text, self.by_model, local_day(now())), self.by_model, stamp));
+            self.stats = Some((load_stats(&text, self.by_model, local_day(now()), None), self.by_model, stamp));
         }
         &self.stats.as_ref().unwrap().0
     }
@@ -2469,7 +2498,7 @@ impl Popup {
             ui.add(egui::Label::new(egui::RichText::new("No tokens recorded yet. ccat counts the requests that go through its proxy: launches with a tier on another provider, or with a fallback.").size(11.5).color(p.subtle)).wrap());
             return;
         }
-        chart(ui, st);
+        chart(ui, st, 150.0);
         ui.add_space(8.0);
         legend(ui, st, &mut more);
         self.more = more;
@@ -3225,11 +3254,13 @@ mod tests {
         let today = local_day(t);
         let line = |dt: u64, model: &str, provider: &str, i: u64, o: u64| json!({ "t": t - dt, "tier": "opus", "provider": provider, "model": model, "input": i, "output": o, "cache_read": 1000, "cache_write": 0 }).to_string();
         let text = [line(0, "claude-opus-5-5", "Claude", 10, 5), line(0, "gemini-x", "Antigravity", 1, 1), line(86_400, "claude-opus-5-5", "Claude", 0, 100), line(40 * 86_400, "old", "Claude", 9, 9), "garbage".into()].join("\n");
-        let st = load_stats(&text, true, today);
+        let st = load_stats(&text, true, today, None);
         assert_eq!(st.keys.iter().map(|k| (k.0.as_str(), k.1, k.2)).collect::<Vec<_>>(), [("Claude Opus 5.5", 2010, 105), ("Gemini X", 1001, 1)], "cache reads count as input; a 40-day-old line is out");
         assert_eq!(st.cells[&(DAYS - 1, 0)], 1015, "today's Opus: in + out");
-        let by_provider = load_stats(&text, false, today);
+        let by_provider = load_stats(&text, false, today, None);
         assert_eq!(by_provider.keys[0].0, "Claude");
+        let ag = load_stats(&text, true, today, Some("Antigravity"));
+        assert_eq!(ag.keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["Gemini X"], "a provider page counts only its own records");
     }
 
 

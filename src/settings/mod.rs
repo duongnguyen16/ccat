@@ -18,6 +18,8 @@ const NAV_W: f32 = 220.0;
 const PANE_W: f32 = 720.0;
 /// The tier editor's width: its selectors read better narrower than the pane.
 const TIERS_W: f32 = 560.0;
+/// Kept free at the pane's right, so switches and percentages never touch the scrollbar.
+const SCROLL_GAP: f32 = 16.0;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Page {
@@ -97,6 +99,24 @@ pub(crate) fn title(text: &str) -> RichText {
 fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(title(text));
     ui.add_space(8.0);
+}
+
+/// A bordered group of rows: rounded, a faint fill, a 1 px border and inner padding, so everything inside it shares
+/// one left edge. Cards of a page sit 10 px apart.
+pub(crate) fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let p = pal(ui);
+    let r = egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner;
+    ui.add_space(10.0);
+    r
 }
 
 /// A titled paragraph of grey text under the rows.
@@ -245,7 +265,7 @@ impl Settings {
             }
         }
         egui::ScrollArea::vertical().id_salt(format!("{:?}", self.page)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(ui.available_width().min(PANE_W));
+            ui.set_max_width((ui.available_width() - SCROLL_GAP).min(PANE_W));
             match self.page.clone() {
                 Page::Models => self.models(ui, frame),
                 Page::Routing => self.routing(ui),
@@ -261,7 +281,7 @@ impl Settings {
                 Page::Ollama => ollama::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::Muse => museai::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::Endpoint(i) => {
-                    if let Some(act) = endpoint::page(&mut self.providers, ui, &mut self.cfg, i) {
+                    if let Some(act) = endpoint::page(&mut self.providers, ui, &mut self.cfg, &self.feed, i) {
                         let deleted = matches!(act, providers::Act::Delete(_));
                         self.providers.apply(&mut self.cfg, act);
                         if deleted {

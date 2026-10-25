@@ -15,8 +15,6 @@ use std::{
 };
 
 const ROW: f32 = 28.0;
-/// How far the rows under a provider (accounts, URL and key, notes) are pushed in.
-pub(crate) const INDENT: f32 = 16.0;
 
 /// A model list: the ids, and (ChatGPT only) what is known of each.
 type Fetched = Result<(Vec<String>, Vec<chatgpt::ChatgptModel>), String>;
@@ -211,19 +209,15 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, on: bool) -> Option<egui::Res
     Some(resp)
 }
 
-/// A line of small text under a row, lined up with the names.
+/// A line of small text under a row or a card, on the same left edge as what it sits in.
 pub(crate) fn note(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT);
-        ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
-    });
+    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
 }
 
 /// `label` and a text field; a secret shows as dots unless it has the keyboard.
 pub(crate) fn field(ui: &mut egui::Ui, label: &str, text: &mut String, id: egui::Id, secret: bool, hint: &str) {
     let p = pal(ui);
     ui.horizontal(|ui| {
-        ui.add_space(INDENT);
         let (rect, _) = ui.allocate_exact_size(vec2(52.0, 24.0), Sense::hover());
         ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, FontId::proportional(11.5), p.subtle);
         let masked = secret && !ui.memory(|m| m.has_focus(id));

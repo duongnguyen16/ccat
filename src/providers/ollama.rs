@@ -636,7 +636,7 @@ pub(crate) fn ollama_messages(
 
 /// Settings → Ollama: its on/off switch, the URL (local, or Ollama Cloud) and key, and the model list.
 pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed) {
-    use crate::settings::providers::{count, head, name, note, row, INDENT};
+    use crate::settings::{card, providers::{count, head, name, note, row}};
     use eframe::egui::{self, RichText, Sense, TextEdit};
     let p = crate::pal(ui);
     let Some(ol) = cfg.providers.iter().position(|p| p.ollama) else { return };
@@ -649,45 +649,48 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
         }
         name(ui, &title, on);
     });
+    feed.analytics(ui, &title);
     let n = crate::model_count(pr);
-    row(ui, |ui, _| {
-        ed.fetch_btn(ui, pr);
-        count(ui, n);
-    });
-    if let Some(e) = ed.fetch_errs.get(&pr.name) {
-        note(ui, e, p.danger);
-    }
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT);
-        ui.label(RichText::new("URL:").size(11.5).color(p.muted));
-        let mut u = pr.url.clone();
-        let te = ui.add(TextEdit::singleline(&mut u).desired_width(260.0));
-        if te.changed() {
-            pr.url = u;
-        }
-        if pr.url.is_empty() {
-            pr.url = DEFAULT_URL.into();
+    card(ui, |ui| {
+        row(ui, |ui, _| {
+            ed.fetch_btn(ui, pr);
+            count(ui, n);
+        });
+        if let Some(e) = ed.fetch_errs.get(&pr.name) {
+            note(ui, e, p.danger);
         }
     });
-    ui.horizontal(|ui| {
-        ui.add_space(INDENT);
-        ui.label(RichText::new("Key:").size(11.5).color(p.muted));
-        let mut k = pr.key.clone();
-        let te = ui.add(TextEdit::singleline(&mut k).password(true).desired_width(260.0));
-        if te.changed() {
-            pr.key = k;
-        }
-        let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
-        if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            crate::open_browser("https://ollama.com/settings/keys");
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("URL:").size(11.5).color(p.muted));
+            let mut u = pr.url.clone();
+            let te = ui.add(TextEdit::singleline(&mut u).desired_width(260.0));
+            if te.changed() {
+                pr.url = u;
+            }
+            if pr.url.is_empty() {
+                pr.url = DEFAULT_URL.into();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Key:").size(11.5).color(p.muted));
+            let mut k = pr.key.clone();
+            let te = ui.add(TextEdit::singleline(&mut k).password(true).desired_width(260.0));
+            if te.changed() {
+                pr.key = k;
+            }
+            let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
+            if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                crate::open_browser("https://ollama.com/settings/keys");
+            }
+        });
+        if pr.models.is_empty() && pr.custom.is_empty() {
+            note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
         }
     });
-    if pr.models.is_empty() && pr.custom.is_empty() {
-        note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
-    }
     // Only an Ollama Cloud key has an allowance to show.
     if crate::usage::ollama_active(cfg) {
-        feed.limits(ui, 3, "", &feed.usage.ollama.bars, feed.usage.ollama.fetched, &feed.usage.ollama.error);
+        card(ui, |ui| feed.limits(ui, 3, "", &feed.usage.ollama.bars, feed.usage.ollama.fetched, &feed.usage.ollama.error));
     }
 }
 
