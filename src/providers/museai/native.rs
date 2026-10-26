@@ -710,6 +710,32 @@ mod tests {
         println!("session/delete: {} ms ok={}", ms(t3), cleanup.is_ok());
     }
 
+    #[test]
+    #[ignore = "explicit live-account opt-in; lists every history event a large prompt produces"]
+    fn live_large_prompt_events() {
+        let text = std::fs::read_to_string(crate::usage::dirs_home().join(".config/muse-cli/cookies.txt")).expect("Existing Muse cookie jar required");
+        let id = identity(&cookies(&text).unwrap()).unwrap();
+        let mut gateway = Gateway::connect(&id, Arc::new(AtomicBool::new(false))).unwrap();
+        let sid = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat large probe"}}))).unwrap()["session_id"].as_str().unwrap().to_string();
+        let size: usize = std::env::var("PROBE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(600_000);
+        let prompt = format!("Reply with exactly OK. The rest is filler to ignore:
+{}", "lorem ipsum dolor sit amet ".repeat(size / 27));
+        gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":prompt}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":sid}))).unwrap();
+        let t = Instant::now();
+        let mut last = String::new();
+        while t.elapsed() < Duration::from_secs(240) {
+            let history = gateway.request("GET", &format!("/chat/history?limit=20&session_id={}", encode_query(&sid)), None);
+            let line = match history {
+                Ok(h) => h["chat_events"].as_array().map(|a| a.iter().map(|e| format!("{}#{}:{}:{}b", e["event_name"], e["seq"], e["payload"]["status"], e["payload"].to_string().len())).collect::<Vec<_>>().join(" | ")).unwrap_or_default(),
+                Err(f) => format!("ERR {} {}", f.status, f.message),
+            };
+            if line != last { println!("+{} ms {line}", t.elapsed().as_millis()); last = line; }
+            if last.contains("\"completed\"") || last.starts_with("ERR") { break; }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        println!("session/delete ok={}", gateway.request("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":sid}))).is_ok());
+    }
+
     fn noise_pair() -> (snow::TransportState, snow::TransportState) {
         let params: snow::params::NoiseParams = "Noise_XX_25519_AESGCM_SHA256".parse().unwrap();
         let keys_a = snow::Builder::new(params.clone()).generate_keypair().unwrap();

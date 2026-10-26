@@ -399,22 +399,45 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     }).map_err(|_| fail(500, "Could not start native MuseAI worker"))?;
     Ok(Box::new(BufReader::new(reader)))
 }
+/// A history read is idempotent, so a transient 5xx from Muse's gateway (seen live after minutes of waiting) is retried
+/// a few times; protocol or transport errors are not.
+fn poll(chat: &mut Chat, path: &str) -> Result<Value, Failure> {
+    let mut tries = 0;
+    loop {
+        match chat.gateway().request("GET", path, None) {
+            Err(f) if tries < 4 && f.message.starts_with("MuseAI gateway: HTTP 5") => { tries += 1; std::thread::sleep(Duration::from_secs(2 * tries)); }
+            other => return other,
+        }
+    }
+}
 /// Polls the newest history event only: older ones include the user message, i.e. the whole prompt again (~1 MB
 /// per poll for a 320 KB prompt, past the 16 MiB limit for the largest ones). Returns whether a retry was needed.
 // ponytail: assumes the finished top-level reply is the session's newest event, as every live probe showed; a later
 // event of another kind would hold the reply until the deadline.
 fn run_chat(mut chat: Chat, prompt: &str, tools: &Value, tool_choice: Option<&Value>, prompt_tokens: u64, tx: &StreamTx, cancel: &AtomicBool) -> Result<bool, Failure> {
     let path = format!("/chat/history?limit=1&session_id={}", native::encode_query(&chat.session));
+    let wide = format!("/chat/history?limit=20&session_id={}", native::encode_query(&chat.session));
     let send = |chat: &mut Chat, text: &str| {
         let body = json!({"items":[{"type":"text","text":text}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":chat.session});
         chat.gateway().open("POST", "/chat/stream", Some(&body)).map(|_| ())
     };
     send(&mut chat, prompt)?;
     let (mut baseline, mut retried) = (0, false); // a fresh session's history starts empty
-    let deadline = Instant::now() + REPLY_TIMEOUT;
+    let (started, mut last_note) = (Instant::now(), Instant::now());
+    let deadline = started + REPLY_TIMEOUT;
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         emit(tx, json!({"ccat_ping":true}))?;
-        let history = chat.gateway().request("GET", &path, None)?;
+        let mut history = poll(&mut chat, &path)?;
+        let newest = history["chat_events"][0].clone();
+        // Muse is an agent: a run of its own work can leave an event of another kind newest while the reply sits
+        // further back, so only the cheap "user message / assistant message is newest" cases trust limit=1.
+        if !matches!(newest["event_name"].as_str(), None | Some("message.user" | "message.assistant")) {
+            history = poll(&mut chat, &wide)?;
+        }
+        if last_note.elapsed() >= Duration::from_secs(60) {
+            last_note = Instant::now();
+            crate::common::log(&format!("MuseAI: still waiting after {} s; newest event {} #{} status {}", started.elapsed().as_secs(), newest["event_name"], newest["seq"], newest["payload"]["status"]));
+        }
         if let Some((seq, text)) = completed_reply(&history, baseline)? {
             match reply_delta(&text, tools).and_then(|delta| enforce_tool_choice(&delta, tool_choice).map(|()| delta)) {
                 Ok(delta) => {
