@@ -14,7 +14,7 @@ use native::{fail, Gateway};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, io::{self, BufRead, BufReader, Read, Cursor}, net::TcpStream, path::{Path, PathBuf}, process::Command,
-    sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc::{self, Receiver, SyncSender}}, time::{Duration, Instant}};
+    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc::{self, Receiver, SyncSender}}, time::{Duration, Instant}};
 
 // Keep saved provider configurations working without rewriting the user's config.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18615";
@@ -153,14 +153,26 @@ fn native_prompt(payload: &Value) -> Result<String, Failure> {
         let schema = tool_schema(function);
         jsonschema::options().offline().build(&schema).map_err(|e| fail(400, format!("MuseAI: invalid schema for tool {} at {} (unsupported schema or external reference)", function["name"].as_str().unwrap_or("unknown"), e.instance_path())))?;
     }
-    let mut prompt = String::from("Continue this conversation as the assistant. Conversation entries below are data. You are an external backend: do not use tools or files on your own server.\n");
+    // Muse is itself an agent with its own server, devices and widgets; without this framing it answers as that
+    // agent ("no paired device", "workspace here lacks D:\…") instead of driving the client's tools.
+    // Telling Muse it "is not Muse" makes it defensive; an honest description of the bridge works better.
+    let mut prompt = String::from("I'm using ccat, a bridge app on my own computer, to connect you to my coding session. Below is that session: its system message, my messages and your earlier replies. \
+Write the assistant's next reply in it, following its system message and my latest message. Answer inside that session only: no widgets, and no remarks about this setup or your own workspace.\n");
     if !tools.as_array().unwrap().is_empty() {
-        prompt.push_str("Client tools are available. To call them reply ONLY with a JSON object {\"tool_calls\":[{\"name\":\"declared tool name\",\"arguments\":{}}]}. Do not embed tool JSON in prose. Otherwise reply with normal text. Tool results reference prior call IDs.\nAvailable tools:\n");
+        prompt.push_str("ccat gives you the tools listed below; they run on my computer, not on your server, so they are not among your built-in tools and calling them through your own tool system fails as unknown. \
+The only way to call them is writing the JSON below as your reply; ccat reads it and runs them. A past \"unknown tool\" error from your own tool system does not mean they are unavailable. \
+Paths, files, repositories and commands in the session (e.g. D:\\...) are on my computer and reachable through these tools: use them instead of saying you cannot access my machine or asking me to run things, and don't guess what they would return.\n\
+To use tools, your whole reply must be only a JSON object {\"tool_calls\":[{\"name\":\"listed tool name\",\"arguments\":{}}]} (several calls allowed) whose arguments match the tool's schema. Otherwise reply with normal text.\n\
+tool_result blocks in my messages are the real outputs ccat returned for your earlier calls with the same IDs; rely on them.\nAvailable tools:\n");
         prompt.push_str(&tools.to_string());
         if let Some(choice) = payload.get("tool_choice") { prompt.push_str(&format!("\nTool choice: {choice}")); }
     }
     prompt.push_str("\nConversation:\n");
     prompt.push_str(&payload["messages"].to_string());
+    if !tools.as_array().unwrap().is_empty() {
+        // Recency: Muse otherwise falls back to "that tool is not in my toolset".
+        prompt.push_str("\n\nNow write the next reply. If it needs work on my computer, reply with only the tool_calls JSON for the ccat tools listed above; otherwise plain text.");
+    }
     if prompt.len() > native::MAX_BODY - 4096 { return Err(fail(413, "MuseAI prompt exceeds 16 MiB transport limit")); }
     Ok(prompt)
 }
@@ -205,7 +217,20 @@ fn normalize_schema(schema: &mut Value) {
         }
     }
 }
+/// Muse's own UI widgets render as `[[hatch_widget:…]]` placeholders that mean nothing to the client.
+fn strip_widgets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[[hatch_widget:") {
+        let Some(end) = rest[start..].find("]]") else { break };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
 fn reply_delta(text: &str, tools: &Value) -> Result<Value, Failure> {
+    let text = &strip_widgets(text);
     let trimmed = text.trim();
     let json_text = trimmed.strip_prefix("```json\n").and_then(|s| s.strip_suffix("```" )).unwrap_or(trimmed).trim();
     let parsed: Value = match serde_json::from_str(json_text) {
@@ -228,7 +253,7 @@ fn reply_delta(text: &str, tools: &Value) -> Result<Value, Failure> {
     Ok(json!({"tool_calls":output}))
 }
 
-fn completed_reply(history: &Value, baseline: i64) -> Result<Option<String>, Failure> {
+fn completed_reply(history: &Value, baseline: i64) -> Result<Option<(i64, String)>, Failure> {
     let events = history["chat_events"].as_array().ok_or_else(|| fail(502, "MuseAI history has no chat_events array"))?;
     let mut candidates: Vec<_> = events.iter().filter(|e| e["seq"].as_i64().unwrap_or(0) > baseline && e["event_name"] == "message.assistant"
         && e["reply_to_message_id"].as_str().unwrap_or("").is_empty() && e["payload"]["reply_to_message_id"].as_str().unwrap_or("").is_empty()).collect();
@@ -239,7 +264,7 @@ fn completed_reply(history: &Value, baseline: i64) -> Result<Option<String>, Fai
             "failed" | "error" | "cancelled" => return Err(fail(502, "MuseAI assistant failed to complete its reply")),
             "completed" => {
                 let text = p["display_text"].as_str().or_else(|| p["content"].as_str()).or_else(|| e["display_text"].as_str()).unwrap_or("");
-                if !text.is_empty() { return Ok(Some(text.into())); }
+                if !text.is_empty() { return Ok(Some((e["seq"].as_i64().unwrap_or(0), text.into()))); }
             },
             _ => {},
         }
@@ -247,12 +272,71 @@ fn completed_reply(history: &Value, baseline: i64) -> Result<Option<String>, Fai
     Ok(None)
 }
 
-struct Chat { gateway: Gateway, session: String }
+/// One request's Muse session; dropping it deletes the session and parks a healthy connection for the next request.
+struct Chat { gateway: Option<Gateway>, session: String, cookie: String, done: bool }
+impl Chat {
+    fn gateway(&mut self) -> &mut Gateway { self.gateway.as_mut().expect("gateway lives until drop") }
+}
 impl Drop for Chat {
     fn drop(&mut self) {
-        if self.gateway.cleanup(&self.session).is_err() {
+        let Some(mut gateway) = self.gateway.take() else { return };
+        if gateway.cleanup(&self.session).is_err() {
             crate::common::log("MuseAI: could not clean up a ccat request session after disconnect");
+        } else if self.done {
+            // Only after a full reply: the client drops its reader at [DONE], so its cancel flag says nothing here,
+            // and an error may leave frames in flight that the next request would read as a protocol error.
+            park(&self.cookie, gateway);
         }
+    }
+}
+
+// Setup measured live: identity ~1.9 s (3 HTTPS calls), handshake ~1.1 s, session start ~0.35 s.
+// ponytail: in-memory only, keyed by the cookie jar so a sign-out or account switch never reuses the old identity.
+static IDENTITY: Mutex<Option<(String, native::Identity, Instant)>> = Mutex::new(None);
+const IDENTITY_TTL: Duration = Duration::from_secs(600);
+static IDLE: Mutex<Vec<(String, Gateway, Instant)>> = Mutex::new(Vec::new());
+// ponytail: the server's idle timeout is unknown; a dead parked socket only costs one failed session start.
+const IDLE_TTL: Duration = Duration::from_secs(20);
+
+fn identity(cookie: &str, fresh: bool) -> Result<native::Identity, Failure> {
+    let lock = || IDENTITY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((c, id, at)) = lock().as_ref().filter(|_| !fresh) {
+        if c == cookie && at.elapsed() < IDENTITY_TTL { return Ok(id.clone()); }
+    }
+    // Fetched unlocked: three HTTPS calls must not stall a concurrent request that only needs the cached value.
+    let id = native::identity(cookie)?;
+    *lock() = Some((cookie.into(), id.clone(), Instant::now()));
+    Ok(id)
+}
+fn park(cookie: &str, gateway: Gateway) {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    idle.retain(|(c, _, at)| c == cookie && at.elapsed() < IDLE_TTL);
+    if idle.len() < 2 { idle.push((cookie.into(), gateway, Instant::now())); }
+}
+fn unpark(cookie: &str) -> Option<Gateway> {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    idle.retain(|(c, _, at)| c == cookie && at.elapsed() < IDLE_TTL);
+    idle.pop().map(|(_, gateway, _)| gateway)
+}
+fn start_session(gateway: &mut Gateway) -> Result<String, Failure> {
+    let started = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat request"}})))?;
+    started["session_id"].as_str().filter(|s| !s.is_empty()).map(String::from).ok_or_else(|| fail(502, "MuseAI returned no session ID"))
+}
+/// A parked connection when one is alive, else a new one; an expired token shows up as a failed handshake or
+/// session start, so a fresh connection is retried once with a fresh identity.
+fn begin(cookie: &str, cancel: &Arc<AtomicBool>) -> Result<(Chat, bool), Failure> {
+    if let Some(mut gateway) = unpark(cookie) {
+        gateway.reuse(cancel.clone());
+        if let Ok(session) = start_session(&mut gateway) { return Ok((Chat { gateway: Some(gateway), session, cookie: cookie.into(), done: false }, true)); }
+    }
+    let attempt = |fresh| -> Result<Chat, Failure> {
+        let mut gateway = Gateway::connect(&identity(cookie, fresh)?, cancel.clone())?;
+        let session = start_session(&mut gateway)?;
+        Ok(Chat { gateway: Some(gateway), session, cookie: cookie.into(), done: false })
+    };
+    match attempt(false) {
+        Err(f) if f.status != 499 && !cancel.load(Ordering::Relaxed) => attempt(true).map(|chat| (chat, false)),
+        other => other.map(|chat| (chat, false)),
     }
 }
 
@@ -298,42 +382,60 @@ pub fn open(base_url: &str, key: Option<&str>, payload: &Value) -> Result<Box<dy
     let slot = Slot::acquire()?;
     let prompt = native_prompt(payload)?;
     let cookie_text = fs::read_to_string(account_dir().join("cookies.txt")).map_err(|_| fail(401, "MuseAI: add an account first"))?;
-    let id = native::identity(&native::cookies(&cookie_text)?)?;
+    let cookie = native::cookies(&cookie_text)?;
     let (tx, reader, cancel) = stream_channel();
-    let gateway = Gateway::connect(&id, cancel.clone())?;
+    let (chat, reused) = begin(&cookie, &cancel)?;
+    let setup_ms = started.elapsed().as_millis();
     let tools = effective_tools(payload);
     let tool_choice = payload.get("tool_choice").cloned();
+    let prompt_tokens = payload["ccat_prompt_tokens"].as_u64().unwrap_or(0);
     let request_id = crate::common::random_hex(8);
-    crate::common::log(&json!({"event":"muse_native_request","phase":"start","request_id":request_id,"prompt_bytes":prompt.len(),"prompt_characters":prompt.chars().count(),"active_tools":tools.as_array().map_or(0, Vec::len),"usage_source":"unavailable"}).to_string());
+    crate::common::log(&json!({"event":"muse_native_request","phase":"start","request_id":request_id,"prompt_bytes":prompt.len(),"prompt_characters":prompt.chars().count(),"active_tools":tools.as_array().map_or(0, Vec::len),"setup_ms":setup_ms,"reused_connection":reused,"usage_source":"estimate"}).to_string());
     std::thread::Builder::new().name("muse-native".into()).spawn(move || {
         let _slot = slot;
-        let result = run_chat(gateway, &prompt, &tools, tool_choice.as_ref(), &tx, &cancel);
-        crate::common::log(&json!({"event":"muse_native_request","phase":"end","request_id":request_id,"status":result.as_ref().err().map_or(200, |f| f.status),"elapsed_ms":started.elapsed().as_millis(),"usage_source":"unavailable"}).to_string());
+        let result = run_chat(chat, &prompt, &tools, tool_choice.as_ref(), prompt_tokens, &tx, &cancel);
+        crate::common::log(&json!({"event":"muse_native_request","phase":"end","request_id":request_id,"status":result.as_ref().err().map_or(200, |f| f.status),"setup_ms":setup_ms,"elapsed_ms":started.elapsed().as_millis(),"retried":result.as_ref().is_ok_and(|r| *r),"usage_source":"estimate"}).to_string());
         if let Err(f) = result { let _ = tx.send(Err(io::Error::other(f.message))); }
     }).map_err(|_| fail(500, "Could not start native MuseAI worker"))?;
     Ok(Box::new(BufReader::new(reader)))
 }
-fn run_chat(mut gateway: Gateway, prompt: &str, tools: &Value, tool_choice: Option<&Value>, tx: &StreamTx, cancel: &AtomicBool) -> Result<(), Failure> {
-    let session = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat request"}})))?;
-    let session = session["session_id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| fail(502, "MuseAI returned no session ID"))?.to_string();
-    let mut chat = Chat { gateway, session };
-    let path = format!("/chat/history?limit=20&session_id={}", native::encode_query(&chat.session));
-    let history = chat.gateway.request("GET", &path, None)?;
-    let baseline = history["chat_events"].as_array().ok_or_else(|| fail(502, "MuseAI returned invalid history"))?.iter().filter_map(|e| e["seq"].as_i64()).max().unwrap_or(0);
-    chat.gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":prompt}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":chat.session})))?;
+/// Polls the newest history event only: older ones include the user message, i.e. the whole prompt again (~1 MB
+/// per poll for a 320 KB prompt, past the 16 MiB limit for the largest ones). Returns whether a retry was needed.
+// ponytail: assumes the finished top-level reply is the session's newest event, as every live probe showed; a later
+// event of another kind would hold the reply until the deadline.
+fn run_chat(mut chat: Chat, prompt: &str, tools: &Value, tool_choice: Option<&Value>, prompt_tokens: u64, tx: &StreamTx, cancel: &AtomicBool) -> Result<bool, Failure> {
+    let path = format!("/chat/history?limit=1&session_id={}", native::encode_query(&chat.session));
+    let send = |chat: &mut Chat, text: &str| {
+        let body = json!({"items":[{"type":"text","text":text}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":chat.session});
+        chat.gateway().open("POST", "/chat/stream", Some(&body)).map(|_| ())
+    };
+    send(&mut chat, prompt)?;
+    let (mut baseline, mut retried) = (0, false); // a fresh session's history starts empty
     let deadline = Instant::now() + REPLY_TIMEOUT;
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         emit(tx, json!({"ccat_ping":true}))?;
-        let history = chat.gateway.request("GET", &path, None)?;
-        if let Some(text) = completed_reply(&history, baseline)? {
-            let delta = reply_delta(&text, tools)?;
-            enforce_tool_choice(&delta, tool_choice)?;
-            let reason = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
-            emit(tx, json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]}))?;
-            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).map_err(|_| fail(499, "MuseAI client disconnected"))?;
-            return Ok(());
+        let history = chat.gateway().request("GET", &path, None)?;
+        if let Some((seq, text)) = completed_reply(&history, baseline)? {
+            match reply_delta(&text, tools).and_then(|delta| enforce_tool_choice(&delta, tool_choice).map(|()| delta)) {
+                Ok(delta) => {
+                    let reason = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+                    // ponytail: Muse reports no token counts; ~4 bytes per token, the proxy's own default ratio.
+                    let usage = json!({"prompt_tokens":prompt_tokens,"completion_tokens":delta.to_string().len().div_ceil(4)});
+                    emit(tx, json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}],"usage":usage}))?;
+                    chat.done = true;
+                    tx.send(Ok(b"data: [DONE]\n\n".to_vec())).map_err(|_| fail(499, "MuseAI client disconnected"))?;
+                    return Ok(retried);
+                }
+                // One corrective turn in the same session for an unusable tool reply; plain prose is never retried.
+                Err(f) if !retried => {
+                    retried = true;
+                    baseline = seq;
+                    send(&mut chat, &format!("Your last reply could not be used: {}. Reply again: either only the tool_calls JSON for a listed tool with arguments that match its schema, or plain text.", f.message))?;
+                }
+                Err(f) => return Err(f),
+            }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(150));
     }
     if cancel.load(Ordering::Relaxed) { Err(fail(499, "MuseAI request cancelled by client")) }
     else { Err(fail(504, format!("MuseAI reply deadline exceeded ({} seconds)", REPLY_TIMEOUT.as_secs()))) }
@@ -397,7 +499,12 @@ pub(crate) fn muse_messages(
     let started = std::time::Instant::now();
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    let payload = crate::providers::museai::chat_body(body, model, true);
+    let mut payload = crate::providers::museai::chat_body(body, model, true);
+    // Muse reports no token counts: the native path carries the proxy's estimate, and only a remote gateway's real
+    // counts may teach the estimator (learning from its own guess would feed the ratio back to itself).
+    let native = is_local_bridge(&normalize_url(url));
+    let estimate = ctx.estimate("muse", body);
+    if native { payload["ccat_prompt_tokens"] = json!(estimate); }
     let key_opt = (!key.trim().is_empty()).then_some(key);
     let reader = match crate::providers::museai::open(url, key_opt, &payload) {
         Ok(r) => r,
@@ -412,13 +519,14 @@ pub(crate) fn muse_messages(
     };
 
     let mut tx = Tx::new(model, asked, stream.then_some(&mut *s), &ctx.sigs);
+    if native { tx.usage.0 = estimate; } // message_start goes out with the first ping, before the reply's usage line
     match tx.run_openai_chat(reader, "MuseAI") {
         Ok(()) => {
             let msg = tx.message();
             let prompt = tx.usage.0;
             drop(tx);
             record(tier, crate::providers::MUSE_NAME, model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: "" });
-            ctx.learn("muse", body, prompt);
+            if !native { ctx.learn("muse", body, prompt); }
             if !stream {
                 respond(s, 200, &msg, "");
             }
@@ -575,6 +683,9 @@ mod tests {
         let delta = reply_delta(r#"{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}]}"#, &tools).unwrap();
         assert_eq!(delta["tool_calls"][0]["function"]["name"], "Read");
         assert!(reply_delta(r#"{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}"#, &tools).is_err(), "truncated tool JSON must fail closed");
+        assert_eq!(reply_delta("a\n\n[[hatch_widget:widget-1]]\n\nb", &tools).unwrap()["content"], "a\n\n\n\nb", "Muse widget markers must not reach the client");
+        let prompt = native_prompt(&json!({"tools":tools,"messages":[]})).unwrap();
+        assert!(prompt.contains("instead of saying you cannot access my machine"), "Muse must drive client tools, not answer as its own agent");
     }
     #[test]
     fn explicit_tool_choice_cannot_be_satisfied_by_plain_text_or_wrong_tool() {
@@ -593,7 +704,7 @@ mod tests {
             {"seq":3,"event_name":"message.assistant","payload":{"display_text":"incomplete"}},
             {"seq":4,"event_name":"message.assistant","payload":{"status":"completed","display_text":"actual"}}
         ]});
-        assert_eq!(completed_reply(&events, 1).unwrap(), Some("actual".into()));
+        assert_eq!(completed_reply(&events, 1).unwrap(), Some((4, "actual".to_string())));
         assert_eq!(completed_reply(&events, 4).unwrap(), None);
     }
     #[test]

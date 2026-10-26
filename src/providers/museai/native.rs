@@ -303,6 +303,7 @@ pub(super) fn subscription(cookies: &str) -> Result<Value, Failure> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Identity { pub viewer_id: String, pub vm_id: String, pub token: String }
 pub(super) fn identity(cookies: &str) -> Result<Identity, Failure> {
     let auth = http_json(cookies, "/api/auth/check", Some(&json!({})), None)?;
@@ -359,6 +360,8 @@ impl Gateway {
         if path == "/chat/stream" { self.chat_stream = Some(self.stream); }
         Ok(self.stream)
     }
+    /// Hands an idle connection to the next request: its cancel flag, and no chat stream yet.
+    pub fn reuse(&mut self, cancel: Arc<AtomicBool>) { self.cancel = cancel; self.chat_stream = None; }
     pub fn cleanup(&mut self, session: &str) -> Result<(), Failure> {
         let previous = std::mem::replace(&mut self.cancel, Arc::new(AtomicBool::new(false)));
         let result = self.request_until("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":session})), Instant::now() + Duration::from_secs(3));
@@ -663,6 +666,48 @@ mod tests {
         assert!(cleanup.is_ok(), "Progress probe cleanup failed");
         let snapshots = result.unwrap();
         println!("Isolated history status and byte-length snapshots: {snapshots:?}");
+    }
+
+    #[test]
+    #[ignore = "explicit live-account opt-in; times each phase and dumps what /chat/stream sends back"]
+    fn live_phase_timing_and_stream_frames() {
+        let t0 = Instant::now();
+        let ms = |t: Instant| t.elapsed().as_millis();
+        let text = std::fs::read_to_string(crate::usage::dirs_home().join(".config/muse-cli/cookies.txt")).expect("Existing Muse cookie jar required");
+        let id = identity(&cookies(&text).unwrap()).unwrap();
+        println!("identity: {} ms", ms(t0));
+        let t = Instant::now();
+        let mut gateway = Gateway::connect(&id, Arc::new(AtomicBool::new(false))).unwrap();
+        println!("connect: {} ms", ms(t));
+        let t = Instant::now();
+        let started = gateway.request("POST", "/session/start", Some(&json!({"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent","title":"ccat phase probe"}}))).unwrap();
+        let sid = started["session_id"].as_str().unwrap().to_string();
+        println!("session/start: {} ms; keys {:?}", ms(t), started.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        let t = Instant::now();
+        let stream = gateway.open("POST", "/chat/stream", Some(&json!({"items":[{"type":"text","text":"Count from 1 to 40, one number per line."}],"node_id":crate::common::random_hex(8),"capabilities":{},"session_id":sid}))).unwrap();
+        let mut chunks = Assembly::default();
+        let mut quiet_since = Instant::now();
+        while quiet_since.elapsed() < Duration::from_secs(25) && t.elapsed() < Duration::from_secs(120) {
+            let Ok(wire) = read_binary(&mut gateway.ws, &gateway.cancel, Instant::now() + Duration::from_secs(5)) else { continue };
+            quiet_since = Instant::now();
+            let Some(bytes) = chunks.push(unpack(&mut gateway.noise, &wire).unwrap()).unwrap() else { continue };
+            let frame = ServiceFrame::decode(ServiceResponse::decode(bytes.as_slice()).unwrap().payload.as_slice()).unwrap();
+            let (kind, body, end) = match frame.kind {
+                Some(FrameKind::Response(r)) => (format!("response {} headers {:?}", r.status, r.headers.iter().map(|h| format!("{}={}", h.key, h.value)).collect::<Vec<_>>()), r.body, r.end_body),
+                Some(FrameKind::Body(b)) => ("body".into(), b.data, b.end_body),
+                Some(FrameKind::Reset(r)) => (format!("reset {} {}", r.code, r.reason), vec![], true),
+                other => (format!("{other:?}"), vec![], false),
+            };
+            let body = String::from_utf8_lossy(&body);
+            println!("+{} ms stream {} (chat {}) {kind} end={end} len={}: {}", ms(t), frame.stream_id, stream, body.len(), body.chars().take(400).collect::<String>());
+        }
+        let t2 = Instant::now();
+        let path = format!("/chat/history?limit=20&session_id={}", encode_query(&sid));
+        let history = gateway.request("GET", &path, None).unwrap();
+        println!("history: {} ms; events {:?}", ms(t2), history["chat_events"].as_array().map(|a| a.iter().map(|e| format!("{} {}", e["event_name"], e["payload"]["status"])).collect::<Vec<_>>()));
+        let t3 = Instant::now();
+        let cleanup = gateway.request("POST", "/session/delete", Some(&json!({"method":"/api/session/delete","session_id":sid})));
+        println!("session/delete: {} ms ok={}", ms(t3), cleanup.is_ok());
     }
 
     fn noise_pair() -> (snow::TransportState, snow::TransportState) {
