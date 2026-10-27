@@ -32,3 +32,10 @@
 - **Chosen:** B (confidence ~80%)
 - **Why:** not measured that prompt size drives Muse's reply time, and trimming descriptions can make tool calls worse — the part that is already unreliable.
 - **Revert if:** a measurement shows reply time grows clearly with prompt size.
+
+### [2026-10-27 08:06] Hold timeout overrides an inherited API_TIMEOUT_MS
+- **Context:** A held request died at "Request timed out (API_TIMEOUT_MS=3000000ms)": ccat lifted the timeout only when the env had none, and the launching shell already set 50 min.
+- **Options:** A keep "env wins" and add a setting / B setting whose default (7 days) replaces the inherited value, "Keep mine" opts out / C always override, no setting
+- **Chosen:** B (confidence ~85%)
+- **Why:** The fix must work without the user touching anything, yet someone who really wants a shorter timeout keeps a way to say so. Also passed via `--settings` env so a settings.json value can't shorten it.
+- **Revert if:** the user relies on a short inherited API_TIMEOUT_MS for ccat sessions and doesn't want to pick "Keep mine".

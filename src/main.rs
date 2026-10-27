@@ -103,6 +103,10 @@ struct Config {
     /// Claude window (often 1M) it would otherwise use. 0 = leave it to Claude Code.
     #[serde(default = "default_compact_window")]
     compact_window: u64,
+    /// While usage limits are waited out, how long Claude Code waits for an answer (`API_TIMEOUT_MS`), in hours; it
+    /// replaces a timeout inherited from the environment. 0 = leave the environment's (or Claude Code's 10 minutes).
+    #[serde(default = "default_hold_hours")]
+    hold_hours: u64,
     /// Usage: the Antigravity model group shown ("" = all), and Claude's per-model weekly bars (Fable) shown.
     ag_group: String,
     show_fable: bool,
@@ -119,6 +123,7 @@ struct Config {
 }
 
 fn default_compact_window() -> u64 { 200_000 }
+fn default_hold_hours() -> u64 { 7 * 24 }
 
 /// Show every set-up usage source, or only those the applied profile routes to.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Debug)]
@@ -185,6 +190,7 @@ struct Launch {
     no_paid_fallback: bool,
     compress_tool_results: bool,
     compact_window: u64,
+    hold_hours: u64,
 }
 
 /// Whether a launch goes through ccat's local proxy: anything but every tier on Claude with no fallback. Plain
@@ -262,7 +268,7 @@ fn load() -> (Config, serde_json::Value) {
 /// The config a file's JSON stands for: older shapes migrated, the built-in providers in place.
 fn from_raw(raw: serde_json::Value) -> Config {
     // An unreadable file falls back to a fresh config, whose compaction window is the usual one (a derived `Default` says 0 = off).
-    let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_else(|_| Config { compact_window: default_compact_window(), ..Default::default() });
+    let mut cfg: Config = serde_json::from_value(raw.clone()).unwrap_or_else(|_| Config { compact_window: default_compact_window(), hold_hours: default_hold_hours(), ..Default::default() });
     if raw.get("live_metric").is_none() && raw.get("live_calls").and_then(|v| v.as_bool()).unwrap_or(false) {
         cfg.live_metric = 1;
     }
@@ -1112,7 +1118,7 @@ impl App {
         self.cfg.recents.insert(0, self.folder.clone());
         self.cfg.recents.truncate(12);
         let (tiers, providers, claude_models) = (self.cfg.tiers.clone(), self.cfg.providers.clone(), self.cfg.claude_models.clone());
-        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback, compress_tool_results: self.cfg.compress_tool_results, compact_window: self.cfg.compact_window });
+        *self.out.lock().unwrap() = Some(Launch { tiers, providers, claude_models, claude_off: self.cfg.claude_off, folder: self.folder.clone(), bypass: self.cfg.bypass, fail_on_limit: self.cfg.fail_on_limit, no_paid_fallback: self.cfg.no_paid_fallback, compress_tool_results: self.cfg.compress_tool_results, compact_window: self.cfg.compact_window, hold_hours: self.cfg.hold_hours });
         ui.send_viewport_cmd(ViewportCommand::Close);
     }
 
@@ -1819,6 +1825,11 @@ fn compact_window(window: u64, routed: bool, overrides: &serde_json::Map<String,
     (routed && window > 0 && !overrides.is_empty() && !user_set).then(|| window.clamp(100_000, 1_000_000).to_string())
 }
 
+/// `API_TIMEOUT_MS` for a routed launch: the hold time while limits are waited out; `None` leaves the environment's.
+fn api_timeout(fail_on_limit: bool, hold_hours: u64) -> Option<String> {
+    (!fail_on_limit && hold_hours > 0).then(|| (hold_hours.min(24 * 365) * 3600 * 1000).to_string())
+}
+
 fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
     let routed = routed(&l.tiers);
     let (names, overrides) = tier_names(&l.tiers, routed);
@@ -1865,9 +1876,9 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
                     px.no_paid_fallback.store(l.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
                     px.compress_tool_results.store(l.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
                     // A request held at a usage limit can wait for hours: Claude Code mustn't give up on it after its
-                    // usual 10 minutes. A timeout the user set stays.
-                    if std::env::var_os("API_TIMEOUT_MS").is_none() {
-                        env.push(("API_TIMEOUT_MS", (7 * 24 * 3600 * 1000u64).to_string()));
+                    // usual 10 minutes, nor after a shorter timeout inherited from the environment.
+                    if let Some(ms) = api_timeout(l.fail_on_limit, l.hold_hours) {
+                        env.push(("API_TIMEOUT_MS", ms));
                     }
                     if uses_ag {
                         let servers = serde_json::json!({ "mcpServers": { "antigravity": {
@@ -1898,7 +1909,7 @@ fn claude_settings(overrides: &serde_json::Map<String, serde_json::Value>, env: 
     // Claude settings can override inherited env; a routed launch owns this non-secret endpoint.
     if let Some((_, url)) = env.iter().find(|(key, _)| *key == "ANTHROPIC_BASE_URL") {
         settings["env"] = serde_json::json!({"ANTHROPIC_BASE_URL": url});
-        if let Some((k, w)) = env.iter().find(|(key, _)| *key == "CLAUDE_CODE_AUTO_COMPACT_WINDOW") {
+        for (k, w) in env.iter().filter(|(key, _)| ["CLAUDE_CODE_AUTO_COMPACT_WINDOW", "API_TIMEOUT_MS"].contains(key)) {
             settings["env"][*k] = w.clone().into();
         }
     }
@@ -1999,6 +2010,16 @@ mod tests {
         assert_eq!(compact_window(u64::MAX, true, &spoofed, false).as_deref(), Some("1000000"));
         let env = [("ANTHROPIC_BASE_URL", "http://127.0.0.1:1".to_string()), ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "272000".into())];
         assert_eq!(claude_settings(&spoofed, &env)["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "272000");
+    }
+
+    #[test]
+    fn hold_time_replaces_an_inherited_api_timeout() {
+        assert_eq!(api_timeout(false, 168).as_deref(), Some("604800000"));
+        assert_eq!(api_timeout(false, 0), None, "0 = keep the environment's");
+        assert_eq!(api_timeout(true, 168), None, "not waiting: nothing to hold");
+        assert_eq!(api_timeout(false, u64::MAX).as_deref(), Some("31536000000"), "capped at a year");
+        let env = [("ANTHROPIC_BASE_URL", "http://127.0.0.1:1".to_string()), ("API_TIMEOUT_MS", "3600000".into())];
+        assert_eq!(claude_settings(&Default::default(), &env)["env"]["API_TIMEOUT_MS"], "3600000", "settings.json can't shorten it");
     }
 
     /// Held by the tests that write the test config (a launcher saves on drop; the Settings tests save too).
@@ -2568,7 +2589,7 @@ mod tests {
     fn live_mixed_tiers() {
         let cfg = live_config();
         let tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
-        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0 };
+        let l = Launch { tiers, providers: cfg.providers, claude_models: cfg.claude_models, claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0, hold_hours: 0 };
         let dir = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &dir).unwrap();
         assert!(p.routed && !p.env.iter().any(|(k, _)| *k == "ANTHROPIC_AUTH_TOKEN"), "official tiers keep the Claude login");
@@ -2615,7 +2636,7 @@ mod tests {
         let mut cfg = live_config();
         cfg.tiers = [Route::default(), Route::default(), route(AG_NAME, "gemini-3.8-flash-tiered", "claude-sonnet-5-5"), Route::default()];
         save(&cfg, &serde_json::Value::Null).unwrap();
-        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0 };
+        let l = Launch { tiers: cfg.tiers.clone(), providers: cfg.providers.clone(), claude_models: cfg.claude_models.clone(), claude_off: false, folder: String::new(), bypass: false, fail_on_limit: false, no_paid_fallback: false, compress_tool_results: false, compact_window: 0, hold_hours: 0 };
         let work = std::env::temp_dir().display().to_string();
         let p = prepare(&l, &work).unwrap();
         let ask = || {

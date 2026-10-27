@@ -515,14 +515,26 @@ impl Settings {
         g.setting(ui, "Wait out usage limits", "When every route and fallback of a request is at its usage limit, the request waits until one can run, so an agent pauses instead of stopping. Esc in Claude Code still cancels it. Routed sessions only.", |ui| {
             switch(ui, &mut wait, "");
         });
+        if wait {
+            g.setting(ui, "Longest wait", "How long Claude Code keeps a held request open before giving up (its API_TIMEOUT_MS). Replaces a shorter timeout inherited from your environment or settings.json; \"Keep mine\" leaves that one. Applies to the next launch.", |ui| {
+                let mut holds: Vec<(String, u64)> = vec![("Keep mine".into(), 0), ("1 hour".into(), 1), ("3 hours".into(), 3), ("6 hours".into(), 6), ("12 hours".into(), 12), ("1 day".into(), 24), ("3 days".into(), 72), ("7 days".into(), 168), ("30 days".into(), 720)];
+                if !holds.iter().any(|(_, v)| *v == self.cfg.hold_hours) {
+                    holds.push((format!("{} hours", self.cfg.hold_hours), self.cfg.hold_hours));
+                }
+                if let Some(v) = select(ui, "hold-hours", 96.0, &holds, &self.cfg.hold_hours) {
+                    self.cfg.hold_hours = v;
+                }
+            });
+        }
         g.setting(ui, "Never fall back to a paid API key", "A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT, MuseAI) and Ollama stay eligible. Routed sessions only.", |ui| {
             switch(ui, &mut self.cfg.no_paid_fallback, "");
         });
         g.setting(ui, "Compact earlier on non-Claude models", "A tier shown to Claude Code under a Claude name gets that model's context window, often 1M, so sessions grow huge and slow before compacting. ccat asks Claude Code to compact at this size instead. Applies to the next launch; the whole session uses it.", |ui| {
             switch(ui, &mut compact, "");
             if compact {
-                // ponytail: the field names the saved size even when it is none of the four.
-                let mut sizes: Vec<(String, u64)> = [128u64, 200, 272, 400].iter().map(|k| (format!("{k}k"), k * 1000)).collect();
+                // ponytail: the field names the saved size even when it is none of the listed ones.
+                let mut sizes: Vec<(String, u64)> = [100u64, 128, 160, 200, 256, 272, 320, 400, 500, 600, 800].iter().map(|k| (format!("{k}k"), k * 1000)).collect();
+                sizes.push(("1M".into(), 1_000_000));
                 if !sizes.iter().any(|(_, v)| *v == self.cfg.compact_window) {
                     sizes.push((format!("{}k", self.cfg.compact_window / 1000), self.cfg.compact_window));
                 }
@@ -533,7 +545,7 @@ impl Settings {
         });
         });
         self.cfg.fail_on_limit = !wait;
-        // ponytail: a saved size outside the four choices (hand-edited) shows as is until another is picked.
+        // ponytail: a saved size outside the listed choices (hand-edited) shows as is until another is picked.
         if compact != (self.cfg.compact_window > 0) {
             self.cfg.compact_window = if compact { 200_000 } else { 0 };
         }
