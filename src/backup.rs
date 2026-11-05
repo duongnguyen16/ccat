@@ -89,10 +89,15 @@ fn safe_name(s: &str) -> bool {
         && !s
             .chars()
             .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
-        && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        && !(stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        && !matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        )
+        && !matches!(
+            stem.strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT")),
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        )
 }
 
 fn allowed(name: &str) -> bool {
@@ -429,6 +434,13 @@ mod tests {
         fs::remove_dir_all(src).unwrap();
         fs::remove_dir_all(dst).unwrap();
     }
+    #[test]
+    fn rejects_windows_device_aliases_before_opening_files() {
+        for name in ["COM¹", "LPT²", "COM³", "CONIN$", "CONOUT$"] {
+            assert!(!allowed(&format!("profiles/{name}.json")), "{name}");
+        }
+    }
+
     #[test]
     fn invalid_backups_do_not_change_existing_data() {
         let root = dir();
