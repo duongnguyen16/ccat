@@ -5,8 +5,10 @@ pub(crate) mod antigravity;
 pub(crate) mod chatgpt;
 pub(crate) mod claude;
 pub(crate) mod endpoint;
-pub(crate) mod museai;
+pub(crate) mod gemini_web;
 pub(crate) mod ollama;
+pub(crate) mod openai;
+pub(crate) mod opencode;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,8 +22,8 @@ pub(crate) fn label(name: &str) -> &str {
 }
 /// The built-in Ollama provider's fixed name.
 pub const OLLAMA_NAME: &str = "Ollama";
-/// The built-in MuseAI provider's fixed name.
-pub const MUSE_NAME: &str = "MuseAI";
+/// The built-in Gemini Web provider's fixed name.
+pub const GEMINI_WEB_NAME: &str = "Gemini Web";
 
 /// The kind of provider a route runs on. Official Claude is not a `Provider` record: it is a route with an empty
 /// provider name (`proxy::Upstream::Official`), so `Provider::kind` never answers `Claude`.
@@ -32,7 +34,8 @@ pub(crate) enum Kind {
     Antigravity,
     ChatGpt,
     Ollama,
-    Muse,
+    OpenCode,
+    GeminiWeb,
     Endpoint,
 }
 
@@ -58,10 +61,20 @@ pub(crate) struct Provider {
     pub(crate) chatgpt_models: Vec<chatgpt::ChatgptModel>,
     /// Served through the local proxy from local Ollama instance (`/api/chat`).
     pub(crate) ollama: bool,
-    /// Served through the local proxy from MuseAI via local sidecar engine.
-    pub(crate) muse: bool,
+    /// Served through the local Argon / Gemini Web bridge (`/claude/v1`).
+    pub(crate) gemini_web: bool,
+    /// An endpoint that speaks OpenAI Chat Completions (`url` is its versioned base) instead of Anthropic Messages.
+    pub(crate) openai: bool,
+    /// Anonymous OpenCode Free proxy, not a regular keyed endpoint.
+    pub(crate) opencode: bool,
+    /// OpenCode egress pool configuration.
     #[serde(default)]
-    pub(crate) muse_account: Option<museai::Account>,
+    pub(crate) opencode_egress: opencode::egress::Config,
+    /// Fetch keeps only the models free by their name (see `openai::is_free`).
+    pub(crate) free_only: bool,
+    /// The retired MuseAI built-in, read from old configs only so `load` can drop it.
+    #[serde(skip_serializing)]
+    pub(crate) muse: bool,
     /// Turned off in the Providers view: not offered in the pickers, not used for routing.
     pub(crate) disabled: bool,
 }
@@ -74,6 +87,10 @@ impl Provider {
         self.chatgpt_legacy.unwrap_or_else(|| self.chatgpt_accounts.iter().any(|a| a.own_codex()))
     }
 
+    pub(crate) fn is_opencode(&self) -> bool {
+        self.opencode
+    }
+
     /// Which provider this record is, from its flags (none set: an Anthropic-compatible endpoint).
     pub(crate) fn kind(&self) -> Kind {
         if self.antigravity {
@@ -82,8 +99,10 @@ impl Provider {
             Kind::ChatGpt
         } else if self.ollama {
             Kind::Ollama
-        } else if self.muse {
-            Kind::Muse
+        } else if self.is_opencode() {
+            Kind::OpenCode
+        } else if self.gemini_web {
+            Kind::GeminiWeb
         } else {
             Kind::Endpoint
         }
@@ -97,7 +116,7 @@ mod tests {
     #[test]
     fn the_chatgpt_provider_is_shown_as_codex_and_stored_as_chatgpt() {
         assert_eq!((label(GPT_NAME), GPT_NAME), ("Codex", "ChatGPT"));
-        for same in [AG_NAME, OLLAMA_NAME, MUSE_NAME, "", "Claude", "chatgpt", "My Codex endpoint"] {
+        for same in [AG_NAME, OLLAMA_NAME, "", "Claude", "chatgpt", "My Codex endpoint"] {
             assert_eq!(label(same), same, "only the stored ChatGPT name is renamed");
         }
     }

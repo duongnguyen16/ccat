@@ -39,8 +39,6 @@ pub struct ProvidersEditor {
     pub(crate) login_err: String,
     pub(crate) gpt_login: Option<LoginJob<chatgpt::ChatgptAccount>>,
     pub(crate) gpt_err: String,
-    pub(crate) muse_login: Option<LoginJob<crate::museai::Account>>,
-    pub(crate) muse_err: String,
     /// Whether each ChatGPT account (by key) must sign in again and whether the Codex backend refused its token (see
     /// `chatgpt::legacy_refused`), and when that was last looked up: the answer is in a file, so it is read every few
     /// seconds, not every frame.
@@ -59,6 +57,15 @@ pub(crate) enum Act {
 
 /// A model-list request on its own thread. Antigravity asks with its first account that's on.
 fn start_fetch(ctx: &egui::Context, p: &Provider) -> Result<mpsc::Receiver<Fetched>, String> {
+    if p.gemini_web {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Ok((crate::providers::gemini_web::default_models(), Vec::new())));
+            ctx.request_repaint();
+        });
+        return Ok(rx);
+    }
     if p.ollama {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
@@ -66,17 +73,6 @@ fn start_fetch(ctx: &egui::Context, p: &Provider) -> Result<mpsc::Receiver<Fetch
         let key = (!p.key.trim().is_empty()).then(|| p.key.clone());
         std::thread::spawn(move || {
             let _ = tx.send(crate::ollama::list_models(&url, key.as_deref()).map(|ids| (ids, Vec::new())));
-            ctx.request_repaint();
-        });
-        return Ok(rx);
-    }
-    if p.muse {
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        let url = p.url.clone();
-        let key = (!p.key.trim().is_empty()).then(|| p.key.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::museai::list_models(&url, key.as_deref()).map(|ids| (ids, Vec::new())));
             ctx.request_repaint();
         });
         return Ok(rx);
@@ -105,6 +101,8 @@ fn start_fetch(ctx: &egui::Context, p: &Provider) -> Result<mpsc::Receiver<Fetch
     std::thread::spawn(move || {
         let models = match &account {
             Some(a) if p.antigravity => antigravity::list_models(a),
+            _ if p.is_opencode() => crate::providers::opencode::fetch_models(&p.url),
+            _ if p.openai => crate::providers::openai::fetch_models(&p.url, &p.key),
             _ => fetch_models(&p.url, &p.key),
         }
         .map(|ids| (ids, Vec::new()));
@@ -122,9 +120,6 @@ impl<T> Drop for LoginJob<T> {
 
 impl Drop for ProvidersEditor {
     fn drop(&mut self) {
-        if let Some(job) = &self.muse_login {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
         if let Some(job) = &self.login {
             job.cancel.store(true, Ordering::Relaxed);
         }
@@ -234,7 +229,7 @@ impl ProvidersEditor {
 
     /// A sign-in is waiting on the browser, which takes focus away from the window.
     pub fn signing_in(&self) -> bool {
-        self.login.is_some() || self.gpt_login.is_some() || self.muse_login.is_some()
+        self.login.is_some() || self.gpt_login.is_some()
     }
 
     /// (must sign in again, Codex backend refused its token) of a ChatGPT account, looked up at most every 3 seconds.
@@ -269,7 +264,7 @@ impl ProvidersEditor {
         std::mem::take(&mut self.gpt_signed_in)
     }
 
-    pub fn poll(&mut self, ctx: &egui::Context, cfg: &mut Config) {
+    pub fn poll(&mut self, cfg: &mut Config) {
         // Accounts looked up again: an Antigravity plan as it is now.
         let mut plans = Vec::new();
         self.checking.retain(|who, rx| match rx.try_recv() {
@@ -303,7 +298,10 @@ impl ProvidersEditor {
         });
         for (name, r) in done {
             match (r, cfg.providers.iter_mut().find(|p| p.name == name)) {
-                (Ok((models, meta)), Some(p)) => {
+                (Ok((mut models, meta)), Some(p)) => {
+                    if p.free_only && !p.is_opencode() {
+                        models.retain(|m| crate::providers::openai::is_free(m));
+                    }
                     p.models = models;
                     if p.chatgpt {
                         // What the answer leaves out (the official `/models` may carry no names or levels) stays as the last fetch knew it.
@@ -366,24 +364,6 @@ impl ProvidersEditor {
                 Err(e) => self.gpt_err = e,
             }
             self.gpt_login = None;
-        }
-        if let Some(r) = self.muse_login.as_ref().and_then(|j| j.rx.try_recv().ok()) {
-            match r {
-                Ok(acc) => {
-                    if let Some(p) = cfg.providers.iter_mut().find(|p| p.muse) {
-                        p.muse_account = Some(acc);
-                        p.disabled = false;
-                        let p = p.clone();
-                        self.fetch(ctx, &p);
-                    }
-                    self.muse_err.clear();
-                    std::thread::spawn(|| {
-                        crate::usage::refresh(false, false, false, false, true);
-                    });
-                }
-                Err(e) => self.muse_err = e,
-            }
-            self.muse_login = None;
         }
     }
 

@@ -20,6 +20,7 @@ use crate::usage::{parse_time, Bar, FIVE_HOURS, WEEK};
 
 pub(crate) mod mcp;
 pub(crate) mod proxy;
+mod selection;
 mod ui;
 pub(crate) use ui::page;
 
@@ -426,16 +427,17 @@ pub struct Pool {
     pub disabled: Arc<RwLock<HashSet<String>>>,
     /// (sticky account index, per-account state)
     state: Mutex<(usize, Vec<Slot>)>,
+    scheduler: Mutex<selection::Scheduler>,
     endpoints: Vec<String>,
     ua: String,
 }
 
 impl Pool {
-    /// Accounts are tried cheapest plan first (see `rank`); within a plan, in the order they were added.
+    /// Stable baseline for ties/missing usage: cheapest plan first, then sign-in order.
     pub fn new(mut accounts: Vec<Account>) -> Pool {
         accounts.sort_by_key(|a| rank(&a.plan));
         let slots = accounts.iter().map(|_| Slot::default()).collect();
-        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
+        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), scheduler: Default::default(), endpoints: ENDPOINTS.map(String::from).to_vec(), ua: user_agent() }
     }
 
     /// The accounts now; held, it keeps the indices it had (the pool only grows).
@@ -512,8 +514,19 @@ impl Pool {
         g.1[i].blocked.get(fam).and_then(|t| t.checked_duration_since(Instant::now()))
     }
 
-    /// Opens a `streamGenerateContent` SSE stream on the first account (cheapest plan first) that isn't out of quota
-    /// for this model family: free accounts carry the load until they run out, and get it back once they reset.
+    /// Fresh per-account quota from the tray, used for selection without another network poll per request.
+    pub fn update_quota(&self, email: &str, fam: &'static str, bars: &[&Bar], fetched: u64) {
+        let Some(i) = self.accounts().iter().position(|a| a.email == email) else { return };
+        self.scheduler.lock().unwrap().update(i, fam, bars, fetched);
+    }
+
+    /// Observe actual backend cache usage only after a successful complete response.
+    pub fn observe_cache(&self, i: usize, model: &str, body: &Value, cached: u64) {
+        self.scheduler.lock().unwrap().observe(i, model, body, cached, unix_now());
+    }
+
+    /// Opens a stream: matching recent cache first, then earliest-expiring usable quota, then plan/order.
+    /// Disabled accounts, live backend blocks and fresh exhausted quota always take precedence over affinity.
     /// Returns the account index used and the raw SSE reader.
     pub fn stream(&self, model: &str, request: &Value, beta: bool) -> Result<(usize, Box<dyn BufRead + Send>), Failure> {
         let fam = family(model);
@@ -525,9 +538,12 @@ impl Pool {
         if (0..n).all(|i| self.off(i)) {
             return Err(fail(403, "Every Antigravity account is turned off. Turn one on in ccat → Providers."));
         }
+        let candidates = (0..n).filter(|&i| !self.off(i) && self.blocked_for(i, fam).is_none()).collect();
+        let order = self.scheduler.lock().unwrap().order(model, request, candidates, unix_now());
         let mut last: Option<Failure> = None;
-        for i in 0..n {
-            if self.off(i) || self.blocked_for(i, fam).is_some() {
+        for i in order {
+            // Settings/quota may change while an earlier account was being tried.
+            if self.off(i) || self.blocked_for(i, fam).is_some() || self.scheduler.lock().unwrap().wait(i, fam, unix_now()).is_some() {
                 continue;
             }
             let who = &accounts[i].email;
@@ -658,10 +674,15 @@ impl Pool {
         Err(last)
     }
 
-    fn all_blocked(&self, fam: &str) -> Failure {
+    fn all_blocked(&self, fam: &'static str) -> Failure {
         let n = self.accounts().len();
-        let soonest = (0..n).filter_map(|i| self.blocked_for(i, fam)).min().unwrap_or(Duration::from_secs(60));
-        let secs = soonest.as_secs().max(1);
+        let now = unix_now();
+        // Both windows and a backend block must clear. Disabled accounts cannot shorten the wait.
+        let secs = (0..n).filter(|&i| !self.off(i)).map(|i| {
+            let block = self.blocked_for(i, fam).map(|d| d.as_secs().max(1)).unwrap_or(0);
+            let quota = self.scheduler.lock().unwrap().wait(i, fam, now).unwrap_or(0);
+            block.max(quota).max(1)
+        }).min().unwrap_or(60);
         Failure {
             status: 429,
             message: format!(
@@ -700,7 +721,7 @@ impl Pool {
         let accounts: Vec<Account> = emails.iter().map(|e| Account { email: e.to_string(), refresh: String::new(), project: format!("p-{e}"), plan: String::new(), disabled: false }).collect();
         let far = Instant::now() + Duration::from_secs(3600);
         let slots = emails.iter().map(|e| Slot { token: Some((e.to_string(), far)), ..Default::default() }).collect();
-        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), endpoints: vec![endpoint.to_string()], ua: "test".into() }
+        Pool { accounts: RwLock::new(Arc::new(accounts)), disabled: Default::default(), state: Mutex::new((0, slots)), scheduler: Default::default(), endpoints: vec![endpoint.to_string()], ua: "test".into() }
     }
 }
 

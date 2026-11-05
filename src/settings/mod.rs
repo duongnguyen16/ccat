@@ -7,15 +7,19 @@ mod glyph;
 mod insights;
 pub(crate) mod providers;
 
-use crate::providers::{antigravity, chatgpt, claude, endpoint, museai, ollama, Kind};
-use crate::{pal, popup_frame, switch, usage, Config, Disk, TierEditor};
+use crate::providers::{antigravity, chatgpt, claude, endpoint, gemini_web, ollama, Kind};
+use crate::{pal, popup_frame, remote, switch, usage, Config, Disk, TierEditor};
 use glyph::Glyph;
-use eframe::egui::{self, vec2, Align, Align2, FontId, Key, Layout, RichText, Sense, TextEdit};
+use eframe::egui::{self, vec2, Align, Align2, FontId, Key, Layout, RichText, Sense, Stroke, TextEdit};
 use providers::ProvidersEditor;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 /// The window's title, which is also how a second request finds the first (see `win::raise`).
 pub(crate) const TITLE: &str = "ccat Settings";
+/// The title of this process's window: the machine it shows is in it, so asking again finds that very window.
+pub(crate) fn window_title() -> String {
+    remote::attached().map_or_else(|| TITLE.to_string(), |m| format!("{TITLE} - {}", m.name))
+}
 const NAV_W: f32 = 220.0;
 /// The widest the page's text and rows go, however wide the window; the tables of Analytics and History get more.
 const PANE_W: f32 = 720.0;
@@ -32,17 +36,24 @@ const SCROLL_GAP: f32 = 7.0;
 enum Page {
     Models,
     Routing,
+    /// ccat's tiers served to other apps (see `gateway`).
+    Gateway,
     Tokens,
     Display,
+    Backup,
     About,
     Dashboard,
     Analytics,
     History,
+    /// The machines Settings can show (see `remote`), and, on a cloud machine, its terminals.
+    Machines,
+    Instances,
     Claude,
     Antigravity,
     ChatGpt,
     Ollama,
-    Muse,
+    GeminiWeb,
+    OpenCode(usize),
     /// A custom endpoint: its index in `Config::providers`.
     Endpoint(usize),
     /// Not a page: the sidebar's "Add endpoint", which makes one and goes to it.
@@ -54,6 +65,8 @@ enum Group {
     General,
     Insights,
     Providers,
+    /// Only on a cloud machine.
+    Cloud,
 }
 
 /// One sidebar entry.
@@ -73,19 +86,33 @@ fn items(cfg: &Config) -> Vec<Item> {
     let mut v = vec![
         general(Page::Models, "Models & tiers", Glyph::Sliders),
         general(Page::Routing, "Routing", Glyph::Route),
+        general(Page::Gateway, "Gateway", Glyph::Link),
         general(Page::Tokens, "Token saving", Glyph::Leaf),
         general(Page::Display, "Display", Glyph::Monitor),
+        general(Page::Backup, "Backup & restore", Glyph::Clock),
         general(Page::About, "About", Glyph::Info),
+        general(Page::Machines, "Cloud machines", Glyph::Cloud),
         item(Group::Insights, Page::Dashboard, "Dashboard", Glyph::Dashboard, false),
         item(Group::Insights, Page::Analytics, "Analytics", Glyph::Bars, false),
         item(Group::Insights, Page::History, "History", Glyph::Clock, false),
     ];
+    if remote::attached().is_some() {
+        v.push(item(Group::Cloud, Page::Instances, "Terminals", Glyph::Terminal, false));
+    }
     let provider = |page, label: &str, glyph, off| item(Group::Providers, page, label, glyph, off);
     v.push(provider(Page::Claude, "Claude", Glyph::Claude, cfg.claude_off));
-    for (kind, page, glyph) in [(Kind::Antigravity, Page::Antigravity, Glyph::Antigravity), (Kind::ChatGpt, Page::ChatGpt, Glyph::ChatGpt), (Kind::Ollama, Page::Ollama, Glyph::Ollama), (Kind::Muse, Page::Muse, Glyph::Muse)] {
+    for (kind, page, glyph) in [
+        (Kind::Antigravity, Page::Antigravity, Glyph::Antigravity),
+        (Kind::ChatGpt, Page::ChatGpt, Glyph::ChatGpt),
+        (Kind::Ollama, Page::Ollama, Glyph::Ollama),
+        (Kind::GeminiWeb, Page::GeminiWeb, Glyph::GeminiWeb),
+    ] {
         if let Some(p) = cfg.providers.iter().find(|p| p.kind() == kind) {
             v.push(provider(page, crate::providers::label(&p.name), glyph, p.disabled));
         }
+    }
+    for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::OpenCode) {
+        v.push(provider(Page::OpenCode(i), &p.name, Glyph::Terminal, p.disabled));
     }
     for (i, p) in cfg.providers.iter().enumerate().filter(|(_, p)| p.kind() == Kind::Endpoint) {
         v.push(provider(Page::Endpoint(i), &p.name, Glyph::Link, p.disabled));
@@ -362,11 +389,21 @@ struct Settings {
     logo: Option<egui::TextureHandle>,
     /// The providers' logos in the sidebar.
     logos: glyph::Logos,
+    /// The Cloud machines page's form for a machine to add, and what is wrong with it.
+    new_machine: remote::Machine,
+    machine_err: String,
+    /// "Turn off" was clicked once: a second click within a few seconds does it.
+    confirm_off: Option<std::time::Instant>,
+    backup_msg: String,
+    backup_err: bool,
+    pending_import: Option<PathBuf>,
+    pending_files: usize,
+    imported: bool,
 }
 
 impl Settings {
     fn new(cfg: Config, loaded: serde_json::Value) -> Self {
-        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new(), insights: insights::Insights::new(), logo: None, logos: Default::default() }
+        Self { cfg, loaded, disk: Disk::new(), page: Page::Models, query: String::new(), tiers: TierEditor::default(), providers: ProvidersEditor::default(), feed: usage::Feed::new(), insights: insights::Insights::new(), logo: None, logos: Default::default(), new_machine: Default::default(), machine_err: String::new(), confirm_off: None, backup_msg: String::new(), backup_err: false, pending_import: None, pending_files: 0, imported: false }
     }
 
     /// Takes in what another process saved (the launcher, a second Settings, a session's model switch), unless
@@ -421,13 +458,35 @@ impl Settings {
         egui::Image::new(&logo).fit_to_exact_size(vec2(28.0, 28.0)).paint_at(ui, egui::Rect::from_min_size(strip.min + vec2(6.0, 0.0), vec2(28.0, 28.0)));
         drag_window(ui, strip, "logo-drag");
         ui.add_space(12.0);
+        let mut switch_to = None;
+        egui::Panel::bottom("settings-machine").frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 0 })).show(ui, |ui| {
+            ui.label(RichText::new("Machine").size(11.5).color(p.subtle));
+            ui.add_space(2.0);
+            let here = remote::attached().map(|m| m.name.clone()).unwrap_or_default();
+            let mut choices: Vec<(String, String)> = vec![("This PC".into(), String::new())];
+            choices.extend(remote::machines().into_iter().map(|m| (m.name.clone(), m.name)));
+            choices.push(("Add machine...".into(), ADD_MACHINE.into()));
+            let width = ui.available_width();
+            if let Some(v) = select(ui, "machine", width, &choices, &here) {
+                if v == ADD_MACHINE {
+                    self.page = Page::Machines;
+                } else {
+                    switch_to = Some(v);
+                }
+            }
+            if remote::attached().is_some() {
+                let status = remote::status();
+                let color = if status == "Connected" { crate::profiles::green(ui) } else { p.danger };
+                ui.add(egui::Label::new(RichText::new(if status.is_empty() { "Connecting..." } else { &status }).size(11.5).color(color)).truncate());
+            }
+        });
         ui.add(TextEdit::singleline(&mut self.query).hint_text("Search").desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 6)));
         let all = items(&self.cfg);
         let mut go = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let shown = filter(&all, &self.query);
-            for (group, caption) in [(Group::General, "General"), (Group::Insights, "Insights"), (Group::Providers, "Providers")] {
+            for (group, caption) in [(Group::General, "General"), (Group::Cloud, "Cloud"), (Group::Insights, "Insights"), (Group::Providers, "Providers")] {
                 let mine: Vec<&&Item> = shown.iter().filter(|i| i.group == group).collect();
                 if mine.is_empty() {
                     continue;
@@ -449,6 +508,176 @@ impl Settings {
         if let Some(page) = go {
             self.go(page);
         }
+        if let Some(name) = switch_to {
+            switch_machine(&name);
+            ui.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The machines Settings can show, and a form for a new one.
+    fn machines(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        heading(ui, "Cloud machines");
+        let all = remote::machines();
+        let here = remote::attached().map(|m| m.name.clone());
+        let mut remove = None;
+        if !all.is_empty() {
+            group(ui, |ui, g| {
+                for m in &all {
+                    g.setting(ui, &m.name, &format!("{}{}", m.addr, if here.as_deref() == Some(m.name.as_str()) { "  -  shown now" } else { "" }), |ui| {
+                        if button(ui, "Remove").clicked() {
+                            remove = Some(m.name.clone());
+                        }
+                        if here.as_deref() != Some(m.name.as_str()) && button(ui, "Open").clicked() {
+                            switch_machine(&m.name);
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(name) = remove {
+            let rest: Vec<remote::Machine> = all.iter().filter(|m| m.name != name).cloned().collect();
+            if let Err(e) = remote::save_machines(&rest) {
+                self.machine_err = e;
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Add a machine").size(14.5).color(p.fg));
+        ui.add_space(4.0);
+        let m = &mut self.new_machine;
+        providers::field(ui, "Name", &mut m.name, egui::Id::new("machine-name"), false, "azure");
+        providers::field(ui, "Agent", &mut m.addr, egui::Id::new("machine-addr"), false, "100.84.218.57:8788");
+        providers::field(ui, "Token", &mut m.token, egui::Id::new("machine-token"), true, "from `ccat --serve` on that machine");
+        providers::field(ui, "SSH", &mut m.ssh, egui::Id::new("machine-ssh"), false, "user@host, for its terminals");
+        providers::field(ui, "VM", &mut m.vm, egui::Id::new("machine-vm"), false, "resource-group/name, to turn it on");
+        ui.add_space(6.0);
+        if primary_button(ui, "Add").clicked() {
+            let mut next = all.clone();
+            self.machine_err = match remote::check_name(&all, &self.new_machine.name, "") {
+                Err(e) => e,
+                Ok(_) if self.new_machine.addr.trim().is_empty() || self.new_machine.token.trim().is_empty() => "The agent's address and token are needed.".into(),
+                Ok(name) => {
+                    next.push(remote::Machine { name, ..std::mem::take(&mut self.new_machine) });
+                    remote::save_machines(&next).err().unwrap_or_default()
+                }
+            };
+        }
+        if !self.machine_err.is_empty() {
+            providers::note(ui, &self.machine_err, p.danger);
+        }
+        paragraph(ui, "How it works", "A cloud machine runs `ccat --serve` (its agent prints where the token is kept). Pick it in the Machine list at the bottom of the sidebar: every page then shows and edits that machine's settings, and its sessions follow within seconds, as local ones do. Sign-ins (Google, ChatGPT...) stay on the machine they were made on. Terminals of a machine open as SSH windows here.");
+    }
+
+    /// Server: on and off, a sleep timer, stay awake. The machine stops by itself (its idle watchdog); this is the
+    /// switch for it.
+    fn server(&mut self, ui: &mut egui::Ui, m: &remote::Machine) {
+        let p = pal(ui);
+        let power = remote::power();
+        let hhmm = |t: u64| {
+            let (_, h, mi) = usage::local(t);
+            format!("{h:02}:{mi:02}")
+        };
+        let (title, desc) = match &power {
+            Some(Ok(w)) if !w.supported => ("Server is on".to_string(), "This machine has no sleep watchdog: it stays on until it is turned off.".to_string()),
+            Some(Ok(w)) if w.stay_awake => ("Server is on, staying awake".to_string(), format!("It does not sleep by itself; it still stops at {} (23:00 in Vietnam).", hhmm(w.hard_stop))),
+            Some(Ok(w)) if w.building => ("Server is on, busy".to_string(), "A build is running; it sleeps 15 minutes after that.".to_string()),
+            Some(Ok(w)) => (
+                "Server is on".to_string(),
+                match w.sleep_at {
+                    Some(t) => format!("Sleeps at {} ({} min from now); always at {} (23:00 in Vietnam).", hhmm(t), t.saturating_sub(w.now) / 60, hhmm(w.hard_stop)),
+                    None => "Sleep time unknown.".to_string(),
+                },
+            ),
+            Some(Err(e)) if remote::starting() => ("Server is starting...".to_string(), format!("It takes a minute or two. ({e})")),
+            Some(Err(e)) => ("Server is off or unreachable".to_string(), e.clone()),
+            None => ("Looking...".to_string(), String::new()),
+        };
+        let on = matches!(power, Some(Ok(_)));
+        group(ui, |ui, g| {
+            g.setting(ui, &title, &desc, |ui| {
+                if on {
+                    let armed = self.confirm_off.is_some_and(|t| t.elapsed() < Duration::from_secs(5));
+                    if button(ui, if armed { "Confirm: turn off" } else { "Turn off" }).on_hover_text("Stops the machine now; terminals running on it end.").clicked() {
+                        if armed {
+                            self.confirm_off = None;
+                            if let Err(e) = remote::power_set(m, &serde_json::json!({ "action": "sleep_now" })) {
+                                self.machine_err = e;
+                            }
+                        } else {
+                            self.confirm_off = Some(std::time::Instant::now());
+                        }
+                    }
+                } else if !remote::starting() && primary_button(ui, "Turn on").clicked() {
+                    if let Err(e) = remote::start_vm(m) {
+                        self.machine_err = e;
+                    }
+                }
+            });
+            if let Some(Ok(w)) = power.as_ref().filter(|w| w.as_ref().is_ok_and(|w| w.supported)) {
+                g.setting(ui, "Sleep in", "From now: the machine turns itself off after this long, however it is used.", |ui| {
+                    let opts: Vec<(String, u64)> = [("Set a timer", 0), ("15 minutes", 15), ("30 minutes", 30), ("1 hour", 60), ("2 hours", 120), ("4 hours", 240), ("8 hours", 480)].iter().map(|(l, v)| (l.to_string(), *v)).collect();
+                    if let Some(minutes) = select(ui, "sleep-timer", 140.0, &opts, &0) {
+                        if let Err(e) = remote::power_set(m, &serde_json::json!({ "action": "timer", "minutes": minutes })) {
+                            self.machine_err = e;
+                        }
+                    }
+                });
+                g.setting(ui, "Stay awake", "No timer: the machine only stops at 23:00 in Vietnam, or when turned off here.", |ui| {
+                    let mut stay = w.stay_awake;
+                    if switch(ui, &mut stay, "").changed() {
+                        if let Err(e) = remote::power_set(m, &serde_json::json!({ "action": "stay", "on": stay })) {
+                            self.machine_err = e;
+                        }
+                    }
+                });
+            }
+        });
+        if !self.machine_err.is_empty() {
+            providers::note(ui, &self.machine_err, p.danger);
+        }
+    }
+
+    /// The terminals (tmux sessions) of the machine shown: a click opens one in a window here.
+    fn instances(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        let Some(m) = remote::attached() else { return };
+        heading(ui, &format!("Terminals on {}", m.name));
+        self.server(ui, m);
+        let list = remote::instances();
+        let existing = match &list {
+            Some(Ok((_, l))) => l.clone(),
+            _ => Vec::new(),
+        };
+        group(ui, |ui, g| {
+            g.setting(ui, "New terminal", "A new session on the machine, in a window here. Run ccat in it, then close the window to leave it running there.", |ui| {
+                if primary_button(ui, "New").clicked() {
+                    if let Err(e) = remote::open_terminal(m, &remote::new_session_name(&existing)) {
+                        self.machine_err = e;
+                    }
+                }
+            });
+        });
+        match list {
+            None => paragraph(ui, "", "Looking..."),
+            Some(Err(e)) => providers::note(ui, &format!("Could not list them: {e}"), p.danger),
+            Some(Ok((false, _))) => paragraph(ui, "", "tmux is not installed on that machine, so there are no sessions to show. Install it there (apt install tmux)."),
+            Some(Ok((true, l))) if l.is_empty() => paragraph(ui, "", "Nothing is running in tmux there yet. Use New terminal."),
+            Some(Ok((true, l))) => group(ui, |ui, g| {
+                for s in &l {
+                    let what = format!("{}  -  {}{}", s.command, s.path, if s.attached { "  -  open somewhere" } else { "" });
+                    g.setting(ui, &s.name, &what, |ui| {
+                        if button(ui, "Open").clicked() {
+                            if let Err(e) = remote::open_terminal(m, &s.name) {
+                                self.machine_err = e;
+                            }
+                        }
+                    });
+                }
+            }),
+        }
+        if !self.machine_err.is_empty() {
+            providers::note(ui, &self.machine_err, p.danger);
+        }
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -464,11 +693,13 @@ impl Settings {
             match self.page.clone() {
                 Page::Models => self.models(ui, frame),
                 Page::Routing => self.routing(ui),
+                Page::Gateway => self.gateway(ui),
                 Page::Tokens => self.tokens(ui),
                 Page::Display => {
                     heading(ui, "Display");
                     group(ui, |ui, g| usage::display_block(ui, g, &mut self.cfg));
                 }
+                Page::Backup => self.backup(ui, frame),
                 Page::About => self.about(ui),
                 Page::Dashboard => self.insights.dashboard(ui),
                 Page::Analytics => self.insights.analytics(ui),
@@ -477,7 +708,12 @@ impl Settings {
                 Page::Antigravity => antigravity::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::ChatGpt => chatgpt::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
                 Page::Ollama => ollama::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
-                Page::Muse => museai::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
+                Page::GeminiWeb => gemini_web::page(&mut self.providers, ui, &mut self.cfg, &self.feed),
+                Page::OpenCode(i) => {
+                    if self.cfg.providers.get(i).is_some_and(|p| p.is_opencode()) {
+                        endpoint::page(&mut self.providers, ui, &mut self.cfg, &self.feed, i);
+                    }
+                }
                 Page::Endpoint(i) => {
                     if let Some(act) = endpoint::page(&mut self.providers, ui, &mut self.cfg, &self.feed, i) {
                         let deleted = matches!(act, providers::Act::Delete(_));
@@ -487,6 +723,8 @@ impl Settings {
                         }
                     }
                 }
+                Page::Machines => self.machines(ui),
+                Page::Instances => self.instances(ui),
                 Page::Add => {}
             }
             ui.add_space(20.0);
@@ -526,7 +764,7 @@ impl Settings {
                 }
             });
         }
-        g.setting(ui, "Never fall back to a paid API key", "A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT, MuseAI) and Ollama stay eligible. Routed sessions only.", |ui| {
+        g.setting(ui, "Never fall back to a paid API key", "A tier's fallbacks that are custom Anthropic-compatible endpoints (a paid API key) are skipped; a tier's own first choice still runs. Subscription plans (Claude, Antigravity, ChatGPT), Ollama and OpenCode Free stay eligible. Routed sessions only.", |ui| {
             switch(ui, &mut self.cfg.no_paid_fallback, "");
         });
         g.setting(ui, "Compact earlier on non-Claude models", "A tier shown to Claude Code under a Claude name gets that model's context window, often 1M, so sessions grow huge and slow before compacting. ccat asks Claude Code to compact at this size instead. Applies to the next launch; the whole session uses it.", |ui| {
@@ -552,6 +790,90 @@ impl Settings {
         paragraph(ui, "Circuit breaker", "A provider that fails 3 times in a row with a 5xx error or a timeout is skipped for 30 seconds, so a request goes straight to the tier's next route instead of waiting on a provider that is down. One request then tries it again. If every route is skipped, they are all tried anyway.");
     }
 
+    fn gateway(&mut self, ui: &mut egui::Ui) {
+        heading(ui, "Gateway");
+        let p = pal(ui);
+        let cfg = &mut self.cfg;
+        let defaults: Vec<String> = (0..4).map(|t| crate::gateway::default_name(cfg, t)).collect();
+        let routes: Vec<(bool, String)> = cfg.tiers.iter().map(|r| (r.provider.is_empty(), crate::route_text(r))).collect();
+        let g = &mut cfg.gateway;
+        let base = format!("http://127.0.0.1:{}", g.port);
+        group(ui, |ui, c| {
+            c.setting(ui, "Serve ccat to other apps", "Other apps and scripts (Cursor, Cline, opencode, your own code) use ccat's tiers through a local URL, OpenAI or Anthropic style, with each tier's fallbacks. The ccat tray runs it.", |ui| {
+                switch(ui, &mut g.on, "");
+            });
+            c.setting(ui, "Port", "On this machine only (127.0.0.1).", |ui| {
+                ui.add(egui::DragValue::new(&mut g.port).range(1024..=65535));
+            });
+            if g.on {
+                c.item(ui, |ui| {
+                    // The tray says how it went; a stale "listening" (tray gone) shows as not running.
+                    let said = crate::gateway::status();
+                    let up = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], g.port).into(), Duration::from_millis(150)).is_ok();
+                    let (text, color) = match said.strip_prefix("listening on ") {
+                        Some(addr) if up && addr.ends_with(&format!(":{}", g.port)) => ("Running".to_string(), p.fg),
+                        _ if said.starts_with("cannot") => (said.clone(), p.danger),
+                        _ => ("Not running yet: it starts within seconds while the ccat tray runs (tray menu → Restart if it doesn't).".to_string(), p.subtle),
+                    };
+                    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+                    for (label, url) in [("OpenAI base URL", format!("{base}/v1")), ("Anthropic base URL", base.clone())] {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(label).size(12.5).color(p.subtle));
+                            ui.label(RichText::new(&url).monospace().size(12.5));
+                            if button(ui, "Copy").clicked() {
+                                ui.ctx().copy_text(url.clone());
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        group(ui, |ui, c| {
+            c.setting(ui, "Accept any API key", "Any key, or none, is let in. Anything on this machine can then spend your plans and keys.", |ui| {
+                switch(ui, &mut g.any_key, "");
+            });
+            if !g.any_key {
+                let mut remove = None;
+                for (i, key) in g.keys.iter_mut().enumerate() {
+                    c.item(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let id = egui::Id::new(("gateway-key", i));
+                            let masked = !ui.memory(|m| m.has_focus(id));
+                            ui.add(TextEdit::singleline(key).id(id).password(masked).desired_width((ui.available_width() - 130.0).max(120.0)));
+                            if button(ui, "Copy").clicked() {
+                                ui.ctx().copy_text(key.clone());
+                            }
+                            if button(ui, "Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = remove {
+                    g.keys.remove(i);
+                }
+                c.item(ui, |ui| {
+                    if button(ui, "Add key").clicked() {
+                        g.keys.push(crate::gateway::new_key());
+                    }
+                    if g.keys.is_empty() {
+                        ui.label(RichText::new("No key yet: every request is refused.").size(12.5).color(p.subtle));
+                    }
+                });
+            }
+        });
+        group(ui, |ui, c| {
+            for (t, (tier, ..)) in crate::TIERS.iter().enumerate() {
+                let (claude, route) = &routes[t];
+                let desc = if *claude { format!("Runs on Claude ({route}): not served, the gateway has no Claude Code login.") } else { format!("Runs {route}.") };
+                c.setting(ui, tier, &desc, |ui| {
+                    ui.add(TextEdit::singleline(&mut g.names[t]).hint_text(&defaults[t]).desired_width(ui.available_width()));
+                });
+            }
+        });
+        paragraph(ui, "Model names", "The name an app asks for picks the tier; leave it empty for the tier's model id. A tier's key (fable, opus, sonnet, haiku) always works too, and /v1/models lists the names. Which model each tier runs is set in Models & tiers.");
+    }
+
     fn tokens(&mut self, ui: &mut egui::Ui) {
         heading(ui, "Token saving");
         group(ui, |ui, g| g.setting(ui, "Compress tool output (third-party models)", "Lossless cleanup of command output (Bash/PowerShell) before it goes to a third-party model: ANSI colours, progress-bar redraws, trailing spaces, runs of identical lines. Never on Claude, never on error results, never on file contents (Read, Grep). Routed sessions only.", |ui| {
@@ -559,6 +881,129 @@ impl Settings {
         }));
         paragraph(ui, "", "Build logs and test runs (command output) are mostly noise. Cleaning them up before they are sent means fewer tokens used and more room left in the model's context window, without changing what the output says.");
         paragraph(ui, "Prompt cache", "ccat keeps each provider's prompt prefix byte-stable, and Claude request bodies are forwarded exactly as Claude Code sent them, so each provider's own prompt cache keeps hitting. Nothing to set.");
+    }
+
+    fn backup(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        heading(ui, "Backup & restore");
+        let p = pal(ui);
+        let disabled = remote::attached().is_some() || self.providers.signing_in();
+
+        group(ui, |ui, g| {
+            g.setting(ui, "Export backup", "Save accounts, routing profiles, preferences and cloud machines to a JSON file.", |ui| {
+                if ui.add_enabled_ui(!disabled, |ui| button(ui, "Export...")).inner.clicked() {
+                    let file = rfd::FileDialog::new().set_parent(frame)
+                        .set_file_name("ccat-backup.json")
+                        .add_filter("ccat backup", &["json"])
+                        .save_file();
+                    if let Some(path) = file {
+                        match crate::backup::export(&path) {
+                            Ok(count) => {
+                                self.backup_msg = format!("Exported {count} files to {}.", path.file_name().and_then(|n| n.to_str()).unwrap_or("backup"));
+                                self.backup_err = false;
+                            }
+                            Err(e) => {
+                                self.backup_msg = e;
+                                self.backup_err = true;
+                            }
+                        }
+                    }
+                }
+            });
+            g.setting(ui, "Restore backup", "Inspect and restore matching saved data from a backup JSON file.", |ui| {
+                if ui.add_enabled_ui(!disabled, |ui| button(ui, "Restore...")).inner.clicked() {
+                    let file = rfd::FileDialog::new().set_parent(frame)
+                        .add_filter("ccat backup", &["json"])
+                        .pick_file();
+                    if let Some(path) = file {
+                        match crate::backup::inspect(&path) {
+                            Ok(count) => {
+                                self.pending_import = Some(path);
+                                self.pending_files = count;
+                                self.backup_msg.clear();
+                                self.backup_err = false;
+                            }
+                            Err(e) => {
+                                self.backup_msg = e;
+                                self.backup_err = true;
+                                self.pending_import = None;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        if !self.backup_msg.is_empty() {
+            let color = if self.backup_err { p.danger } else { crate::profiles::green(ui) };
+            providers::note(ui, &self.backup_msg, color);
+            ui.add_space(8.0);
+        }
+
+        if remote::attached().is_some() {
+            providers::note(ui, "Backup and restore are available for local data only.", p.subtle);
+            ui.add_space(6.0);
+        } else if self.providers.signing_in() {
+            providers::note(ui, "Backup and restore are disabled while a provider is signing in.", p.subtle);
+            ui.add_space(6.0);
+        }
+
+        providers::note(ui, "Warning: unencrypted backup contains API keys, OAuth tokens and Gemini cookies; keep private.", p.danger);
+        ui.add_space(10.0);
+
+        paragraph(ui, "Scope", "Includes app accounts, all named routing profiles, preferences, and cloud machines. Excludes Claude CLI login, environment secrets, browser profiles, and runtime logs or caches.");
+        paragraph(ui, "Sessions", "Close other ccat sessions before restoring; relaunch sessions afterward.");
+
+        if let Some(path) = self.pending_import.clone() {
+            let mut do_import = false;
+            let mut cancel = false;
+            let m = egui::Modal::new(egui::Id::new("backup-restore-modal")).show(ui.ctx(), |ui| {
+                ui.set_width(320.0);
+                style(ui);
+                let p = pal(ui);
+                ui.label(RichText::new("Replace matching saved data").family(crate::serif()).size(17.0));
+                ui.add_space(8.0);
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("backup");
+                let files_label = if self.pending_files == 1 { "1 file" } else { &format!("{} files", self.pending_files) };
+                ui.add(egui::Label::new(RichText::new(format!(
+                    "Restoring “{name}” ({files_label}) will replace matching saved files, including account lists and settings. Accounts absent from those lists will no longer appear. Other local files stay in place."
+                )).size(12.0).color(p.fg)).wrap());
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new("Close other ccat sessions before restoring; relaunch sessions afterward.").size(11.5).color(p.subtle)).wrap());
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let go = egui::Button::new(RichText::new("Import").color(p.bg).strong())
+                        .fill(p.fg)
+                        .stroke(Stroke::NONE)
+                        .min_size(vec2(72.0, 30.0));
+                    if ui.add(go).clicked() {
+                        do_import = true;
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Cancel").color(p.muted)).frame(false)).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if cancel || m.should_close() {
+                self.pending_import = None;
+            } else if do_import {
+                self.pending_import = None;
+                match crate::backup::import(&path) {
+                    Ok(count) => {
+                        (self.cfg, self.loaded) = crate::load();
+                        self.providers = ProvidersEditor::default();
+                        self.tiers = TierEditor::default();
+                        self.disk = Disk::new();
+                        self.imported = true;
+                        self.backup_msg = format!("Restored {count} files. Close other ccat sessions; relaunch sessions afterward.");
+                        self.backup_err = false;
+                    }
+                    Err(e) => {
+                        self.backup_msg = e;
+                        self.backup_err = true;
+                    }
+                }
+            }
+        }
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
@@ -599,10 +1044,12 @@ impl eframe::App for Settings {
         let before = serde_json::to_value(&self.cfg).unwrap_or_default();
         let gpt_mode = |c: &Config| c.providers.iter().find(|p| p.chatgpt).map(|p| p.gpt_legacy());
         let mode = gpt_mode(&self.cfg);
-        self.providers.poll(&ctx, &mut self.cfg);
+        self.providers.poll(&mut self.cfg);
         // Esc belongs to a rename or a picker first, then to the search box, then it closes the window.
         if !self.providers.active() && !self.tiers.active() && !select_open && ui.input(|i| i.key_pressed(Key::Escape)) {
-            if self.query.is_empty() {
+            if self.pending_import.is_some() {
+                self.pending_import = None;
+            } else if self.query.is_empty() {
                 ui.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 self.query.clear();
@@ -612,7 +1059,9 @@ impl eframe::App for Settings {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal(ui).content)).show(ui, |ui| self.layout(ui, frame));
         crate::outline(ui);
         resize_zones(ui);
-        if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
+        if self.imported {
+            self.imported = false;
+        } else if serde_json::to_value(&self.cfg).unwrap_or_default() != before {
             self.save();
         }
         // A finished ChatGPT sign-in or a mode switch makes the stored usage answer (often an error) stale: ask again, now
@@ -683,6 +1132,22 @@ fn resize_zones(ui: &mut egui::Ui) {
 }
 
 /// The Settings process: `page` names the one to open on (see `Page::parse`).
+/// The row of the Machine list that adds a machine.
+const ADD_MACHINE: &str = "\u{1}add";
+
+/// Opens Settings for `name` (a machine; "" is this PC), or brings its window to the front.
+fn switch_machine(name: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(usage::SETTINGS_FLAG).env_remove(remote::MACHINE_ENV).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if !name.is_empty() {
+        cmd.env(remote::MACHINE_ENV, name);
+    }
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0000_0008 | 0x0000_0200);
+    let _ = cmd.spawn();
+}
+
 pub fn run(page: Option<String>) {
     #[cfg(windows)]
     if !win::claim() {
@@ -691,7 +1156,7 @@ pub fn run(page: Option<String>) {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
+            .with_title(window_title())
             .with_icon(crate::app_icon())
             .with_decorations(false)
             .with_resizable(true)
@@ -701,7 +1166,7 @@ pub fn run(page: Option<String>) {
         ..Default::default()
     };
     let _ = eframe::run_native(
-        TITLE,
+        &window_title(),
         options,
         Box::new(move |cc| {
             crate::setup(&cc.egui_ctx);
@@ -751,7 +1216,7 @@ pub fn open_settings_at(page: &str) {
 
 #[cfg(windows)]
 mod win {
-    use super::TITLE;
+    use super::window_title;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
         System::Threading::CreateMutexW,
@@ -766,7 +1231,7 @@ mod win {
     pub fn claim() -> bool {
         // SAFETY: a named mutex; the handle is kept for the process lifetime when it's ours, closed when it isn't.
         unsafe {
-            let h = CreateMutexW(std::ptr::null(), 0, wide("Local\\ccat-settings").as_ptr());
+            let h = CreateMutexW(std::ptr::null(), 0, wide(&format!("Local\\ccat-settings-{}", window_title())).as_ptr());
             if h.is_null() {
                 return true; // can't tell: open anyway
             }
@@ -782,7 +1247,7 @@ mod win {
     pub fn raise() -> bool {
         // SAFETY: a top-level window found by its title; restoring and focusing it takes no pointers.
         unsafe {
-            let hwnd = FindWindowW(std::ptr::null(), wide(TITLE).as_ptr());
+            let hwnd = FindWindowW(std::ptr::null(), wide(&window_title()).as_ptr());
             if hwnd.is_null() {
                 return false;
             }
@@ -813,19 +1278,33 @@ mod tests {
         assert_eq!(filter(&all, "  ").len(), all.len(), "blanks don't filter");
         assert_eq!(labels(&filter(&all, "OPENrou")), ["OpenRouter"]);
         assert_eq!(labels(&filter(&all, "tier")), ["Models & tiers"]);
+        assert_eq!(labels(&filter(&all, "backup")), ["Backup & restore"]);
         assert!(filter(&all, "zzz").is_empty());
         let names: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(names[..8], ["Models & tiers", "Routing", "Token saving", "Display", "About", "Dashboard", "Analytics", "History"]);
-        assert_eq!(names[8..], ["Claude", "Antigravity", "Codex", "Ollama", "MuseAI", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
+        assert_eq!(names[..11], ["Models & tiers", "Routing", "Gateway", "Token saving", "Display", "Backup & restore", "About", "Cloud machines", "Dashboard", "Analytics", "History"]);
+        assert_eq!(names[11..], ["Claude", "Antigravity", "Codex", "Ollama", "Gemini Web", "OpenCode Free", "OpenRouter", "Add endpoint"], "Claude, the built-ins, then endpoints by name");
         assert_eq!((Page::parse("codex", &cfg), Page::parse("ChatGPT", &cfg)), (Some(Page::ChatGpt), Some(Page::ChatGpt)), "the old page name still opens it");
         assert_eq!(Page::parse("models", &cfg), Some(Page::Models), "the first word of a label is enough");
+        assert_eq!(Page::parse("backup", &cfg), Some(Page::Backup));
+        assert_eq!(Page::parse("backup & restore", &cfg), Some(Page::Backup));
         assert_eq!((Page::parse("analytics", &cfg), Page::parse("History", &cfg)), (Some(Page::Analytics), Some(Page::History)));
         assert_eq!(Page::parse("dashboard", &cfg), Some(Page::Dashboard), "--ccat-settings dashboard");
         assert_eq!(Page::parse("openrouter", &cfg), Some(Page::Endpoint(4)));
         assert_eq!(Page::parse("add", &cfg), None);
     }
 
-    /// Only the five built-in providers carry a logo: the white marks are tinted, the brand ones keep their colours; every
+    #[test]
+    fn every_migrated_opencode_provider_remains_visible() {
+        let cfg = crate::from_raw(serde_json::json!({ "providers": [
+            { "name": "Free A", "url": "https://opencode.ai/inference/openai/v1" },
+            { "name": "Free B", "url": "https://opencode.ai/inference/openai/v1" }
+        ] }));
+        let all = items(&cfg);
+        assert_eq!(labels(&filter(&all, "Free")), ["Free A", "Free B"]);
+        assert!(all.iter().filter(|i| i.label.starts_with("Free ")).all(|i| matches!(i.page, Page::OpenCode(_))));
+    }
+
+    /// Only the four built-in providers carry a logo: the white marks are tinted, the brand ones keep their colours; every
     /// other item (pages, endpoints, "Add endpoint") stays a drawn glyph. The embedded files decode.
     #[test]
     fn provider_items_use_their_logo_and_the_rest_keep_the_glyph() {
@@ -838,11 +1317,10 @@ mod tests {
         assert_eq!(logo("Antigravity"), Some(("google-antigravity.png", false)));
         assert_eq!(logo("Codex"), Some(("openai-chatgpt.png", true)), "stored as ChatGPT, shown as Codex");
         assert_eq!(logo("Ollama"), Some(("ollama-dark.png", true)));
-        assert_eq!(logo("MuseAI"), Some(("Muse-logo.png", false)));
-        for plain in ["Models & tiers", "Routing", "Token saving", "Display", "About", "Dashboard", "Analytics", "History", "OpenRouter", "Add endpoint"] {
+        for plain in ["Models & tiers", "Routing", "Token saving", "Display", "Backup & restore", "About", "Dashboard", "Analytics", "History", "Gemini Web", "OpenRouter", "Add endpoint"] {
             assert_eq!(logo(plain), None, "{plain}");
         }
-        for g in [Glyph::Claude, Glyph::Antigravity, Glyph::ChatGpt, Glyph::Ollama, Glyph::Muse] {
+        for g in [Glyph::Claude, Glyph::Antigravity, Glyph::ChatGpt, Glyph::Ollama] {
             let icon = eframe::icon_data::from_png_bytes(glyph::art(g).unwrap().png).unwrap();
             assert_eq!((icon.width, icon.height), (96, 96), "{g:?}");
             // The decoded mark paints through a real context without a window.

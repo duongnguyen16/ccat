@@ -83,8 +83,9 @@ pub(crate) fn messages(s: &mut TcpStream, ctx: &Ctx, req: &Value, asked: &str, m
         match tx.run(reader) {
             Ok(()) => {
                 let msg = tx.message();
-                let prompt = tx.usage.0;
+                let (prompt, cached, _) = tx.usage;
                 drop(tx);
+                ctx.pool.observe_cache(i, &model, &cca, cached);
                 record(tier, "Antigravity", &model, &msg["usage"], Meta { started, stop: msg["stop_reason"].as_str(), acct: &ctx.pool.alias(i) });
                 // Search answers carry Google's page text, which the request never had: they'd skew the ratio.
                 if web_search(req).is_none() {

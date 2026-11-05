@@ -1,6 +1,7 @@
-//! Ollama provider: Ollama Cloud (https://ollama.com) and local Ollama model serving for Claude Code.
-//! Protocol: translates Anthropic Messages API -> Ollama's native `/api/chat` (NDJSON stream: the OpenAI-compatible
-//! `/v1` ignores `num_ctx` and `keep_alive`), quota/balance tracking via `/api/balance`, and web search via `/api/web_search`.
+//! Ollama provider: Ollama Cloud (https://ollama.com) only, behind Claude Code. A local Ollama server is not supported.
+//! Protocol: translates Anthropic Messages API -> Ollama's native `/api/chat` (NDJSON stream, `think` levels and cached
+//! prompt counts, which the `/v1/messages` compatibility route lacks), quota/balance via `/api/balance`, and web search
+//! via `/api/web_search`.
 
 use crate::common::{self, Failure};
 use crate::providers::antigravity::proxy::messages;
@@ -22,80 +23,58 @@ use std::{
 static NO_THINK: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 pub const DEFAULT_URL: &str = "https://ollama.com";
-pub const _LOCAL_URL: &str = "http://localhost:11434";
 
-/// Normalize base URL ensuring http/https scheme, stripped trailing slashes and any `/v1` saved for the old
-/// OpenAI-compatible route (every call here is under `/api`).
+/// The base every call goes under: `DEFAULT_URL` unless a test points it elsewhere. Trailing slashes and a `/v1` saved
+/// for the old OpenAI-compatible route are stripped (every call here is under `/api`).
 pub fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
     if trimmed.is_empty() {
-        return DEFAULT_URL.to_string();
-    }
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        if trimmed.starts_with("localhost") || trimmed.starts_with("127.0.0.1") {
-            format!("http://{trimmed}")
-        } else {
-            format!("https://{trimmed}")
-        }
-    } else {
+        DEFAULT_URL.to_string()
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
     }
 }
 
-/// Fetch list of models from Ollama (Cloud or Local).
-/// Tries `/api/tags` first (standard for ollama.com and local); falls back to `/v1/models`.
+/// The cloud models Claude Code can drive, from `GET /api/tags`: a model that lists capabilities without `tools`
+/// could not run a single tool call, so it is left out.
 pub fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<String>, String> {
-    let url = normalize_url(base_url);
+    let url = format!("{}/api/tags", normalize_url(base_url));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
-
-    let mut req_tags = agent.get(format!("{url}/api/tags"));
+    let mut req = agent.get(&url);
     if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
-        req_tags = req_tags.header("Authorization", format!("Bearer {k}"));
+        req = req.header("Authorization", format!("Bearer {k}"));
     }
-
-    if let Ok(mut res) = req_tags.call() {
-        if let Ok(body) = res.body_mut().read_to_string() {
-            if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                if let Some(arr) = v["models"].as_array() {
-                    let mut models: Vec<String> = arr
-                        .iter()
-                        .filter_map(|m| m["name"].as_str().or(m["model"].as_str()).map(crate::bare_id))
-                        .collect();
-                    if !models.is_empty() {
-                        models.sort();
-                        models.dedup();
-                        return Ok(models);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut req_v1 = agent.get(format!("{url}/v1/models"));
-    if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
-        req_v1 = req_v1.header("Authorization", format!("Bearer {k}"));
-    }
-    let mut res = req_v1.call().map_err(|e| format!("{url}: {e}"))?;
+    let mut res = req.call().map_err(|e| format!("{url}: {e}"))?;
     let body = res.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|e| format!("response is not JSON: {e}"))?;
-    let data_arr = v["data"].as_array().ok_or("response has no `data` or `models` array")?;
-    let mut models: Vec<String> = data_arr
-        .iter()
-        .filter_map(|m| m["id"].as_str().map(crate::bare_id))
-        .collect();
+    let models = tool_models(&v);
     if models.is_empty() {
-        return Err("No models found from Ollama.".into());
+        return Err("Ollama Cloud listed no models that can call tools.".into());
     }
-    models.sort();
-    models.dedup();
     Ok(models)
 }
 
-/// Fetch quota/balance from Ollama Cloud (`GET /api/balance`).
+fn tool_models(tags: &Value) -> Vec<String> {
+    let mut models: Vec<String> = tags["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["capabilities"].as_array().is_none_or(|c| c.iter().any(|x| x == "tools")))
+        .filter_map(|m| m["name"].as_str().or(m["model"].as_str()).map(crate::bare_id))
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// Fetch quota/balance from Ollama Cloud (`GET /api/balance`). The endpoint allows 10 calls a minute per user,
+/// shared across keys; `usage` polls far less often than that.
 pub fn fetch_balance(base_url: &str, key: &str) -> Result<Vec<crate::usage::Bar>, String> {
     if key.trim().is_empty() {
         return Ok(Vec::new());
@@ -103,6 +82,7 @@ pub fn fetch_balance(base_url: &str, key: &str) -> Result<Vec<crate::usage::Bar>
     let url = format!("{}/api/balance", normalize_url(base_url));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
         .build()
         .into();
 
@@ -112,6 +92,14 @@ pub fn fetch_balance(base_url: &str, key: &str) -> Result<Vec<crate::usage::Bar>
         .header("Accept", "application/json")
         .call()
         .map_err(|e| format!("{url}: {e}"))?;
+    match res.status().as_u16() {
+        200 => {}
+        401 => return Err("Ollama Cloud rejected the API key (401). Check it under Settings → Ollama.".into()),
+        403 => return Err("Ollama Cloud account is suspended (403).".into()),
+        429 => return Err("Ollama Cloud balance is rate limited (429); it is asked again later.".into()),
+        503 => return Err("Ollama Cloud balance reporting is temporarily unavailable (503).".into()),
+        s => return Err(format!("Ollama Cloud balance answered {s}.")),
+    }
 
     let body = res.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|e| format!("balance response is not JSON: {e}"))?;
@@ -209,13 +197,7 @@ pub fn web_search(base_url: &str, key: &str, query: &str) -> Result<Vec<(String,
     Ok(links)
 }
 
-/// How long Ollama keeps the model (and its KV cache, the prompt-cache hit) loaded after a request. Default is 5 min.
-const KEEP_ALIVE: &str = "30m";
-/// Context window, the same on every request: a different `num_ctx` reloads the model and drops its cache.
-/// Ollama's default is too small for Claude Code's prompt; only the native API honours this, not `/v1`.
-const NUM_CTX: u64 = 65536;
-
-/// Lines injected by Claude Code or Agent SDK that degrade prompt caching or cause issues on local models.
+/// Lines injected by Claude Code or Agent SDK: the per-request billing line would break Ollama's prompt cache.
 const FILTERED_LINES: [&str; 2] = [
     "x-anthropic-billing-header:",
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
@@ -366,12 +348,12 @@ pub fn chat_body(body: &Value, model: &str, stream: bool) -> Value {
         }
     }
 
+    // No `num_ctx` / `keep_alive`: cloud models run at their own full context, and nothing stays loaded per user.
     let mut payload = json!({
         "model": model,
         "messages": messages,
         "stream": stream,
-        "keep_alive": KEEP_ALIVE,
-        "options": { "num_ctx": NUM_CTX },
+        "options": {},
     });
 
     if let Some(max_tokens) = body.get("max_tokens").and_then(Value::as_u64) {
@@ -547,9 +529,8 @@ pub(crate) fn ollama_messages(
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
 
-    // WebSearch support:
-    // If an Ollama Cloud API key is available, query Ollama's native web search endpoint!
-    // Otherwise, delegate to Gemini Flash if Antigravity is active.
+    // WebSearch runs on Ollama Cloud's own `/api/web_search` with the same key; should it fail, Gemini Flash answers
+    // when Antigravity accounts are signed in.
     if crate::proxy::web_search(body).is_some() {
         let q = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| {
             if let Some(s) = m["content"].as_str() {
@@ -635,7 +616,7 @@ pub(crate) fn ollama_messages(
 
 // ---------------------------------------------------------------- settings page
 
-/// Settings → Ollama: its on/off switch, the URL (local, or Ollama Cloud) and key, and the model list.
+/// Settings → Ollama: its on/off switch, the Ollama Cloud API key, the balance and the model list.
 pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mut eframe::egui::Ui, cfg: &mut crate::Config, feed: &crate::usage::Feed) {
     use crate::settings::{group, providers::{count, head, name, note, row}};
     use eframe::egui::{self, RichText, Sense};
@@ -668,20 +649,16 @@ pub(crate) fn page(ed: &mut crate::settings::providers::ProvidersEditor, ui: &mu
     }
     group(ui, |ui, g| {
         g.item(ui, |ui| {
-            crate::settings::providers::field(ui, "URL", &mut pr.url, egui::Id::new("ccat-ollama-url"), false, DEFAULT_URL);
-            if pr.url.is_empty() {
-                pr.url = DEFAULT_URL.into();
+            crate::settings::providers::field(ui, "API key", &mut pr.key, egui::Id::new("ccat-ollama-key"), true, "");
+            let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
+            if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                crate::open_browser("https://ollama.com/settings/keys");
             }
-        });
-        g.item(ui, |ui| {
-        crate::settings::providers::field(ui, "API key", &mut pr.key, egui::Id::new("ccat-ollama-key"), true, "");
-        let link = egui::Label::new(RichText::new("Get API key").size(11.0).color(p.subtle).underline()).sense(Sense::click());
-        if ui.add(link).on_hover_text("https://ollama.com/settings/keys").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            crate::open_browser("https://ollama.com/settings/keys");
-        }
-        if pr.models.is_empty() && pr.custom.is_empty() {
-            note(ui, "Click Fetch (↻) to retrieve models from Ollama Cloud or local instance.", p.subtle);
-        }
+            if pr.key.trim().is_empty() {
+                note(ui, "Ollama Cloud needs an API key: every cloud model is billed per token against your plan's credits.", p.subtle);
+            } else if pr.models.is_empty() && pr.custom.is_empty() {
+                note(ui, "Click Fetch (↻) to list the Ollama Cloud models that can call tools.", p.subtle);
+            }
         });
     });
 }
@@ -693,10 +670,19 @@ mod tests {
     #[test]
     fn test_normalize_url() {
         assert_eq!(normalize_url(""), "https://ollama.com");
-        assert_eq!(normalize_url("localhost:11434"), "http://localhost:11434");
-        assert_eq!(normalize_url("http://127.0.0.1:11434/"), "http://127.0.0.1:11434");
         assert_eq!(normalize_url("ollama.com"), "https://ollama.com");
-        assert_eq!(normalize_url("https://my-ollama.internal:11434"), "https://my-ollama.internal:11434");
+        assert_eq!(normalize_url("http://127.0.0.1:9/"), "http://127.0.0.1:9", "a test's mock server keeps its scheme");
+    }
+
+    #[test]
+    fn only_models_that_call_tools_are_listed() {
+        let tags = json!({ "models": [
+            { "name": "kimi-k3", "capabilities": ["completion", "thinking", "tools"] },
+            { "name": "clef:27b", "capabilities": ["completion"] },
+            { "name": "gemma4:31b" },
+            { "name": "kimi-k3" }
+        ] });
+        assert_eq!(tool_models(&tags), ["gemma4:31b", "kimi-k3"], "no capabilities listed = kept; no `tools` = dropped");
     }
 
     #[test]
@@ -728,7 +714,6 @@ mod tests {
 
     #[test]
     fn url_saved_for_the_v1_route_still_works() {
-        assert_eq!(normalize_url("http://localhost:11434/v1"), "http://localhost:11434");
         assert_eq!(normalize_url("https://ollama.com/v1/"), "https://ollama.com");
     }
 
@@ -743,15 +728,12 @@ mod tests {
         let body = chat_body(&req, "gpt-oss:120b", true);
         assert_eq!(body["model"], "gpt-oss:120b");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["keep_alive"], "30m");
-        assert_eq!(body["options"]["num_ctx"], 65536);
+        assert!(body.get("keep_alive").is_none() && body["options"].get("num_ctx").is_none(), "cloud models keep their own context");
         assert_eq!(body["options"]["num_predict"], 1024);
         assert_eq!(body["think"], "medium");
         assert!(body.get("max_tokens").is_none() && body.get("reasoning_effort").is_none(), "no OpenAI-only fields");
         assert_eq!(body["messages"], json!([{ "role": "system", "content": "You are helpful." }, { "role": "user", "content": "Hello" }]));
-        // Another request must not move what keeps the model loaded.
         let other = chat_body(&json!({ "messages": [{ "role": "user", "content": "x" }], "max_tokens": 5 }), "gpt-oss:120b", true);
-        assert_eq!((&other["keep_alive"], &other["options"]["num_ctx"]), (&body["keep_alive"], &body["options"]["num_ctx"]));
         assert!(other.get("think").is_none());
     }
 

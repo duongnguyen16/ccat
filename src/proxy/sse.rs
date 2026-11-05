@@ -1,5 +1,5 @@
-//! The Anthropic SSE writer (`Tx`) every translated provider streams through, the OpenAI-chat stream parser
-//! MuseAI uses, and the request helpers all translations need: signature tags, content blocks,
+//! The Anthropic SSE writer (`Tx`) every translated provider streams through, the OpenAI-chat stream parser,
+//! and the request helpers all translations need: signature tags, content blocks,
 //! tool declarations and the token estimate.
 
 use super::http::error_kind;
@@ -350,7 +350,7 @@ impl<'a> Tx<'a> {
             let delta = &choice["delta"];
 
             // 1. Thinking / reasoning delta (DeepSeek-R1 / Qwen native field)
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Some(reasoning) = delta.get("reasoning_content").or_else(|| delta.get("reasoning")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 self.delta("thinking", reasoning)?;
             }
 
@@ -393,7 +393,10 @@ impl<'a> Tx<'a> {
                     let func_name = tc["function"]["name"].as_str().filter(|s| !s.is_empty());
                     let func_args = tc["function"]["arguments"].as_str().filter(|s| !s.is_empty());
 
-                    if current_tool_idx != Some(idx) {
+                    // A call with a new id is a new call even at the same index (Gemini's compat layer sends each
+                    // parallel call whole, without `index`).
+                    let new_id = tc_id.is_some_and(|id| self.open != Some("tool") || self.blocks.last().and_then(|b| b["id"].as_str()) != Some(id));
+                    if current_tool_idx != Some(idx) || new_id {
                         current_tool_idx = Some(idx);
                         let id = tc_id.map(String::from).unwrap_or_else(|| format!("call_{}", common::random_hex(12)));
                         let name = func_name.unwrap_or("");
@@ -431,6 +434,10 @@ impl<'a> Tx<'a> {
 
         self.close()?;
         self.begin()?;
+        // Some servers (Gemini's compat layer, some NIM models) end a turn that called tools with "stop".
+        if self.stop_reason == "end_turn" && self.blocks.iter().any(|b| b["type"] == "tool_use") {
+            self.stop_reason = "tool_use";
+        }
         let (usage, stop) = (self.usage_json(), self.stop_reason);
         self.send("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": usage }))?;
         self.send("message_stop", json!({ "type": "message_stop" }))

@@ -53,3 +53,23 @@ pub fn log(line: &str) {
 pub fn log_path() -> std::path::PathBuf {
     crate::config_path().with_file_name("antigravity.log")
 }
+
+/// Limits a credential file to the current user (and SYSTEM on Windows).
+pub fn secure_file(path: &std::path::Path) -> Result<(), String> { secure_path(path, false) }
+pub fn secure_directory(path: &std::path::Path) -> Result<(), String> { secure_path(path, true) }
+fn secure_path(path: &std::path::Path, directory: bool) -> Result<(), String> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 })).map_err(|e| e.to_string())?;
+    }
+    #[cfg(windows)] {
+        let user = std::env::var("USERNAME").map_err(|_| "Cannot determine current Windows user".to_string())?;
+        let rights = if directory { "(OI)(CI)(F)" } else { "(F)" };
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.arg(path).args(["/inheritance:r", "/grant:r"]).arg(format!("{user}:{rights}")).arg(format!("*S-1-5-18:{rights}"));
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        let status = cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map_err(|e| e.to_string())?;
+        if !status.success() { return Err("Could not protect credentials with Windows ACLs".into()); }
+    }
+    Ok(())
+}

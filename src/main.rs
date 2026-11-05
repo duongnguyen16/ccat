@@ -9,8 +9,12 @@ mod providers;
 mod proxy;
 mod settings;
 mod usage;
+mod agent;
+mod remote;
+mod gateway;
+mod backup;
 
-use providers::{antigravity, chatgpt, museai, ollama, Provider, AG_NAME, GPT_NAME, MUSE_NAME, OLLAMA_NAME};
+use providers::{antigravity, chatgpt, gemini_web, ollama, Provider, AG_NAME, GEMINI_WEB_NAME, GPT_NAME, OLLAMA_NAME};
 use providers::claude::fetch_claude_models;
 use providers::endpoint::fetch_models;
 
@@ -120,6 +124,8 @@ struct Config {
     live_metric: u8,
     live_by: u8,
     live_cumulative: bool,
+    /// ccat's tiers served to other apps (see `gateway`).
+    gateway: gateway::Gateway,
 }
 
 fn default_compact_window() -> u64 { 200_000 }
@@ -237,7 +243,7 @@ fn user_config_path() -> PathBuf {
 }
 
 #[cfg(not(test))]
-pub fn config_path() -> PathBuf { user_config_path() }
+pub fn config_path() -> PathBuf { remote::root().map_or_else(user_config_path, |r| r.join("config.json")) }
 
 #[cfg(test)]
 pub fn config_path() -> PathBuf {
@@ -275,21 +281,40 @@ fn from_raw(raw: serde_json::Value) -> Config {
     if raw.get("tiers").is_none() {
         cfg.tiers = migrate_tiers(&raw);
     }
+    // Keep old free-tier presets (and their route names), but never store a user key for anonymous access.
+    for (i, p) in cfg.providers.iter_mut().enumerate() {
+        if p.opencode || (raw["providers"][i].get("opencode").is_none() && providers::opencode::is_free_tier(&p.url)) {
+            p.opencode = true;
+            p.openai = true;
+            p.free_only = true;
+            p.key.clear();
+        }
+    }
+    if !cfg.providers.iter().any(|p| p.is_opencode()) {
+        let names: Vec<String> = cfg.providers.iter().map(|p| p.name.clone()).collect();
+        let name = profiles::unique(&names, "OpenCode Free");
+        cfg.providers.push(Provider { name, opencode: true, openai: true, free_only: true, ..Default::default() });
+    }
     // ponytail: one-off migration of ids saved before bare_id existed; cheap, so it just runs every load.
-    for p in &mut cfg.providers {
+    // An OpenAI-compatible endpoint's ids are kept as given (OpenRouter's `anthropic/…` is a real id there).
+    for p in cfg.providers.iter_mut().filter(|p| !p.openai) {
         for m in p.models.iter_mut().chain(p.custom.iter_mut()) {
             *m = bare_id(m);
         }
         p.models.dedup();
     }
+    let openai: Vec<String> = cfg.providers.iter().filter(|p| p.openai).map(|p| p.name.clone()).collect();
     for r in &mut cfg.tiers {
-        r.model = bare_id(&r.model);
+        if !openai.contains(&r.provider) {
+            r.model = bare_id(&r.model);
+        }
         r.fallbacks.extend(r.fallback.take());
     }
     builtin_antigravity(&mut cfg);
     builtin_chatgpt(&mut cfg);
     builtin_ollama(&mut cfg);
-    builtin_muse(&mut cfg);
+    builtin_gemini_web(&mut cfg);
+    drop_muse(&mut cfg);
     // The ChatGPT mode, once decided (see `Provider::gpt_legacy`), is kept: later changes of accounts cannot flip it.
     if let Some(g) = cfg.providers.iter_mut().find(|p| p.chatgpt) {
         g.chatgpt_legacy = Some(g.gpt_legacy());
@@ -360,7 +385,7 @@ fn check_rename(providers: &[Provider], i: usize, name: &str) -> Result<String, 
     let name = name.trim();
     if name.is_empty() {
         Err("Give it a name.".into())
-    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) || name.eq_ignore_ascii_case(providers::label(GPT_NAME)) {
+    } else if [AG_NAME, GPT_NAME, OLLAMA_NAME, GEMINI_WEB_NAME].iter().any(|b| name.eq_ignore_ascii_case(b)) || name.eq_ignore_ascii_case(providers::label(GPT_NAME)) {
         Err("That is a built-in provider's name.".into())
     } else if providers.iter().enumerate().any(|(n, p)| n != i && p.name.eq_ignore_ascii_case(name)) {
         Err("Another provider already has that name.".into())
@@ -445,7 +470,8 @@ fn builtin_chatgpt(cfg: &mut Config) {
     cfg.providers.insert(1.min(cfg.providers.len()), gpt);
 }
 
-/// Ollama is the local built-in provider: exactly one, third in the list. An endpoint a user had named "Ollama" is
+/// Ollama is the Ollama Cloud built-in provider: exactly one, third in the list, always on `ollama::DEFAULT_URL` (a
+/// local server URL saved by an older ccat is dropped). An endpoint a user had named "Ollama" is
 /// renamed (its tiers follow).
 fn builtin_ollama(cfg: &mut Config) {
     for p in cfg.providers.iter_mut().filter(|p| !p.ollama && p.name == OLLAMA_NAME) {
@@ -460,9 +486,7 @@ fn builtin_ollama(cfg: &mut Config) {
         ollama: true,
         ..Default::default()
     }, |i| cfg.providers.remove(i));
-    if ol.url.trim().is_empty() {
-        ol.url = ollama::DEFAULT_URL.into();
-    }
+    ol.url = ollama::DEFAULT_URL.into();
     let old = std::mem::replace(&mut ol.name, OLLAMA_NAME.into());
     rename_routes(&mut cfg.tiers, &old, OLLAMA_NAME);
     let mut rest = Vec::new();
@@ -477,40 +501,45 @@ fn builtin_ollama(cfg: &mut Config) {
     cfg.providers.insert(2.min(cfg.providers.len()), ol);
 }
 
-/// MuseAI is the Hatch Gateway VM built-in provider: exactly one, fourth in the list. An endpoint a user had named "MuseAI" is
-/// renamed (its tiers follow).
-fn builtin_muse(cfg: &mut Config) {
-    for p in cfg.providers.iter_mut().filter(|p| !p.muse && p.name == MUSE_NAME) {
-        let to = format!("{MUSE_NAME} endpoint");
-        rename_routes(&mut cfg.tiers, MUSE_NAME, &to);
+/// Gemini Web is a built-in provider: exactly one, fourth in the list, connects to Argon Local's bridge (default port 4982).
+fn builtin_gemini_web(cfg: &mut Config) {
+    gemini_web::ensure_installed();
+    for p in cfg.providers.iter_mut().filter(|p| !p.gemini_web && p.name == GEMINI_WEB_NAME) {
+        let to = format!("{GEMINI_WEB_NAME} endpoint");
+        rename_routes(&mut cfg.tiers, GEMINI_WEB_NAME, &to);
         p.name = to;
     }
-    let main = cfg.providers.iter().position(|p| p.muse);
-    let mut mu = main.map_or_else(|| Provider {
-        name: MUSE_NAME.into(),
-        url: museai::DEFAULT_URL.into(),
-        muse: true,
+    let main = cfg.providers.iter().position(|p| p.gemini_web);
+    let mut gw = main.map_or_else(|| Provider {
+        name: GEMINI_WEB_NAME.into(),
+        url: gemini_web::DEFAULT_URL.into(),
+        gemini_web: true,
+        models: gemini_web::default_models(),
         ..Default::default()
     }, |i| cfg.providers.remove(i));
-    if mu.url.trim().is_empty() {
-        mu.url = museai::DEFAULT_URL.into();
+    if gw.url.trim().is_empty() {
+        gw.url = gemini_web::DEFAULT_URL.into();
     }
-    // The local bridge's list is a constant: offered from the start, without a Fetch click.
-    if mu.models.is_empty() && museai::is_local_bridge(&museai::normalize_url(&mu.url)) {
-        mu.models = museai::list_models(&mu.url, None).unwrap_or_default();
+    if gw.models.is_empty() {
+        gw.models = gemini_web::default_models();
     }
-    let old = std::mem::replace(&mut mu.name, MUSE_NAME.into());
-    rename_routes(&mut cfg.tiers, &old, MUSE_NAME);
+    let old = std::mem::replace(&mut gw.name, GEMINI_WEB_NAME.into());
+    rename_routes(&mut cfg.tiers, &old, GEMINI_WEB_NAME);
     let mut rest = Vec::new();
     for p in std::mem::take(&mut cfg.providers) {
-        if p.muse {
-            rename_routes(&mut cfg.tiers, &p.name, MUSE_NAME);
+        if p.gemini_web {
+            rename_routes(&mut cfg.tiers, &p.name, GEMINI_WEB_NAME);
             continue;
         }
         rest.push(p);
     }
     cfg.providers = rest;
-    cfg.providers.insert(3.min(cfg.providers.len()), mu);
+    cfg.providers.insert(3.min(cfg.providers.len()), gw);
+}
+
+/// The retired MuseAI built-in is dropped from old configs; tiers still naming it report the provider gone.
+fn drop_muse(cfg: &mut Config) {
+    cfg.providers.retain(|p| !p.muse);
 }
 
 /// Several ccat windows may be open at once, so the file is never written in place (a reader could catch it half
@@ -782,7 +811,14 @@ fn pick_row(ui: &mut egui::Ui, checked: bool, text: &str, mono: bool, tag: &str)
     let font = if mono { FontId::monospace(12.0) } else { FontId::proportional(13.0) };
     let reserved = if tag.is_empty() { 26.0 } else { 72.0 };
     ui.painter().with_clip_rect(r.with_max_x(r.max.x - reserved)).text(r.left_center(), Align2::LEFT_CENTER, text, font, p.fg);
-    if !tag.is_empty() {
+    if tag == FREE {
+        // A green pill, like a provider's plan badge, so free models stand out in a long list.
+        let green = profiles::green(ui);
+        let galley = ui.painter().layout_no_wrap(tag.to_string(), FontId::proportional(10.5), green);
+        let pill = egui::Rect::from_min_size(r.right_center() - vec2(24.0 + galley.size().x + 12.0, 9.0), vec2(galley.size().x + 12.0, 18.0));
+        ui.painter().rect_filled(pill, 9.0, green.gamma_multiply(0.16));
+        ui.painter().galley(pill.center() - galley.size() / 2.0, galley, green);
+    } else if !tag.is_empty() {
         ui.painter().text(r.right_center() - vec2(24.0, 0.0), Align2::RIGHT_CENTER, tag, FontId::proportional(11.0), p.subtle);
     }
     if checked {
@@ -1089,10 +1125,22 @@ impl App {
                 _ if p.chatgpt && p.chatgpt_accounts.is_empty() => Some((format!("“{name}” needs a signed-in Codex account."), true)),
                 _ if p.chatgpt && p.chatgpt_accounts.iter().all(|a| a.disabled) => Some((format!("“{name}” has every account turned off."), true)),
                 _ if p.chatgpt && !p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())) => Some((format!("“{name}”: no account can run in this mode (plan usage granted, signed in); sign in again in Settings."), true)),
-                _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).map(|why| (why, true)),
-                // A local Ollama needs no key; Ollama Cloud's is only required by the server.
-                _ if p.ollama => p.url.trim().is_empty().then(|| (format!("“{name}” needs a URL."), true)),
-                _ if !p.antigravity && !p.chatgpt && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{name}” needs a URL and a key."), true)),
+                _ if p.ollama => p.key.trim().is_empty().then(|| (format!("“{name}” needs an Ollama Cloud API key."), true)),
+                _ if p.is_opencode() => {
+                    if p.url.trim().is_empty() { Some((format!("“{name}” needs a URL."), true)) }
+                    else { providers::opencode::egress::validate(&p.opencode_egress).err().map(|e| (format!("“{name}” pool: {e}"), true)) }
+                },
+                _ if p.gemini_web => {
+                    let accounts = providers::gemini_web::list_accounts();
+                    if accounts.is_empty() {
+                        Some((format!("“{name}” needs at least one Google account."), true))
+                    } else if accounts.iter().all(|a| !a.enabled) {
+                        Some((format!("“{name}” has every Google account turned off."), true))
+                    } else {
+                        None
+                    }
+                }
+                _ if !p.antigravity && !p.chatgpt && !p.gemini_web && (p.url.trim().is_empty() || p.key.trim().is_empty()) => Some((format!("“{name}” needs a URL and a key."), true)),
                 _ => None,
             }
         };
@@ -1623,6 +1671,15 @@ fn shift<T>(rows: &mut [T], n: usize, up: bool) -> bool {
     }
 }
 
+/// The selector tag of a model that costs nothing to run (drawn as a green badge by `pick_row`).
+const FREE: &str = "Free";
+
+/// Whether a provider's model is free by its name (OpenRouter's `:free`, the `-free` others use). Ollama Cloud has
+/// none: every cloud model is billed per token (ollama.com/pricing). OpenCode's free tier serves only free ones.
+fn free(p: &Provider, model: &str) -> bool {
+    p.is_opencode() || providers::openai::is_free(model)
+}
+
 /// Every model the selectors offer, by provider: Claude first (Claude Code's own pick, then the Claude models),
 /// then each provider's fetched and custom models. `typed` is offered on every non-Claude provider as a custom id.
 /// Providers turned off are left out; so are the Claude models while `claude_off` (Default is Claude Code's own
@@ -1638,8 +1695,8 @@ fn model_groups(providers: &[Provider], typed_and_claude: &(String, Vec<String>)
     for p in providers.iter().filter(|p| !p.disabled) {
         // ChatGPT models show their display name; the slug is on hover.
         let shown = |m: &String| p.chatgpt_models.iter().find(|x| x.slug == *m).map(|x| x.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| m.clone());
-        let mut choices: Vec<Choice> = p.models.iter().map(|m| Choice { provider: p.name.clone(), model: m.clone(), text: shown(m), tag: "" }).collect();
-        choices.extend(p.custom.iter().filter(|c| !p.models.contains(c)).map(|m| Choice { provider: p.name.clone(), model: m.clone(), text: m.clone(), tag: "saved" }));
+        let mut choices: Vec<Choice> = p.models.iter().map(|m| Choice { provider: p.name.clone(), model: m.clone(), text: shown(m), tag: if free(p, m) { FREE } else { "" } }).collect();
+        choices.extend(p.custom.iter().filter(|c| !p.models.contains(c)).map(|m| Choice { provider: p.name.clone(), model: m.clone(), text: m.clone(), tag: if free(p, m) { FREE } else { "saved" } }));
         if !typed.is_empty() && !p.models.contains(typed) && !p.custom.contains(typed) {
             choices.push(Choice { provider: p.name.clone(), model: typed.clone(), text: format!("Use “{typed}”"), tag: "custom" });
         }
@@ -1656,6 +1713,12 @@ fn app_icon() -> Arc<egui::IconData> {
     ICON.get_or_init(|| Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("icon.png is a valid PNG"))).clone()
 }
 
+/// True on Linux without a display (or with `CCAT_NO_GUI` set): ccat has no window to open there.
+fn headless() -> bool {
+    cfg!(all(unix, not(target_os = "macos")))
+        && (std::env::var_os("CCAT_NO_GUI").is_some() || (std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()))
+}
+
 fn main() {
     // Everything else is forwarded to claude, so these are the only flags ccat keeps for itself
     // (the usage and settings ones are internal: the tray helper and its windows).
@@ -1667,10 +1730,42 @@ fn main() {
             let at = |i| std::env::args().nth(i).and_then(|x| x.parse().ok()).unwrap_or(f64::MAX);
             return usage::run_popup((at(2), at(3)));
         }
-        Some(usage::SETTINGS_FLAG) => return settings::run(std::env::args().nth(2)),
+        Some(usage::SETTINGS_FLAG) => {
+            // A machine named here: the window works on that machine's settings (see `remote`).
+            if let Some(name) = std::env::var(remote::MACHINE_ENV).ok().filter(|n| !n.is_empty()) {
+                if let Err(e) = remote::attach(&name) {
+                    return eprintln!("ccat: {e}");
+                }
+            }
+            return settings::run(std::env::args().nth(2));
+        }
+        Some(agent::FLAG) => return agent::run(std::env::args().nth(2)),
+        Some(remote::FORWARD_FLAG) => {
+            let port = std::env::args().nth(3).and_then(|p| p.parse().ok()).unwrap_or(2222);
+            if let Err(e) = remote::forward(&std::env::args().nth(2).unwrap_or_default(), port) {
+                eprintln!("ccat: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some(remote::TUNNEL_FLAG) => {
+            if let Err(e) = remote::tunnel(&std::env::args().nth(2).unwrap_or_default()) {
+                eprintln!("ccat: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         _ => usage::ensure_tray(),
     }
     let cwd =std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    // No display (an SSH session, a server): no launcher window; the saved config and this folder are the launch.
+    if headless() {
+        let (cfg, _) = load();
+        let (tiers, providers, claude_models) = (cfg.tiers.clone(), cfg.providers.clone(), cfg.claude_models.clone());
+        let launch = Launch { tiers, providers, claude_models, claude_off: cfg.claude_off, folder: cwd.clone(), bypass: cfg.bypass, fail_on_limit: cfg.fail_on_limit, no_paid_fallback: cfg.no_paid_fallback, compress_tool_results: cfg.compress_tool_results, compact_window: cfg.compact_window, hold_hours: cfg.hold_hours };
+        usage::spawn_refresher();
+        return run_claude(launch, &cwd);
+    }
     let out = Arc::new(Mutex::new(None));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1714,20 +1809,13 @@ struct Prepared {
     uses_ag: bool,
 }
 
-/// Why the built-in MuseAI on the local bridge can't serve: nobody is signed in, or its account is turned off. It
-/// signs in by cookie login and needs no key; `login` finds the muse-cli login for configs saved before accounts were.
-fn muse_blocked(p: &Provider, login: impl FnOnce() -> Option<museai::Account>) -> Option<String> {
-    match p.muse_account.clone().or_else(login) {
-        None => Some(format!("“{}” needs a signed-in MuseAI account. Use + in Providers to sign in.", providers::label(&p.name))),
-        Some(a) if a.disabled => Some(format!("“{}” has its account turned off.", p.name)),
-        Some(_) => None,
-    }
-}
-
 /// Where a tier's requests go in the proxy and the model they run there; `None` when that can't be served (a
 /// provider gone, no model, no key or account). `sent` is the name Claude Code sends for the tier (fixed at launch).
 fn target(provider: &str, model: &str, providers: &[Provider], claude_models: &[String], t: usize, sent: &str) -> Option<(proxy::Upstream, String)> {
-    let model = bare_id(model).split('[').next().unwrap_or("").trim().to_string();
+    // An OpenAI-compatible endpoint's ids are sent as given (OpenRouter's `anthropic/…`).
+    let openai = providers.iter().any(|p| p.name == provider && (p.openai || p.is_opencode()));
+    let model = if openai { model.trim().to_string() } else { bare_id(model) };
+    let model = model.split('[').next().unwrap_or("").trim().to_string();
     if provider.is_empty() {
         // Claude Code's pick: the Claude name it sends, unless the tier sends a name only ccat knows (it ran on
         // another provider at launch); then the newest Claude model of the tier's family.
@@ -1744,10 +1832,11 @@ fn target(provider: &str, model: &str, providers: &[Provider], claude_models: &[
         _ if p.antigravity && p.accounts.iter().all(|a| a.disabled) => None,
         _ if p.antigravity => Some((proxy::Upstream::Antigravity, model)),
         _ if p.chatgpt => p.chatgpt_accounts.iter().any(|a| a.usable() && a.runs(p.gpt_legacy())).then_some((proxy::Upstream::ChatGPT, model)),
-        _ if p.ollama => Some((proxy::Upstream::Ollama { url: p.url.clone(), key: p.key.clone() }, model)),
-        _ if p.muse && museai::is_local_bridge(&p.url) => muse_blocked(p, museai::active_account).is_none().then_some((proxy::Upstream::MuseAI { url: p.url.clone(), key: p.key.clone() }, model)),
+        _ if p.ollama => (!p.key.trim().is_empty()).then(|| (proxy::Upstream::Ollama { url: p.url.clone(), key: p.key.trim().to_string() }, model)),
+        _ if p.is_opencode() => (!p.url.trim().is_empty()).then(|| (proxy::Upstream::OpenAi { name: p.name.clone(), url: p.url.clone(), key: String::new(), free: true, egress: Some(p.opencode_egress.clone()) }, model)),
+        _ if p.gemini_web => Some((proxy::Upstream::GeminiWeb, model)),
         _ if p.url.trim().is_empty() || p.key.trim().is_empty() => None,
-        _ if p.muse => Some((proxy::Upstream::MuseAI { url: p.url.clone(), key: p.key.clone() }, model)),
+        _ if p.openai => Some((proxy::Upstream::OpenAi { name: p.name.clone(), url: p.url.clone(), key: p.key.trim().to_string(), free: false, egress: None }, model)),
         _ => Some((proxy::Upstream::Endpoint { name: p.name.clone(), url: p.url.clone(), key: p.key.trim().to_string() }, model)),
     }
 }
@@ -1770,7 +1859,7 @@ fn retarget(routes: &mut [proxy::Route], tiers: &[Route; 4], providers: &[Provid
 
 /// Watches the config while a routed session runs: a model switched in ccat (Settings) reaches this
 /// session's next request, and a Google account signed in joins its pool.
-fn follow_config(px: &proxy::Proxy) {
+fn follow_config(px: &proxy::Proxy, no_claude: bool) {
     let (routes, disabled, chatgpt, chatgpt_models, fail_on_limit, no_paid_fallback, compress_tool_results) = (px.routes.clone(), px.disabled.clone(), px.chatgpt.clone(), px.chatgpt_models.clone(), px.fail_on_limit.clone(), px.no_paid_fallback.clone(), px.compress_tool_results.clone());
     let stamp = || fs::metadata(config_path()).and_then(|m| m.modified()).ok();
     let usage_stamp = || fs::metadata(config_path().with_file_name("usage.json")).and_then(|m| m.modified()).ok();
@@ -1794,9 +1883,9 @@ fn follow_config(px: &proxy::Proxy) {
             }
             seen = stamp();
             // Read only: never move the user's config aside from a background thread.
-            let Some(cfg) = fs::read_to_string(config_path()).ok().and_then(|t| serde_json::from_str::<Config>(&t).ok()) else { continue };
+            let Some(cfg) = fs::read_to_string(config_path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).map(from_raw) else { continue };
             let mut next = routes.read().unwrap().clone();
-            let bad = retarget(&mut next, &cfg.tiers, &cfg.providers, &cfg.claude_models, cfg.claude_off);
+            let bad = retarget(&mut next, &cfg.tiers, &cfg.providers, &cfg.claude_models, cfg.claude_off || no_claude);
             *disabled.write().unwrap() = off_accounts(&cfg.providers);
             px.add_accounts(cfg.providers.iter().find(|p| p.antigravity).map_or(&[], |p| &p.accounts));
             let gpt = cfg.providers.iter().find(|p| p.chatgpt);
@@ -1830,6 +1919,31 @@ fn api_timeout(fail_on_limit: bool, hold_hours: u64) -> Option<String> {
     (!fail_on_limit && hold_hours > 0).then(|| (hold_hours.min(24 * 365) * 3600 * 1000).to_string())
 }
 
+/// Starts the proxy on `routes` (already targeted) with the routing switches (wait out limits off, no paid fallback,
+/// compress tool output), and has it follow the config (see `follow_config`). `no_claude`: Claude fallbacks are
+/// dropped then and later (the gateway has no Claude Code login).
+fn start_proxy(providers: &[Provider], (fail_on_limit, no_paid_fallback, compress): (bool, bool, bool), routes: Vec<proxy::Route>, folder: PathBuf, no_claude: bool) -> std::io::Result<proxy::Proxy> {
+    // Every account, used or not at launch: a tier can be switched to Antigravity while the session runs, and
+    // an account turned on again joins (one signed in later joins too, see `follow_config`). Those turned off are
+    // told to the pool, which skips them.
+    let mut accounts = providers.iter().find(|p| p.antigravity).map(|p| p.accounts.clone()).unwrap_or_default();
+    // Launched before the launcher learned every plan: ask now, in parallel (it orders the rotation).
+    std::thread::scope(|s| {
+        let asks: Vec<_> = accounts.iter_mut().filter(|a| a.plan.is_empty()).map(|a| s.spawn(move || a.plan = antigravity::plan_of(a).unwrap_or_default())).collect();
+        asks.into_iter().for_each(|h| drop(h.join()));
+    });
+    let gpt = providers.iter().find(|p| p.chatgpt);
+    let (gpt_accounts, gpt_models) = gpt.map(|p| (p.chatgpt_accounts.clone(), p.chatgpt_models.clone())).unwrap_or_default();
+    let px = proxy::start(accounts, gpt_accounts, gpt_models, routes, folder)?;
+    *px.disabled.write().unwrap() = off_accounts(providers);
+    px.set_chatgpt_legacy(gpt.is_some_and(|p| p.gpt_legacy()));
+    px.fail_on_limit.store(fail_on_limit, std::sync::atomic::Ordering::Relaxed);
+    px.no_paid_fallback.store(no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
+    px.compress_tool_results.store(compress, std::sync::atomic::Ordering::Relaxed);
+    follow_config(&px, no_claude);
+    Ok(px)
+}
+
 fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
     let routed = routed(&l.tiers);
     let (names, overrides) = tier_names(&l.tiers, routed);
@@ -1857,24 +1971,8 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
             return Err(format!("{} can't be served as set; check it in ccat", bad.join(", ")));
         }
         {
-            // Every account, used or not at launch: a tier can be switched to Antigravity while the session runs, and
-            // an account turned on again joins (one signed in later joins too, see `follow_config`). Those turned off are
-            // told to the pool, which skips them.
-            let mut accounts = l.providers.iter().find(|p| p.antigravity).map(|p| p.accounts.clone()).unwrap_or_default();
-            // Launched before the launcher learned every plan: ask now, in parallel (it orders the rotation).
-            std::thread::scope(|s| {
-                let asks: Vec<_> = accounts.iter_mut().filter(|a| a.plan.is_empty()).map(|a| s.spawn(move || a.plan = antigravity::plan_of(a).unwrap_or_default())).collect();
-                asks.into_iter().for_each(|h| drop(h.join()));
-            });
-            let gpt = l.providers.iter().find(|p| p.chatgpt);
-            let (gpt_accounts, gpt_models) = gpt.map(|p| (p.chatgpt_accounts.clone(), p.chatgpt_models.clone())).unwrap_or_default();
-            match proxy::start(accounts, gpt_accounts, gpt_models, routes, PathBuf::from(folder)) {
+            match start_proxy(&l.providers, (l.fail_on_limit, l.no_paid_fallback, l.compress_tool_results), routes, PathBuf::from(folder), false) {
                 Ok(px) => {
-                    *px.disabled.write().unwrap() = off_accounts(&l.providers);
-                    px.set_chatgpt_legacy(gpt.is_some_and(|p| p.gpt_legacy()));
-                    px.fail_on_limit.store(l.fail_on_limit, std::sync::atomic::Ordering::Relaxed);
-                    px.no_paid_fallback.store(l.no_paid_fallback, std::sync::atomic::Ordering::Relaxed);
-                    px.compress_tool_results.store(l.compress_tool_results, std::sync::atomic::Ordering::Relaxed);
                     // A request held at a usage limit can wait for hours: Claude Code mustn't give up on it after its
                     // usual 10 minutes, nor after a shorter timeout inherited from the environment.
                     if let Some(ms) = api_timeout(l.fail_on_limit, l.hold_hours) {
@@ -1894,7 +1992,6 @@ fn prepare(l: &Launch, folder: &str) -> Result<Prepared, String> {
                         env.push(("ANTHROPIC_AUTH_TOKEN", px.token.clone()));
                     }
                     env.push(("ANTHROPIC_BASE_URL", px.url.clone()));
-                    follow_config(&px);
                 }
                 Err(e) => return Err(format!("could not start the local proxy: {e}")),
             }
@@ -1987,11 +2084,11 @@ mod tests {
 
     #[test]
     fn routed_launch_pins_its_endpoint_without_putting_secrets_in_arguments() {
-        let overrides = serde_json::Map::from_iter([("claude-haiku-5-5".into(), serde_json::json!("muse-chat@haiku"))]);
+        let overrides = serde_json::Map::from_iter([("claude-haiku-5-5".into(), serde_json::json!("some-model@haiku"))]);
         let env = vec![("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321".into()), ("ANTHROPIC_AUTH_TOKEN", "private-auth".into()), ("ANTHROPIC_CUSTOM_HEADERS", "x-ccat-token: private-header".into())];
         let settings = claude_settings(&overrides, &env);
         assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:54321");
-        assert_eq!(settings["modelOverrides"]["claude-haiku-5-5"], "muse-chat@haiku");
+        assert_eq!(settings["modelOverrides"]["claude-haiku-5-5"], "some-model@haiku");
         assert!(!settings.to_string().contains("private-"));
         assert_eq!(settings["env"].as_object().unwrap().len(), 1);
         assert!(claude_settings(&serde_json::Map::new(), &[]).as_object().unwrap().is_empty());
@@ -2030,7 +2127,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(&text).unwrap();
         let path = config_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        museai::secure_directory(path.parent().unwrap()).unwrap();
+        common::secure_directory(path.parent().unwrap()).unwrap();
         save(&cfg, &serde_json::Value::Null).unwrap();
         cfg
     }
@@ -2295,50 +2392,74 @@ mod tests {
         builtin_antigravity(&mut cfg);
         builtin_chatgpt(&mut cfg);
         builtin_ollama(&mut cfg);
-        builtin_muse(&mut cfg);
         let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, [AG_NAME, GPT_NAME, OLLAMA_NAME, MUSE_NAME, "OR", "Ollama endpoint"], "Antigravity, ChatGPT, Ollama, MuseAI, then endpoints");
+        assert_eq!(names, [AG_NAME, GPT_NAME, OLLAMA_NAME, "OR", "Ollama endpoint"], "Antigravity, ChatGPT, Ollama, then endpoints");
         assert_eq!(cfg.providers.iter().filter(|p| p.ollama).count(), 1);
         assert_eq!(cfg.providers[2].url, ollama::DEFAULT_URL);
         assert_eq!(cfg.tiers[0].provider, "Ollama endpoint", "tiers follow rename");
 
         let claude: Vec<String> = Vec::new();
-        let ol = &cfg.providers[2];
-        let t = target(OLLAMA_NAME, "qwen2.5-coder:32b", &[ol.clone()], &claude, 0, "");
-        assert_eq!(t.map(|(u, m)| (format!("{u:?}"), m)), Some(("Ollama".into(), "qwen2.5-coder:32b".into())));
+        let ol = Provider { key: "ok".into(), ..cfg.providers[2].clone() };
+        let t = target(OLLAMA_NAME, "kimi-k3", std::slice::from_ref(&ol), &claude, 0, "");
+        assert_eq!(t.map(|(u, m)| (format!("{u:?}"), m)), Some(("Ollama".into(), "kimi-k3".into())));
+        assert!(target(OLLAMA_NAME, "kimi-k3", &[cfg.providers[2].clone()], &claude, 0, "").is_none(), "no key, no Ollama Cloud route");
 
-        let mu = Provider { muse_account: Some(museai::Account::default()), ..cfg.providers[3].clone() };
-        let t_mu = target(MUSE_NAME, "muse-chat", &[mu], &claude, 0, "");
-        assert_eq!(t_mu.map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
+        // Free models carry the green Free badge in the selectors; Ollama Cloud's never do (all are billed).
+        let or = Provider { models: vec!["a/b:free".into(), "a/c".into()], custom: vec!["a/d:free".into()], ..endpoint("OR") };
+        let tags: Vec<(String, &str)> = model_groups(&[or, Provider { models: vec!["kimi-k3".into()], ..ol }], &(String::new(), Vec::new()), false)[1..].iter().flat_map(|(_, c)| c.iter().map(|c| (c.model.clone(), c.tag))).collect();
+        assert_eq!(tags, [("a/b:free".to_string(), FREE), ("a/c".into(), ""), ("a/d:free".into(), FREE), ("kimi-k3".into(), "")]);
+
+        // A local server URL an older ccat saved for the built-in goes back to Ollama Cloud.
+        let mut cfg = Config { providers: vec![Provider { name: OLLAMA_NAME.into(), ollama: true, url: "http://localhost:11434".into(), ..Default::default() }], ..Default::default() };
+        builtin_ollama(&mut cfg);
+        assert_eq!(cfg.providers[0].url, ollama::DEFAULT_URL);
     }
 
     #[test]
-    fn muse_chat_is_offered_from_the_start_and_listed_on_its_page() {
-        let mut cfg = Config::default();
-        builtin_muse(&mut cfg);
-        let mu = cfg.providers.iter().find(|p| p.muse).unwrap();
-        assert_eq!((model_names(mu), model_count(mu)), (vec!["muse-chat"], 1), "no Fetch click needed on the local bridge");
-        let groups = model_groups(&cfg.providers, &(String::new(), Vec::new()), false);
-        let muse = groups.iter().find(|(g, _)| g == MUSE_NAME).expect("MuseAI group");
-        assert!(muse.1.iter().any(|c| c.model == "muse-chat" && c.provider == MUSE_NAME));
-        assert!(model_groups(&[Provider { disabled: true, ..mu.clone() }], &(String::new(), Vec::new()), false).iter().all(|(g, _)| g != MUSE_NAME), "off: not offered");
-        // A saved list stays; a remote gateway is not asked at load; custom ids are listed once.
-        let mut kept = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, models: vec!["x".into()], custom: vec!["x".into(), "y".into()], ..Default::default() }], ..Default::default() };
-        builtin_muse(&mut kept);
-        assert_eq!(model_names(&kept.providers[0]), ["x", "y"]);
-        let mut remote = Config { providers: vec![Provider { name: MUSE_NAME.into(), muse: true, url: "https://gateway.invalid".into(), ..Default::default() }], ..Default::default() };
-        builtin_muse(&mut remote);
-        assert!(model_names(&remote.providers[0]).is_empty());
+    fn gemini_web_is_one_builtin_provider_fourth_in_the_list() {
+        let mut cfg = Config {
+            providers: vec![
+                Provider { name: AG_NAME.into(), antigravity: true, ..Default::default() },
+                Provider { name: GPT_NAME.into(), chatgpt: true, ..Default::default() },
+                Provider { name: OLLAMA_NAME.into(), ollama: true, ..Default::default() },
+                endpoint("OR"),
+                Provider { name: GEMINI_WEB_NAME.into(), url: "http://127.0.0.1:4985".into(), ..Default::default() },
+            ],
+            tiers: [route(GEMINI_WEB_NAME, "gemini-4-argon", ""), Route::default(), Route::default(), Route::default()],
+            ..Default::default()
+        };
+        builtin_antigravity(&mut cfg);
+        builtin_chatgpt(&mut cfg);
+        builtin_ollama(&mut cfg);
+        builtin_gemini_web(&mut cfg);
+        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, [AG_NAME, GPT_NAME, OLLAMA_NAME, GEMINI_WEB_NAME, "OR", "Gemini Web endpoint"], "Antigravity, ChatGPT, Ollama, Gemini Web, then endpoints");
+        assert_eq!(cfg.providers.iter().filter(|p| p.gemini_web).count(), 1);
+        assert_eq!(cfg.providers[3].url, gemini_web::DEFAULT_URL);
+        assert_eq!(cfg.tiers[0].provider, "Gemini Web endpoint", "tiers follow rename");
+
+        let claude: Vec<String> = Vec::new();
+        let gw = cfg.providers[3].clone();
+        let t = target(GEMINI_WEB_NAME, "gemini-4-argon", std::slice::from_ref(&gw), &claude, 0, "");
+        assert_eq!(t.map(|(u, m)| (format!("{u:?}"), m)), Some(("Gemini Web".into(), "gemini-4-argon".into())));
     }
 
     #[test]
-    fn muse_account_launcher_and_routing_agreements() {
+    fn an_old_museai_provider_is_dropped_on_load() {
+        let mut cfg: Config = serde_json::from_str(r#"{"providers":[{"name":"MuseAI","muse":true,"url":"http://127.0.0.1:18615"},{"name":"OR","url":"u","key":"k"}]}"#).unwrap();
+        drop_muse(&mut cfg);
+        assert_eq!(cfg.providers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["OR"]);
+        assert!(!serde_json::to_string(&cfg.providers[0]).unwrap().contains("muse"), "never written back");
+    }
+
+    #[test]
+    fn launcher_and_routing_agree_on_what_needs_a_key() {
         let _files = CONFIG_FILE.lock().unwrap_or_else(|e| e.into_inner()); // each App saves on drop
         let claude: Vec<String> = Vec::new();
         let make_app = |p: Provider| {
             let cfg = Config {
                 providers: vec![p],
-                tiers: [route(MUSE_NAME, "muse-chat", ""), Route::default(), Route::default(), Route::default()],
+                tiers: [route("Local", "m", ""), Route::default(), Route::default(), Route::default()],
                 ..Default::default()
             };
             App {
@@ -2362,62 +2483,86 @@ mod tests {
             }
         };
 
-        // 1. Valid signed-in enabled local Muse: must be ready with no manual API key
-        let ready_mu = Provider {
-            name: MUSE_NAME.into(),
-            muse: true,
-            url: museai::DEFAULT_URL.into(),
-            muse_account: Some(museai::Account { viewer_id: "test-viewer".into(), disabled: false, ..Default::default() }),
-            ..Default::default()
-        };
-        let app = make_app(ready_mu.clone());
-        assert_eq!(app.problem(0), None, "signed-in enabled Muse must be ready to launch with no key");
-        assert_eq!(target(MUSE_NAME, "muse-chat", &[ready_mu.clone()], &claude, 0, "").map(|(u, m)| (format!("{u:?}"), m)), Some(("MuseAI".into(), "muse-chat".into())));
-
-        // 2. Disabled local Muse account: must not be treated ready or routed
-        let disabled_acc_mu = Provider {
-            name: MUSE_NAME.into(),
-            muse: true,
-            url: museai::DEFAULT_URL.into(),
-            muse_account: Some(museai::Account { viewer_id: "test-viewer".into(), disabled: true, ..Default::default() }),
-            ..Default::default()
-        };
-        let app_disabled_acc = make_app(disabled_acc_mu.clone());
-        assert_eq!(app_disabled_acc.problem(0), Some(("“MuseAI” has its account turned off.".into(), true)));
-        assert!(target(MUSE_NAME, "muse-chat", &[disabled_acc_mu], &claude, 0, "").is_none(), "disabled account must not route");
-
-        // 3. Signed out (no saved account, no login on disk): the message points at + sign-in, not key fields.
-        let signed_out = Provider { muse_account: None, ..ready_mu.clone() };
-        let why = muse_blocked(&signed_out, || None).unwrap();
-        assert!(why.contains("signed-in") && why.contains("+") && !why.contains("key"), "{why}");
-        // ... but a muse-cli login on disk from before accounts were saved still counts.
-        assert_eq!(muse_blocked(&signed_out, || Some(museai::Account::default())), None);
-        assert_eq!(muse_blocked(&signed_out, || Some(museai::Account { disabled: true, ..Default::default() })).as_deref(), Some("“MuseAI” has its account turned off."));
-
-        // 4. Parent provider turned off wins over a good account.
-        let off = Provider { disabled: true, ..ready_mu.clone() };
-        assert_eq!(make_app(off.clone()).problem(0), Some(("“MuseAI” is turned off.".into(), true)));
-        assert!(target(MUSE_NAME, "muse-chat", &[off], &claude, 0, "").is_none());
-
-        // 5. A custom remote Muse endpoint keeps the generic URL + key rules, in both places.
-        let remote = Provider { url: "https://muse.example.com".into(), muse_account: None, ..ready_mu.clone() };
-        assert_eq!(make_app(remote.clone()).problem(0), Some(("“MuseAI” needs a URL and a key.".into(), true)));
-        assert!(target(MUSE_NAME, "muse-chat", &[remote.clone()], &claude, 0, "").is_none());
-        let remote = Provider { key: "k".into(), ..remote };
-        assert_eq!(make_app(remote.clone()).problem(0), None);
-        assert!(target(MUSE_NAME, "muse-chat", &[remote], &claude, 0, "").is_some());
-
-        // 6. A plain endpoint without a key is still refused.
+        // A plain endpoint without a key is still refused.
         let keyless = Provider { key: String::new(), ..endpoint("OR") };
         let mut app = make_app(keyless.clone());
         app.cfg.tiers[0] = route("OR", "m", "");
         assert_eq!(app.problem(0), Some(("“OR” needs a URL and a key.".into(), true)));
         assert!(target("OR", "m", &[keyless], &claude, 0, "").is_none());
 
-        // 7. A local Ollama needs only its URL (the route is named MuseAI here only because `make_app` routes to it).
-        let local = Provider { name: MUSE_NAME.into(), ollama: true, url: "http://localhost:11434".into(), ..Default::default() };
-        assert_eq!(make_app(local.clone()).problem(0), None);
-        assert_eq!(make_app(Provider { url: " ".into(), ..local }).problem(0), Some(("“MuseAI” needs a URL.".into(), true)));
+        // OpenCode Free uses anonymous auth, never a user key.
+        let free = Provider { name: "Local".into(), url: providers::opencode::URL.into(), openai: true, opencode: true, ..Default::default() };
+        assert_eq!(make_app(free.clone()).problem(0), None);
+        assert!(target("Local", "big-pickle", &[free], &claude, 0, "").is_some());
+        let custom = Provider { name: "Local".into(), opencode: true, url: "http://localhost:1234/v1".into(), key: "ignored".into(), ..Default::default() };
+        assert_eq!(make_app(custom.clone()).problem(0), None);
+        let (up, _) = target("Local", "big-pickle", &[custom.clone()], &claude, 0, "").unwrap();
+        assert!(matches!(up, proxy::Upstream::OpenAi { free: true, key, .. } if key.is_empty()));
+        let missing_url = Provider { url: " ".into(), ..custom };
+        assert_eq!(make_app(missing_url.clone()).problem(0), Some(("“Local” needs a URL.".into(), true)));
+        assert!(target("Local", "big-pickle", &[missing_url], &claude, 0, "").is_none());
+
+        // Ollama Cloud needs only its key.
+        let cloud = Provider { name: "Local".into(), ollama: true, url: ollama::DEFAULT_URL.into(), key: "ok".into(), ..Default::default() };
+        assert_eq!(make_app(cloud.clone()).problem(0), None);
+        assert_eq!(make_app(Provider { key: " ".into(), ..cloud }).problem(0), Some(("“Local” needs an Ollama Cloud API key.".into(), true)));
+
+        // Gemini Web needs at least one account, not an API key.
+        let gw_provider = Provider { name: GEMINI_WEB_NAME.into(), gemini_web: true, url: gemini_web::DEFAULT_URL.into(), ..Default::default() };
+        let mut gw_app = make_app(gw_provider.clone());
+        gw_app.cfg.tiers[0] = route(GEMINI_WEB_NAME, "gemini-4-argon", "");
+        assert_eq!(gw_app.problem(0), Some(("“Gemini Web” needs at least one Google account.".into(), true)));
+        providers::gemini_web::save_accounts(&[providers::gemini_web::GeminiAccount {
+            id: "test".into(),
+            name: "Test".into(),
+            port: 4982,
+            enabled: true,
+            ..Default::default()
+        }]).unwrap();
+        assert_eq!(gw_app.problem(0), None);
+    }
+
+    #[test]
+    fn opencode_pool_configuration_reaches_live_routes() {
+        use providers::opencode::egress::{Config as Egress, Kind, NodeConfig};
+        let pool = Egress { nodes: vec![NodeConfig { id: "office".into(), name: "Office".into(), kind: Kind::HttpProxy, address: "http://127.0.0.1:3128".into(), ..Default::default() }], ..Default::default() };
+        let p = Provider { name: "OpenCode Free".into(), opencode: true, url: providers::opencode::URL.into(), opencode_egress: pool.clone(), ..Default::default() };
+        let (up, _) = target(&p.name, "big-pickle", &[p.clone()], &[], 3, "").unwrap();
+        match up {
+            proxy::Upstream::OpenAi { free: true, egress: Some(actual), key, .. } => {
+                assert_eq!(actual, pool);
+                assert!(key.is_empty());
+            }
+            _ => panic!("the saved pool must not stop at the Settings page"),
+        }
+    }
+
+    #[test]
+    fn opencode_free_is_built_in_and_old_presets_keep_their_routes() {
+        let cfg = from_raw(serde_json::json!({}));
+        let p = cfg.providers.iter().find(|p| p.is_opencode()).unwrap();
+        assert_eq!(p.kind(), providers::Kind::OpenCode);
+        assert!(p.url.is_empty() && p.key.is_empty(), "the user supplies only the URL");
+        let cfg = from_raw(serde_json::json!({
+            "providers": [{ "name": "My free models", "url": "https://opencode.ai/inference/openai/v1/", "key": "public", "openai": true }],
+            "tiers": [{ "provider": "My free models", "model": "big-pickle" }, {}, {}, {}]
+        }));
+        let free: Vec<_> = cfg.providers.iter().filter(|p| p.is_opencode()).collect();
+        assert_eq!(free.len(), 1);
+        assert!(free[0].opencode && free[0].key.is_empty());
+        assert_eq!(cfg.tiers[0].provider, "My free models");
+        assert!(target(&cfg.tiers[0].provider, "big-pickle", &cfg.providers, &[], 0, "").is_some());
+        let p = Provider { url: "http://localhost:1234/v1".into(), models: vec!["big-pickle".into()], ..free[0].clone() };
+        let groups = model_groups(&[p], &(String::new(), Vec::new()), false);
+        assert_eq!(groups[1].1[0].tag, FREE, "a custom URL still has free badges");
+        let cfg = from_raw(serde_json::json!({ "providers": [{ "name": "OpenCode Free", "url": "https://paid.example/v1", "key": "paid" }] }));
+        assert_ne!(cfg.providers.iter().find(|p| p.is_opencode()).unwrap().name, "OpenCode Free", "never shadow an existing endpoint's routes");
+        let regular = Provider { name: "Regular".into(), url: providers::opencode::URL.into(), key: "own-key".into(), openai: true, ..Default::default() };
+        assert_eq!(regular.kind(), providers::Kind::Endpoint, "typing a URL must not change provider kind");
+        let cfg = from_raw(serde_json::json!({ "providers": [regular] }));
+        let regular = cfg.providers.iter().find(|p| p.name == "Regular").unwrap();
+        assert_eq!(regular.kind(), providers::Kind::Endpoint, "modern endpoint records stay regular after reload");
+        assert_eq!(regular.key, "own-key");
     }
 
     #[test]
@@ -2503,9 +2648,18 @@ mod tests {
         assert!(check_rename(&all, 1, "  ").is_err(), "an empty name would read as the official login");
         assert!(check_rename(&all, 1, "mine").is_err(), "taken, whatever the case");
         assert!(check_rename(&all, 2, "antigravity").is_err(), "the built-in's name is reserved");
-        for b in ["chatgpt", "OLLAMA", "museai"] {
+        for b in ["chatgpt", "OLLAMA"] {
             assert!(check_rename(&all, 2, b).is_err(), "{b}: every built-in's name is reserved");
         }
+    }
+
+    #[test]
+    fn an_openai_endpoint_keeps_anthropic_ids_and_routes_as_openai() {
+        let or = Provider { name: "OR".into(), url: "https://openrouter.ai/api/v1".into(), key: "k".into(), openai: true, ..Default::default() };
+        let t = target("OR", "anthropic/claude-x", &[or.clone()], &[], 0, "");
+        assert_eq!(t.map(|(u, m)| (format!("{u:?}"), m)), Some(("OR".into(), "anthropic/claude-x".into())));
+        let t = target("OR", "anthropic/claude-x", &[Provider { openai: false, ..or }], &[], 0, "");
+        assert_eq!(t.map(|(_, m)| m), Some("claude-x".into()), "an Anthropic endpoint still strips it");
     }
 
     #[test]

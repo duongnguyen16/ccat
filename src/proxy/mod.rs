@@ -76,6 +76,11 @@ impl Proxy {
             // The second group's buckets cover Claude and GPT-OSS alike.
             for (group, fams) in [("Gemini", &["gemini"][..]), ("Claude", &["claude", "gpt"][..])] {
                 let bars: Vec<_> = src.bars.iter().filter(|b| b.label.starts_with(group)).collect();
+                if !bars.is_empty() {
+                    for &fam in fams {
+                        ctx.pool.update_quota(email, fam, &bars, src.fetched);
+                    }
+                }
                 if !bars.is_empty() && bars.iter().all(|b| !b.out()) {
                     for f in fams {
                         lifted |= ctx.pool.unblock(email, f, src.fetched);
@@ -112,11 +117,11 @@ fn plan_back(src: &crate::usage::Source) -> u64 {
 fn hop(u: &Upstream, model: &str) -> crate::live::Hop {
     let provider = match u {
         Upstream::Official => String::new(),
-        Upstream::Endpoint { name, .. } => name.clone(),
+        Upstream::Endpoint { name, .. } | Upstream::OpenAi { name, .. } => name.clone(),
         Upstream::Antigravity => crate::providers::AG_NAME.into(),
         Upstream::ChatGPT => crate::providers::GPT_NAME.into(),
         Upstream::Ollama { .. } => crate::providers::OLLAMA_NAME.into(),
-        Upstream::MuseAI { .. } => crate::providers::MUSE_NAME.into(),
+        Upstream::GeminiWeb { .. } => crate::providers::GEMINI_WEB_NAME.into(),
     };
     crate::live::Hop { provider, model: model.to_string() }
 }
@@ -144,13 +149,15 @@ pub enum Upstream {
     Official,
     /// `name` is the provider's, for the token log.
     Endpoint { name: String, url: String, key: String },
+    /// An OpenAI-compatible endpoint: Anthropic Messages translated to Chat Completions.
+    OpenAi { name: String, url: String, key: String, free: bool, egress: Option<crate::providers::opencode::egress::Config> },
     Antigravity,
     /// The ChatGPT plan: Anthropic Messages translated to the Responses API.
     ChatGPT,
     /// Ollama model server (Cloud or Local): Anthropic Messages translated to Ollama's native `/api/chat`.
     Ollama { url: String, key: String },
-    /// MuseAI Hatch Gateway VM via local sidecar: Anthropic Messages translated to OpenAI Chat Completions.
-    MuseAI { url: String, key: String },
+    /// Native in-process Google Gemini Web provider (no bridge URL or external server).
+    GeminiWeb,
 }
 
 /// Names the provider and never the key, so a route can be logged.
@@ -158,11 +165,11 @@ impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(match self {
             Upstream::Official => "Claude",
-            Upstream::Endpoint { name, .. } => name,
+            Upstream::Endpoint { name, .. } | Upstream::OpenAi { name, .. } => name,
             Upstream::Antigravity => "Antigravity",
             Upstream::ChatGPT => "ChatGPT",
             Upstream::Ollama { .. } => "Ollama",
-            Upstream::MuseAI { .. } => "MuseAI",
+            Upstream::GeminiWeb { .. } => "Gemini Web",
         })
     }
 }
@@ -209,6 +216,7 @@ pub(crate) struct Ctx {
     pub(crate) wake: AtomicU64,
     /// When Claude Code's plan and the ChatGPT plan are back, by the last usage seen (see `plan_back`).
     pub(crate) plan_backs: Mutex<[u64; 2]>,
+    pub(crate) gemini_pool: Arc<crate::providers::gemini_web::pool::Pool>,
 }
 
 impl Ctx {
@@ -253,7 +261,10 @@ impl Ctx {
 
 /// `accounts` serve the Antigravity routes, `chatgpt` the ChatGPT ones; `routes` say where each tier goes (see `Ctx::resolve`).
 pub fn start(accounts: Vec<Account>, chatgpt: Vec<ChatgptAccount>, models: Vec<ChatgptModel>, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
-    serve_with(Pool::new(accounts), chatgpt::Pool::new(chatgpt, models), routes, folder)
+    let proxy = serve_with(Pool::new(accounts), chatgpt::Pool::new(chatgpt, models), routes, folder)?;
+    // Seed selection before the first client request, rather than waiting for the config watcher.
+    proxy.recheck(&crate::usage::load_usage());
+    Ok(proxy)
 }
 
 fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBuf) -> io::Result<Proxy> {
@@ -292,6 +303,7 @@ fn serve_with(pool: Pool, gpt: chatgpt::Pool, routes: Vec<Route>, folder: PathBu
         live: Default::default(),
         wake: AtomicU64::new(0),
         plan_backs: Default::default(),
+        gemini_pool: Arc::new(crate::providers::gemini_web::pool::Pool::new(crate::providers::gemini_web::dir())),
     });
     let handle = ctx.clone();
     std::thread::spawn(move || {
@@ -348,6 +360,9 @@ fn serve(mut s: TcpStream, ctx: &Ctx) {
                     return denied(&mut s);
                 }
                 let tries = pick_tries(chain, authed, ctx.no_paid_fallback.load(Ordering::Relaxed), &ctx.breaker);
+                // Free-tier refusals can also mean client admission, not exhausted device quota.
+                // Surface the error after fallbacks instead of keeping a spinner open for hours.
+                let hold = hold && !tries.iter().all(|(u, _)| matches!(u, Upstream::OpenAi { free: true, .. }));
                 if cleaned.is_none() && ctx.compress_tool_results.load(Ordering::Relaxed) && tries.iter().any(|(u, _)| *u != Upstream::Official) {
                     let mut b = body.clone();
                     let saved = compress::tool_results(&mut b);
@@ -461,7 +476,7 @@ fn pick_tries(chain: Vec<(Upstream, String)>, authed: bool, no_paid: bool, break
     let all: Vec<_> = chain
         .into_iter()
         .enumerate()
-        .filter(|(n, (u, _))| (*u == Upstream::Official || authed) && (*n == 0 || !(no_paid && matches!(u, Upstream::Endpoint { .. }))))
+        .filter(|(n, (u, _))| (*u == Upstream::Official || authed) && (*n == 0 || !(no_paid && matches!(u, Upstream::Endpoint { .. } | Upstream::OpenAi { free: false, .. }))))
         .map(|(_, t)| t)
         .collect();
     let ready: Vec<_> = all.iter().filter(|(u, _)| !breaker.is_open(&format!("{u:?}"))).cloned().collect();
@@ -501,6 +516,11 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
             let meter = counted.then_some((tier, name.as_str(), model));
             forward(s, &ctx.http, req, base.strip_suffix("/v1").unwrap_or(base), Some(key), upstream_body(body, &req.body, model, true), meter, may_fail)
         }
+        Upstream::OpenAi { .. } if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("openai", body) }), "");
+            Ok(())
+        }
+        Upstream::OpenAi { name, url, key, free, egress } => crate::providers::openai::messages(s, ctx, req, body, asked, name, model, url, key, *free, egress.as_ref(), tier, may_fail),
         Upstream::Antigravity if !counted => {
             crate::providers::antigravity::proxy::count_tokens(s, ctx, body, model);
             Ok(())
@@ -517,11 +537,14 @@ fn run(s: &mut TcpStream, ctx: &Ctx, req: &Req, body: &Value, asked: &str, up: &
             Ok(())
         }
         Upstream::Ollama { url, key } => crate::providers::ollama::ollama_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
-        Upstream::MuseAI { .. } if !counted => {
-            respond(s, 200, &json!({ "input_tokens": ctx.estimate("muse", body) }), "");
+        Upstream::GeminiWeb if !counted => {
+            respond(s, 200, &json!({ "input_tokens": ctx.estimate("gemini", body) }), "");
             Ok(())
         }
-        Upstream::MuseAI { url, key } => crate::providers::museai::muse_messages(s, ctx, req, body, asked, model, url, key, tier, may_fail),
+        Upstream::GeminiWeb => {
+            let cancel = AtomicBool::new(false);
+            ctx.gemini_pool.proxy_messages(s, &ctx.sigs, body, asked, model, &cancel)
+        }
     }
 }
 
@@ -630,14 +653,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn muse_native_heartbeat_precedes_content_with_valid_http_headers() {
+    fn openai_chat_heartbeat_precedes_content_with_valid_http_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
         let sigs = Mutex::new(HashMap::new());
         let input = b"data: {\"ccat_ping\":true}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let mut tx = Tx::new("muse-chat", "asked", Some(&mut server), &sigs);
-        assert!(tx.run_openai_chat(Box::new(io::Cursor::new(input.to_vec())), "MuseAI").is_ok());
+        let mut tx = Tx::new("some-model", "asked", Some(&mut server), &sigs);
+        assert!(tx.run_openai_chat(Box::new(io::Cursor::new(input.to_vec())), "Upstream").is_ok());
         drop(tx); drop(server);
         let mut output = String::new();
         client.read_to_string(&mut output).unwrap();
@@ -679,6 +702,7 @@ pub(crate) mod tests {
             live: Default::default(),
             wake: AtomicU64::new(0),
             plan_backs: Default::default(),
+            gemini_pool: Arc::new(crate::providers::gemini_web::pool::Pool::new(crate::providers::gemini_web::dir())),
         }
     }
 
@@ -746,6 +770,80 @@ pub(crate) mod tests {
             json!({ "response": { "candidates": [{ "content": { "parts": [{ "functionCall": { "name": "Read", "args": { "p": "a" } }, "thoughtSignature": "Q0FMTA==" }] },
                     "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 7, "thoughtsTokenCount": 3 } } }),
         ])
+    }
+
+    /// Real tray snapshots; reset offsets keep these routing checks independent of the local timezone.
+    fn ag_usage(rows: &[(&str, f64, u64, f64, u64)]) -> crate::usage::Usage {
+        let now = crate::now();
+        let mut u = crate::usage::Usage::default();
+        for &(email, short_used, short_left, week_used, week_left) in rows {
+            let bar = |label: &str, used, left, window| crate::usage::Bar {
+                label: label.into(), used, resets: now + left, window, ..Default::default()
+            };
+            u.antigravity.insert(email.into(), crate::usage::Source {
+                fetched: now,
+                bars: vec![bar("Gemini (5hr)", short_used, short_left, crate::usage::FIVE_HOURS),
+                    bar("Gemini (Weekly)", week_used, week_left, crate::usage::WEEK)],
+                ..Default::default()
+            });
+        }
+        u
+    }
+
+    #[test]
+    fn ag_routing_spends_the_earliest_expiring_usable_quota() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["first", "weekly", "short", "exhausted"]), Vec::new(), PathBuf::new()).unwrap();
+        proxy.recheck(&ag_usage(&[
+            ("first", 10.0, 14_000, 10.0, 300_000),
+            ("weekly", 10.0, 10_000, 10.0, 900),
+            ("short", 10.0, 300, 10.0, 400_000),
+            ("exhausted", 100.0, 60, 10.0, 30),
+        ]));
+        let req = json!({ "model": "gemini-test", "messages": [{ "role": "user", "content": "new chat" }] });
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        assert_eq!(*seen.lock().unwrap(), ["short p-short"], "a 5h reset in 5 minutes wins over a week in 15 minutes; an exhausted account is never tried");
+    }
+
+    #[test]
+    fn ag_routing_cache_affinity_is_prefix_and_model_specific_and_never_overrides_limits() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["first", "warm"]), Vec::new(), PathBuf::new()).unwrap();
+        let req = json!({ "model": "gemini-test", "system": "stable", "messages": [{ "role": "user", "content": "conversation A" }] });
+        proxy.disabled.write().unwrap().insert("first".into());
+        assert_eq!(post(&proxy, &proxy.token, &req).0, 200);
+        proxy.disabled.write().unwrap().clear();
+        proxy.recheck(&ag_usage(&[("first", 10.0, 300, 10.0, 90_000), ("warm", 10.0, 9000, 10.0, 300_000)]));
+        let mut next = req.clone();
+        next["messages"].as_array_mut().unwrap().extend([
+            json!({ "role": "assistant", "content": "Hello" }), json!({ "role": "user", "content": "continue" }),
+        ]);
+        assert_eq!(post(&proxy, &proxy.token, &next).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "warm p-warm", "a matching warm conversation beats an earlier reset");
+        for changed in [
+            json!({ "model": "gemini-test", "system": "stable", "messages": [{ "role": "user", "content": "conversation B" }] }),
+            json!({ "model": "gemini-other", "system": "stable", "messages": req["messages"] }),
+            json!({ "model": "gemini-test", "system": "changed", "messages": req["messages"] }),
+        ] {
+            assert_eq!(post(&proxy, &proxy.token, &changed).0, 200);
+            assert_eq!(seen.lock().unwrap().last().unwrap(), "first p-first", "different prefixes/models must not inherit affinity");
+        }
+        proxy.recheck(&ag_usage(&[("first", 10.0, 300, 10.0, 90_000), ("warm", 10.0, 9000, 100.0, 300_000)]));
+        assert_eq!(post(&proxy, &proxy.token, &next).0, 200);
+        assert_eq!(seen.lock().unwrap().last().unwrap(), "first p-first", "cached account with no weekly quota is ineligible");
+    }
+
+    #[test]
+    fn ag_routing_all_exhausted_waits_for_both_windows_and_ignores_disabled_accounts() {
+        let (url, seen) = fake_upstream(reply());
+        let proxy = serve_pool(Pool::fake(&url, &["off", "both", "short"]), Vec::new(), PathBuf::new()).unwrap();
+        proxy.disabled.write().unwrap().insert("off".into());
+        proxy.recheck(&ag_usage(&[("off", 100.0, 30, 10.0, 90_000), ("both", 100.0, 90, 100.0, 3600), ("short", 100.0, 600, 10.0, 90_000)]));
+        let req = json!({ "model": "gemini-test", "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 429, "{body}");
+        assert!(body.contains("10m") || body.contains("9m"), "the usable account resets in 10m, not the disabled one's 30s or just one of two exhausted windows: {body}");
+        assert!(seen.lock().unwrap().is_empty(), "known exhausted accounts never reach the backend");
     }
 
     #[test]
@@ -1037,6 +1135,51 @@ pub(crate) mod tests {
             assert!(ask(&proxy).1.contains("\"who\":\"good\""));
         }
         assert_eq!(busy_hits.load(Ordering::Relaxed), 5, "a usage limit never opens the breaker");
+    }
+
+    #[test]
+    fn opencode_free_proxies_to_the_entered_url_without_a_user_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/custom/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let req = read_request(&s).unwrap();
+            assert_eq!(req.path, "/custom/v1/chat/completions");
+            assert_eq!(req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str()), Some("Bearer public"));
+            assert!(!req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-api-key")));
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["model"], "big-pickle");
+            assert!(body["messages"][0]["content"].as_str().unwrap().starts_with("You are an AI agent running in OpenCode"));
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").unwrap();
+        });
+        let up = Upstream::OpenAi { name: "OpenCode Free".into(), url, key: "must-not-leak".into(), free: true, egress: Some(Default::default()) };
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![route("sonnet", &["m@sonnet"], up, "big-pickle")], PathBuf::new()).unwrap();
+        let (status, body) = post(&proxy, &proxy.token, &json!({ "model": "m@sonnet", "messages": [{ "role": "user", "content": "hi" }] }));
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["content"][0]["text"], "hello");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn opencode_free_quota_is_returned_instead_of_silently_held() {
+        let up = Upstream::OpenAi { name: "OpenCode Free".into(), url: fake_endpoint(429, "blocked"), key: String::new(), free: true, egress: Some(Default::default()) };
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), vec![route("haiku", &["m@haiku"], up, "big-pickle")], PathBuf::new()).unwrap();
+        proxy.fail_on_limit.store(false, Ordering::Relaxed);
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(2))).http_status_as_error(false).build().into();
+        let result = agent.post(format!("{}/v1/messages", proxy.url)).header("authorization", format!("Bearer {}", proxy.token))
+            .send(json!({ "model": "m@haiku", "messages": [{ "role": "user", "content": "hi" }] }).to_string());
+        assert_eq!(result.expect("a free-provider refusal must not be silently held").status().as_u16(), 429);
+    }
+
+    #[test]
+    fn no_paid_fallback_keeps_opencode_free_but_not_keyed_endpoints() {
+        let ai = |free| Upstream::OpenAi { name: "Free".into(), url: "http://localhost/v1".into(), key: String::new(), free, egress: free.then(Default::default) };
+        let chain = vec![(Upstream::Antigravity, "first".into()), (ai(true), "big-pickle".into()), (ai(false), "paid".into())];
+        let tries = pick_tries(chain, true, true, &breaker::Breaker::default());
+        assert_eq!(tries.len(), 2);
+        assert!(matches!(&tries[1].0, Upstream::OpenAi { free: true, .. }));
     }
 
     #[test]
@@ -2162,8 +2305,7 @@ HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
         assert_eq!(requests.len(), 1);
         let sent = &requests[0];
         assert_eq!(sent["model"], "qwen2.5-coder:32b");
-        assert_eq!(sent["options"]["num_ctx"], 65536, "Ollama num_ctx configured");
-        assert_eq!(sent["keep_alive"], "30m");
+        assert!(sent["options"].get("num_ctx").is_none() && sent.get("keep_alive").is_none(), "cloud models keep their own context");
         assert_eq!(sent["messages"][0]["role"], "user");
         assert_eq!(sent["messages"][0]["content"], "hi");
     }
@@ -2204,76 +2346,85 @@ HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
     }
 
     #[test]
-    #[ignore = "uses the real Claude CLI and signed-in Muse account"]
-    fn live_claude_code_muse_greeting_and_tool_search() {
-        let dir = std::env::temp_dir().join(format!("ccat-muse-cli-{}", common::random_hex(8)));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::create_dir(dir.join(".claude")).unwrap();
-        std::fs::write(dir.join(".claude/settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}"#).unwrap();
-        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &[]), vec![route("haiku", &["claude-haiku-5-5"], Upstream::MuseAI { url: crate::museai::DEFAULT_URL.into(), key: String::new() }, "muse-chat")], dir.clone()).unwrap();
-        let mut settings = crate::claude_settings(&serde_json::Map::new(), &[("ANTHROPIC_BASE_URL", proxy.url.clone())]);
-        settings["env"]["ENABLE_TOOL_SEARCH"] = json!("true");
-        let mut cmd = std::process::Command::new("claude");
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("CLAUDE") || name.starts_with("ANTHROPIC") { cmd.env_remove(key); }
-        }
-        let out = cmd.current_dir(&dir)
-            .args(["-p", "Call the client tool ToolSearch with arguments {\"query\":\"select:WebSearch\",\"max_results\":1}. For this first step reply ONLY with the JSON tool_calls object. After the client returns the actual tool result, reply with exactly CCAT_TOOL_SEARCH_OK. Do not perform a web search.", "--model", "claude-haiku-5-5", "--output-format", "json", "--no-session-persistence", "--setting-sources", "project", "--settings"])
-            .arg(settings.to_string()).args(["--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"])
-            .env("ANTHROPIC_BASE_URL", &proxy.url).env("ANTHROPIC_CUSTOM_HEADERS", format!("x-ccat-token: {}", proxy.token))
-            .env("API_TIMEOUT_MS", "60000").output().expect("claude on PATH");
-        std::fs::remove_dir_all(&dir).unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let result: Value = serde_json::from_str(stdout.lines().rfind(|line| line.starts_with('{')).unwrap_or("{}")).unwrap();
-        assert!(out.status.success() && result["is_error"] == false, "Claude CLI failed: {stdout} {}", String::from_utf8_lossy(&out.stderr));
-        assert!(result["result"].as_str().unwrap_or("").contains("CCAT_TOOL_SEARCH_OK"), "Claude CLI must receive Muse's answer: {stdout}");
-        assert!(result["num_turns"].as_u64().unwrap_or(0) >= 2, "ToolSearch must complete a client-tool follow-up: {stdout}");
-    }
-
-    #[test]
-    fn muse_proxy_end_to_end() {
+    fn openai_endpoint_end_to_end() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
         let log = seen.clone();
-
         std::thread::spawn(move || {
             for mut s in listener.incoming().flatten() {
                 let req = read_request(&s).unwrap();
-                let body: Value = serde_json::from_slice(&req.body).unwrap();
-                log.lock().unwrap().push(body);
-                let text = "\
-HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
-data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello from MuseAI\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":6}}\n\
-data: [DONE]\n\n";
-                let _ = s.write_all(text.as_bytes());
+                let auth = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.clone()).unwrap_or_default();
+                log.lock().unwrap().push((req.path.clone(), auth, serde_json::from_slice(&req.body).unwrap()));
+                let reply = if req.path.ends_with("/chat/completions") && log.lock().unwrap().len() == 1 {
+                    let events = [
+                        r#"{"choices":[{"delta":{"reasoning_content":"plan"}}]}"#,
+                        r#"{"choices":[{"delta":{"content":"Hello from NIM"}}]}"#,
+                        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Read","arguments":"{\"path\":"}}]}}]}"#,
+                        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                        r#"{"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":7}}"#,
+                        "[DONE]",
+                    ];
+                    let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}")
+                } else {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+                };
+                let _ = s.write_all(reply.as_bytes());
             }
         });
+        let routes = vec![Route {
+            tier: "sonnet",
+            names: vec!["claude-sonnet-5-5".into()],
+            upstream: Upstream::OpenAi { name: "NIM".into(), url: url.clone(), key: "nvapi-k".into(), free: false, egress: None },
+            model: "meta/llama".into(),
+            fallbacks: Vec::new(),
+        }];
+        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
+        let req = json!({ "model": "claude-sonnet-5-5", "max_tokens": 64000, "messages": [{ "role": "user", "content": "hi" }], "stream": false });
+        let (status, body) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 200, "{body}");
+        let msg: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["stop_reason"], "tool_use");
+        assert!(msg["content"].as_array().unwrap().iter().any(|b| b["type"] == "text" && b["text"] == "Hello from NIM"));
+        assert!(msg["content"].as_array().unwrap().iter().any(|b| b["type"] == "tool_use" && b["input"]["path"] == "a.txt"), "{body}");
+        assert_eq!((msg["usage"]["input_tokens"].as_u64(), msg["usage"]["output_tokens"].as_u64()), (Some(30), Some(7)));
+        {
+            let seen = seen.lock().unwrap();
+            let (path, auth, sent) = &seen[0];
+            assert_eq!((path.as_str(), auth.as_str()), ("/v1/chat/completions", "Bearer nvapi-k"));
+            assert_eq!((sent["model"].as_str(), sent["stream"].as_bool(), sent.get("max_tokens")), (Some("meta/llama"), Some(true), None));
+        }
+        // An upstream failure reaches Claude Code with its status (a 429 is held instead, see `a_held_request_…`).
+        let (status, _) = post(&proxy, &proxy.token, &req);
+        assert_eq!(status, 503);
+    }
+
+    #[test]
+    fn routes_to_gemini_web() {
+        let root = std::env::temp_dir().join(format!("ccat_test_gw_route_{}", common::random_hex(6)));
+        let _ = std::fs::create_dir_all(&root);
+        let acc = crate::providers::gemini_web::store::Account {
+            id: "gw-test-acc".into(),
+            name: "GW Test".into(),
+            port: 0,
+            enabled: true,
+            profile: "profiles/gw-test".into(),
+            request_count: 0,
+            error_count: 0,
+            extra: Default::default(),
+        };
+        crate::providers::gemini_web::store::save_in(&root, &[acc]).unwrap();
 
         let routes = vec![Route {
             tier: "sonnet",
             names: vec!["claude-sonnet-5-5".into()],
-            upstream: Upstream::MuseAI { url: url.clone(), key: String::new() },
-            model: "muse-chat".into(),
+            upstream: Upstream::GeminiWeb,
+            model: "gemini-4-argon".into(),
             fallbacks: Vec::new(),
         }];
-        let proxy = serve_with(Pool::fake("http://127.0.0.1:1", &["a"]), chatgpt::Pool::fake("http://127.0.0.1:1", &[]), routes, PathBuf::new()).unwrap();
-        let req = json!({
-            "model": "claude-sonnet-5-5",
-            "messages": [{ "role": "user", "content": "hello muse" }],
-            "stream": true
-        });
-        let (status, body) = post(&proxy, &proxy.token, &req);
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("Hello from MuseAI"));
-        assert!(body.contains("message_stop"));
-
-        let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let sent = &requests[0];
-        assert_eq!(sent["model"], "muse-chat");
-        assert_eq!(sent["messages"][0]["role"], "user");
-        assert_eq!(sent["messages"][0]["content"], "hello muse");
+        let proxy = serve_pool(Pool::fake("http://127.0.0.1:1", &["a"]), routes, PathBuf::new()).unwrap();
+        assert!(matches!(proxy.ctx.resolve("claude-sonnet-5-5").0, Upstream::GeminiWeb));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -19,9 +19,11 @@ pub(super) enum Glyph {
     Antigravity,
     ChatGpt,
     Ollama,
-    Muse,
+    GeminiWeb,
     Link,
     Plus,
+    Terminal,
+    Cloud,
 }
 
 /// Draws `glyph` centred on `c`.
@@ -69,6 +71,18 @@ pub(super) fn paint(pt: &egui::Painter, c: Pos2, glyph: Glyph, color: Color32) {
             line((0.0, 3.0), (0.0, 6.5));
             line((-3.5, 6.5), (3.5, 6.5));
         }
+        Glyph::Terminal => {
+            pt.rect_stroke(egui::Rect::from_min_max(at(-7.5, -6.0), at(7.5, 6.0)), 1.5, s, egui::StrokeKind::Middle);
+            open(&[(-4.0, -2.5), (-1.0, 0.0), (-4.0, 2.5)]);
+            line((1.0, 2.5), (4.5, 2.5));
+        }
+        Glyph::Cloud => {
+            // Three overlapping bumps over a flat base.
+            for (x, y, r) in [(-3.5, 0.5, 3.5), (0.5, -2.0, 4.5), (4.5, 1.0, 3.0)] {
+                pt.circle_stroke(at(x, y), r, s);
+            }
+            line((-6.5, 4.0), (7.0, 4.0));
+        }
         Glyph::Info => {
             pt.circle_stroke(c, 7.0, s);
             pt.circle_filled(at(0.0, -3.0), 1.0, color);
@@ -114,7 +128,9 @@ pub(super) fn paint(pt: &egui::Painter, c: Pos2, glyph: Glyph, color: Color32) {
                 pt.circle_filled(at(3.5, y + 3.0), 1.0, color);
             }
         }
-        Glyph::Muse => poly(&[(1.5, -8.0), (-5.0, 1.0), (-0.5, 1.0), (-1.5, 8.0), (5.0, -1.5), (0.5, -1.5)]),
+        Glyph::GeminiWeb => {
+            poly(&[(0.0, -7.5), (2.0, -2.0), (7.5, 0.0), (2.0, 2.0), (0.0, 7.5), (-2.0, 2.0), (-7.5, 0.0), (-2.0, -2.0)]);
+        }
         Glyph::Link => {
             pt.circle_stroke(c, 7.0, s);
             line((-7.0, 0.0), (7.0, 0.0));
@@ -153,7 +169,6 @@ pub(super) fn art(glyph: Glyph) -> Option<Art> {
         Glyph::Antigravity => art!("google-antigravity.png", false),
         Glyph::ChatGpt => art!("openai-chatgpt.png", true),
         Glyph::Ollama => art!("ollama-dark.png", true),
-        Glyph::Muse => art!("Muse-logo.png", false),
         _ => None,
     }
 }

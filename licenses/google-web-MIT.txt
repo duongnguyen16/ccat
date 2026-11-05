@@ -1,10 +1,12 @@
-# Third-party notices
+Gemini Web protocol port
 
-The MuseAI wire protocol implementation in `src/museai/native.rs` is adapted from [nikships/muse-cli](https://github.com/nikships/muse-cli).
+The native Gemini Web provider includes code ported from the
+Argon Local gemini-web-to-agy / gemini-web-to-api bridge source supplied
+with Argon-Local-MCP-v1.1.0.
 
 MIT License
 
-Copyright (c) 2026 Nik Ships
+Copyright (c) 2025 Nguyễn Tuấn Thành
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
