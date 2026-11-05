@@ -232,7 +232,21 @@ pub fn local_date(t: u64) -> (i64, i64, i64) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn local_date(t: u64) -> (i64, i64, i64) {
+    let sec = (t.min(i64::MAX as u64)) as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    unsafe {
+        if libc::localtime_r(&sec, tm.as_mut_ptr()).is_null() {
+            civil_from_days((t / 86_400) as i64)
+        } else {
+            let tm = tm.assume_init();
+            ((tm.tm_year + 1900) as i64, (tm.tm_mon + 1) as i64, tm.tm_mday as i64)
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn local_date(t: u64) -> (i64, i64, i64) {
     civil_from_days((t / 86_400) as i64)
 }
@@ -256,7 +270,21 @@ pub fn local(t: u64) -> (u16, u16, u16) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn local(t: u64) -> (u16, u16, u16) {
+    let sec = (t.min(i64::MAX as u64)) as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    unsafe {
+        if libc::localtime_r(&sec, tm.as_mut_ptr()).is_null() {
+            utc_parts(t)
+        } else {
+            let tm = tm.assume_init();
+            (tm.tm_wday as u16, tm.tm_hour as u16, tm.tm_min as u16)
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn local(t: u64) -> (u16, u16, u16) {
     utc_parts(t)
 }
@@ -762,6 +790,336 @@ pub fn tooltip(u: &Usage, shown: &[Src], ag: &[Bar]) -> String {
     lines.join("\n").chars().take(127).collect()
 }
 
+// ---------------------------------------------------------------- tray process (macOS)
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use objc2::{class, msg_send, sel};
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::OpenOptionsExt,
+        os::unix::io::AsRawFd,
+        path::PathBuf,
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct NSPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct NSSize {
+        pub width: f64,
+        pub height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct NSRect {
+        pub origin: NSPoint,
+        pub size: NSSize,
+    }
+
+    unsafe impl objc2::Encode for NSPoint {
+        const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGPoint", &[objc2::Encoding::Double, objc2::Encoding::Double]);
+    }
+
+    unsafe impl objc2::Encode for NSSize {
+        const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGSize", &[objc2::Encoding::Double, objc2::Encoding::Double]);
+    }
+
+    unsafe impl objc2::Encode for NSRect {
+        const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGRect", &[NSPoint::ENCODING, NSSize::ENCODING]);
+    }
+
+    fn lockfile_path() -> PathBuf {
+        crate::config_path().with_file_name("tray.lock")
+    }
+
+    pub fn tray_running() -> bool {
+        let path = lockfile_path();
+        if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) {
+            let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if res != 0 {
+                return true;
+            }
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        false
+    }
+
+    pub fn claim() -> Option<File> {
+        let path = lockfile_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if res == 0 {
+            Some(file)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn ns_string(s: &str) -> *mut AnyObject {
+        let cls = class!(NSString);
+        msg_send![cls, stringWithBytes: s.as_ptr(), length: s.len(), encoding: 4usize]
+    }
+
+    unsafe fn create_ns_image(pixels: &[u8], size: u32) -> *mut AnyObject {
+        let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), alloc];
+        let mut planes = [pixels.as_ptr()];
+        let rep: *mut AnyObject = msg_send![
+            rep,
+            initWithBitmapDataPlanes: planes.as_mut_ptr(),
+            pixelsWide: size as isize,
+            pixelsHigh: size as isize,
+            bitsPerSample: 8isize,
+            samplesPerPixel: 4isize,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: ns_string("NSDeviceRGBColorSpace"),
+            bytesPerRow: (size * 4) as isize,
+            bitsPerPixel: 32isize
+        ];
+        if rep.is_null() {
+            return std::ptr::null_mut();
+        }
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let pt = (size / 2) as f64;
+        let image: *mut AnyObject = msg_send![image, initWithSize: NSSize { width: pt, height: pt }];
+        let _: () = msg_send![image, addRepresentation: rep];
+        image
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        menu: None,
+        status_item: None,
+    });
+
+    struct State {
+        menu: Option<*mut AnyObject>,
+        status_item: Option<*mut AnyObject>,
+    }
+    unsafe impl Send for State {}
+
+    unsafe extern "C" fn status_item_clicked(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let event: *mut AnyObject = msg_send![app, currentEvent];
+        let event_type: usize = if !event.is_null() { msg_send![event, type] } else { 0 };
+        let modifier_flags: usize = if !event.is_null() { msg_send![event, modifierFlags] } else { 0 };
+
+        let is_right_click = event_type == 3 || (modifier_flags & 0x0004_0000) != 0;
+
+        if is_right_click {
+            let guard = STATE.lock().unwrap();
+            if let (Some(menu), Some(item)) = (guard.menu, guard.status_item) {
+                let _: () = msg_send![item, popUpStatusItemMenu: menu];
+            }
+        } else {
+            let window: *mut AnyObject = msg_send![sender, window];
+            let frame: NSRect = msg_send![sender, frame];
+            let screen_frame: NSRect = if !window.is_null() {
+                msg_send![window, convertRectToScreen: frame]
+            } else {
+                frame
+            };
+            let screen: *mut AnyObject = if !window.is_null() {
+                msg_send![window, screen]
+            } else {
+                msg_send![class!(NSScreen), mainScreen]
+            };
+            let screen_rect: NSRect = if !screen.is_null() {
+                msg_send![screen, frame]
+            } else {
+                NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 1920.0, height: 1080.0 } }
+            };
+
+            let click_x = screen_frame.origin.x + screen_frame.size.width / 2.0;
+            let click_y_from_top = (screen_rect.size.height - screen_frame.origin.y).max(24.0);
+
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe)
+                    .args([POPUP_FLAG, &click_x.to_string(), &click_y_from_top.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+    }
+
+    unsafe extern "C" fn menu_settings(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+        crate::settings::open_settings();
+    }
+
+    unsafe extern "C" fn menu_reload(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+        reload_all();
+    }
+
+    unsafe extern "C" fn menu_restart(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg(TRAY_FLAG)
+                .env(RESTART_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        std::process::exit(0);
+    }
+
+    unsafe extern "C" fn menu_quit(_this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+        std::process::exit(0);
+    }
+
+    unsafe extern "C" fn timer_tick(_this: *mut AnyObject, _cmd: Sel, _timer: *mut AnyObject) {
+        let guard = STATE.lock().unwrap();
+        if let Some(status_item) = guard.status_item {
+            let button: *mut AnyObject = msg_send![status_item, button];
+            if !button.is_null() {
+                update_button(button);
+            }
+        }
+    }
+
+    unsafe fn update_button(button: *mut AnyObject) {
+        let u = load_usage();
+        let cfg = read_config();
+        let accounts: Vec<antigravity::Account> = cfg.providers.iter().filter(|p| p.antigravity).flat_map(|p| p.accounts.clone()).collect();
+        let ag = ag_view(&u, &accounts, &cfg.usage_view, &cfg.ag_group);
+        let src = shown(&cfg, cfg.tray_mode, [claude_set_up(), u.chatgpt_on && (!u.chatgpt.bars.is_empty() || !u.chatgpt.error.is_empty() || u.chatgpt.fetched == 0), !ag.is_empty(), ollama_active(&cfg), gemini_web_active(&cfg)]);
+
+        let size = 36u32;
+        let pixels = icon_pixels(size, &icon_dials(&u, &src, &ag), false, now());
+        let image = create_ns_image(&pixels, size);
+        if !image.is_null() {
+            let _: () = msg_send![button, setImage: image];
+        }
+        let tip = tooltip(&u, &src, &ag);
+        let _: () = msg_send![button, setToolTip: ns_string(&tip)];
+    }
+
+    fn register_handler_class() -> &'static AnyClass {
+        extern "C" {
+            fn objc_allocateClassPair(superclass: *const AnyClass, name: *const std::ffi::c_char, extra_bytes: usize) -> *mut AnyClass;
+            fn class_addMethod(cls: *mut AnyClass, name: Sel, imp: *const std::ffi::c_void, types: *const std::ffi::c_char) -> bool;
+            fn objc_registerClassPair(cls: *mut AnyClass);
+        }
+
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        const CLASS_NAME: &[u8] = b"CcatStatusItemHandler\0";
+
+        REGISTER.call_once(|| unsafe {
+            let superclass = class!(NSObject);
+            let cls = objc_allocateClassPair(superclass as *const _, CLASS_NAME.as_ptr() as *const _, 0);
+            if !cls.is_null() {
+                class_addMethod(cls, sel!(statusItemClicked:), status_item_clicked as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                class_addMethod(cls, sel!(menuSettings:), menu_settings as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                class_addMethod(cls, sel!(menuReload:), menu_reload as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                class_addMethod(cls, sel!(menuRestart:), menu_restart as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                class_addMethod(cls, sel!(menuQuit:), menu_quit as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                class_addMethod(cls, sel!(timerTick:), timer_tick as *const () as *const _, b"v@:@\0".as_ptr() as *const _);
+                objc_registerClassPair(cls);
+            }
+        });
+
+        AnyClass::get("CcatStatusItemHandler").expect("CcatStatusItemHandler registered")
+    }
+
+    pub fn run_tray() {
+        let restarted = std::env::var_os(RESTART_ENV).is_some();
+        let until = Instant::now() + Duration::from_secs(10);
+        let _lock = loop {
+            if let Some(f) = claim() {
+                break f;
+            }
+            if !restarted || Instant::now() > until {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        crate::gateway::spawn();
+        std::thread::spawn(|| loop {
+            refresh(false, false, false, false, false);
+            std::thread::sleep(Duration::from_secs(15));
+        });
+
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: bool = msg_send![app, setActivationPolicy: 1isize];
+
+            let handler_cls = register_handler_class();
+            let handler: *mut AnyObject = msg_send![handler_cls, alloc];
+            let handler: *mut AnyObject = msg_send![handler, init];
+
+            let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
+            let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: -1.0f64];
+
+            let button: *mut AnyObject = msg_send![status_item, button];
+            if !button.is_null() {
+                let _: () = msg_send![button, setTarget: handler];
+                let _: () = msg_send![button, setAction: sel!(statusItemClicked:)];
+                let _: () = msg_send![button, sendActionOn: (1usize << 2) | (1usize << 3)];
+                update_button(button);
+            }
+
+            let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+            let menu: *mut AnyObject = msg_send![menu, initWithTitle: ns_string("ccat")];
+
+            let add_item = |title: &str, action: Sel, key: &str| {
+                let item: *mut AnyObject = msg_send![
+                    menu,
+                    addItemWithTitle: ns_string(title),
+                    action: action,
+                    keyEquivalent: ns_string(key)
+                ];
+                let _: () = msg_send![item, setTarget: handler];
+            };
+
+            add_item("Settings", sel!(menuSettings:), ",");
+            add_item("Reload", sel!(menuReload:), "r");
+            add_item("Restart", sel!(menuRestart:), "");
+            let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+            let _: () = msg_send![menu, addItem: sep];
+            add_item("Quit ccat", sel!(menuQuit:), "q");
+
+            {
+                let mut guard = STATE.lock().unwrap();
+                guard.menu = Some(menu);
+                guard.status_item = Some(status_item);
+            }
+
+            let _: *mut AnyObject = msg_send![
+                class!(NSTimer),
+                scheduledTimerWithTimeInterval: 3.0f64,
+                target: handler,
+                selector: sel!(timerTick:),
+                userInfo: std::ptr::null_mut::<AnyObject>(),
+                repeats: true
+            ];
+
+            let _: () = msg_send![app, run];
+        }
+    }
+}
+
 // ---------------------------------------------------------------- tray process (Windows)
 
 #[cfg(windows)]
@@ -938,6 +1296,22 @@ pub fn ensure_tray() {
                 .spawn();
         }
     }
+    #[cfg(target_os = "macos")]
+    if !macos::tray_running() {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg(TRAY_FLAG)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_tray() {
+    macos::run_tray();
 }
 
 /// The tray helper: one per user session (a named mutex), gone a little after the last ccat closes.
@@ -1201,7 +1575,14 @@ fn anchor(click: (f64, f64)) -> (f32, f32, f32) {
         let bottom = (click.1 as f32).min(wa.bottom as f32 - 8.0);
         (x / scale, bottom / scale, (wa.top as f32 + 8.0) / scale)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let x = (click.0 as f32 - POPUP_W / 2.0).max(10.0);
+        let top = (click.1 as f32).max(24.0) + 4.0;
+        let bottom = top + 800.0;
+        (x, bottom, top)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = click;
         (100.0, 700.0, 0.0)
@@ -2796,6 +3177,9 @@ impl eframe::App for Popup {
                 self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
                 ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(POPUP_W, h)));
             }
+            #[cfg(target_os = "macos")]
+            let want = egui::pos2(self.anchor.0, self.anchor.2);
+            #[cfg(not(target_os = "macos"))]
             let want = egui::pos2(self.anchor.0, (self.anchor.1 - h).max(self.anchor.2));
             if ui.input(|i| i.viewport().outer_rect).is_some_and(|o| (o.min - want).length() > 1.0) {
                 self.ignore_focus_until = std::time::Instant::now() + FOCUS_GRACE;
@@ -2872,6 +3256,10 @@ pub fn run_popup(click: (f64, f64)) {
     let anchor = anchor(click);
     // Its real size from the start: the window opens where it ends up.
     let h = height(&sections(&cfg, &usage, claude));
+    #[cfg(target_os = "macos")]
+    let pos = egui::pos2(anchor.0, anchor.2);
+    #[cfg(not(target_os = "macos"))]
+    let pos = egui::pos2(anchor.0, (anchor.1 - h).max(anchor.2));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ccat usages")
@@ -2882,7 +3270,7 @@ pub fn run_popup(click: (f64, f64)) {
             .with_taskbar(false)
             .with_active(true)
             .with_inner_size([POPUP_W, h])
-            .with_position(egui::pos2(anchor.0, (anchor.1 - h).max(anchor.2))),
+            .with_position(pos),
         ..Default::default()
     };
     let _ = eframe::run_native(
@@ -3482,5 +3870,16 @@ mod tests {
         assert!(should_close(true, Some(false), later, later, false), "...and counts again when it ends");
         assert!(!should_close(false, Some(false), t0, later, false), "never focused yet: not a click-away");
         assert!(!should_close(true, Some(true), t0, later, false) && !should_close(true, None, t0, later, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_tray_lock() {
+        assert!(!macos::tray_running());
+        let lock = macos::claim();
+        assert!(lock.is_some());
+        assert!(macos::tray_running());
+        drop(lock);
+        assert!(!macos::tray_running());
     }
 }

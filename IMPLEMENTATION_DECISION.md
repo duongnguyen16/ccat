@@ -218,3 +218,11 @@
 - **Chosen:** B (confidence ~99%)
 - **Why:** Excludes local .commandcode preferences, ask.py, downloaded executables and non-bundled proprietary fonts. These are not app build inputs; existing bundled font/ assets remain unchanged.
 - **Revert if:** A currently excluded file becomes a reviewed, licensed runtime or build dependency.
+
+### [2026-11-06 03:15] Official macOS support
+- **Context:** ccat had Windows-specific assumptions in OpenCode/Bun discovery, browser detection, terminal launching, and statusline scripts.
+- **Options:** A keep Windows-only and leave macOS untested / B official macOS support with native browser/runtime discovery, AppleScript terminal dispatch, libc localtime, and a cross-platform statusline script
+- **Chosen:** B (confidence ~95%)
+- **Why:** The core egui UI and in-process proxy engine are already cross-platform. Providing proper macOS path resolution, Terminal.app spawning, and a statusline script brings complete, seamless first-class support to macOS.
+- **Revert if:** Platform-specific maintenance overhead proves unsustainable.
+

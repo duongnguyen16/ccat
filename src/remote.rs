@@ -485,7 +485,15 @@ pub fn open_terminal(m: &Machine, session: &str) -> Result<(), String> {
     };
     #[cfg(windows)]
     let r = Command::new("cmd").args(["/c", "start", &title, "ssh", "-t", "-o", "ServerAliveInterval=30", "-o", &proxy, target, "ccat-term", session]).spawn();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let r = {
+        let script = format!(
+            "tell application \"Terminal\" to do script \"printf '\\\\e]2;{}\\\\a' && ssh -t -o ServerAliveInterval=30 -o {} {} ccat-term {}\"",
+            title, proxy, target, session
+        );
+        Command::new("osascript").args(["-e", &script, "-e", "tell application \"Terminal\" to activate"]).spawn()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
     let r = Command::new("x-terminal-emulator").args(["-T", &title, "-e", "ssh", "-t", "-o", "ServerAliveInterval=30", "-o", &proxy, target, "ccat-term", session]).spawn();
     r.map(|_| ()).map_err(|e| format!("could not open a terminal: {e}"))
 }

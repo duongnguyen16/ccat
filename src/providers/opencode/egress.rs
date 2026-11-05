@@ -194,6 +194,7 @@ static ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SNAPSHOTS: Mutex<Option<HashMap<String, Snapshot>>> = Mutex::new(None);
 
 fn find_runtime() -> (std::path::PathBuf, bool) {
+    #[cfg(windows)]
     if let Ok(appdata) = std::env::var("APPDATA") {
         let base = std::path::PathBuf::from(appdata).join("npm").join("node_modules");
         let candidates = [
@@ -209,11 +210,32 @@ fn find_runtime() -> (std::path::PathBuf, bool) {
             }
         }
     }
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let candidates = [
+            home.join(".opencode/bin/opencode"),
+            home.join(".bun/bin/bun"),
+            home.join(".local/bin/opencode"),
+            home.join(".local/bin/bun"),
+        ];
+        for c in candidates {
+            if c.is_file() {
+                let is_op = c.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("opencode"));
+                return (c, is_op);
+            }
+        }
+    }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let exe = dir.join("opencode.exe");
-            if exe.is_file() {
-                return (exe, true);
+            #[cfg(windows)]
+            let candidates = [("opencode.exe", true), ("bun.exe", false)];
+            #[cfg(not(windows))]
+            let candidates = [("opencode", true), ("bun", false)];
+            for (name, is_op) in candidates {
+                let exe = dir.join(name);
+                if exe.is_file() {
+                    return (exe, is_op);
+                }
             }
         }
     }

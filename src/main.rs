@@ -1724,7 +1724,7 @@ fn main() {
     // (the usage and settings ones are internal: the tray helper and its windows).
     match std::env::args().nth(1).as_deref() {
         Some("--version" | "-V") => return println!("ccat {}", &VERSION[1..]),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         Some(usage::TRAY_FLAG) => return usage::run_tray(),
         Some(usage::POPUP_FLAG) => {
             let at = |i| std::env::args().nth(i).and_then(|x| x.parse().ok()).unwrap_or(f64::MAX);
@@ -2068,7 +2068,29 @@ fn run_claude(l: Launch, cwd: &str) {
         std::thread::sleep(Duration::from_secs(30));
         usage::ensure_tray();
     });
-    let status = build("claude").status().or_else(|_| build("claude.cmd").status());
+    let status = build("claude")
+        .status()
+        .or_else(|_| build("claude.cmd").status())
+        .or_else(|_| {
+            #[cfg(unix)]
+            {
+                let mut candidates = Vec::new();
+                if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                    candidates.push(home.join(".local/bin/claude"));
+                    candidates.push(home.join(".claude/bin/claude"));
+                }
+                candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
+                candidates.push(PathBuf::from("/usr/local/bin/claude"));
+                for c in candidates {
+                    if c.is_file() {
+                        if let Ok(s) = build(&c.to_string_lossy()).status() {
+                            return Ok(s);
+                        }
+                    }
+                }
+            }
+            build("claude").status()
+        });
     match status {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => {

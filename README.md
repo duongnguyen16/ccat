@@ -164,19 +164,9 @@ Claude Code's own login, environment-variable secrets, browser profiles, remote 
 
 ## Install
 
-You need [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`) on your `PATH`. ccat itself is a single `ccat.exe`.
+You need [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`) on your `PATH`. ccat itself is a single native binary (`ccat` on macOS/Linux, `ccat.exe` on Windows).
 
-**winget** (Windows):
-
-```powershell
-winget install duongnguyen16.ccat
-```
-
-> The winget package was submitted to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/pulls?q=duongnguyen16.ccat) and goes live once that review is merged. Until then, use one of the options below.
-
-**Download:** grab `ccat-v<version>-x86_64-windows.zip` from the [latest release](https://github.com/duongnguyen16/ccat/releases/latest), unzip it, and put `ccat.exe` somewhere on your `PATH`. The binary is not code-signed, so Windows SmartScreen may ask you to confirm the first run.
-
-**From source** (needs [Rust](https://rustup.rs)):
+**macOS & Linux** (from source via Cargo):
 
 ```bash
 git clone https://github.com/duongnguyen16/ccat
@@ -184,11 +174,45 @@ cd ccat
 cargo install --path .
 ```
 
+Ensure `~/.cargo/bin` is in your `PATH` (typically added automatically by `rustup`). Verify with `ccat --version`.
+
+**Windows** (winget):
+
+```powershell
+winget install duongnguyen16.ccat
+```
+
+> The winget package was submitted to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs/pulls?q=duongnguyen16.ccat) and goes live once that review is merged. Until then, use one of the options below.
+
+**Download:** grab `ccat-v<version>-x86_64-windows.zip` or the macOS binary from the [latest release](https://github.com/duongnguyen16/ccat/releases/latest), unzip it, and put the binary somewhere on your `PATH`. On Windows, the binary is not code-signed, so Windows SmartScreen may ask you to confirm the first run.
+
 Check it with `ccat --version`. Then run `ccat` in any terminal: add your first provider in **Settings**, pick a folder and press **Launch**.
 
-Developed and used on Windows. The UI (egui) and the proxy are cross-platform, but macOS and Linux are untested.
+Officially supports **macOS** and **Windows**. The UI (egui) and the proxy run natively on both platforms.
 
-### Status line (optional, Windows PowerShell)
+### Status line (optional)
+
+#### macOS / Linux (bash / zsh)
+
+Claude Code, in `~/.claude/settings.json`:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "/path/to/ccat/statusline/quota-statusline.sh"
+}
+```
+
+Antigravity CLI, in `~/.gemini/antigravity-cli/settings.json` (or run `/statusline <command>` inside `agy`):
+
+```json
+"statusLine": {
+  "enabled": true,
+  "command": "/path/to/ccat/statusline/quota-statusline.sh -Agy"
+}
+```
+
+#### Windows (PowerShell)
 
 Claude Code, in `~/.claude/settings.json`:
 

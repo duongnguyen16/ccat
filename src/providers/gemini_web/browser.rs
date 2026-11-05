@@ -26,7 +26,7 @@ pub struct CdpCookie {
 
 // ---------------------------------------------------------------- Browser Discovery & Arguments
 
-/// Searches standard installation locations on Windows for Google Chrome or Microsoft Edge.
+/// Searches standard installation locations for Google Chrome, Microsoft Edge, Brave, or Chromium.
 pub fn find_browser_executable() -> Result<PathBuf, String> {
     if let Ok(env_path) = std::env::var("CCAT_BROWSER_PATH") {
         let p = PathBuf::from(env_path);
@@ -64,7 +64,58 @@ pub fn find_browser_executable() -> Result<PathBuf, String> {
         }
     }
 
-    Err("Neither Google Chrome nor Microsoft Edge could be found. Please ensure one is installed.".into())
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        ];
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            candidates.push(home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"));
+            candidates.push(home.join("Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"));
+            candidates.push(home.join("Applications/Brave Browser.app/Contents/MacOS/Brave Browser"));
+            candidates.push(home.join("Applications/Chromium.app/Contents/MacOS/Chromium"));
+        }
+
+        for path in candidates {
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/brave-browser",
+            "/snap/bin/chromium",
+        ];
+        for path in candidates {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"] {
+                    let exe = dir.join(name);
+                    if exe.is_file() {
+                        return Ok(exe);
+                    }
+                }
+            }
+        }
+    }
+
+    Err("A supported Chromium browser (Chrome, Edge, Brave, or Chromium) could not be found. Please ensure one is installed or set CCAT_BROWSER_PATH.".into())
 }
 
 /// Builds command line arguments for the isolated browser instance.
@@ -559,6 +610,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_browser_executable() {
+        if let Ok(path) = find_browser_executable() {
+            assert!(path.is_file(), "Executable must be an actual file: {}", path.display());
+        }
+    }
 
     #[test]
     fn test_parse_devtools_active_port() {

@@ -21,6 +21,12 @@ jsonschema = { version = "0.60.2", default-features = false }
 tray-icon = { version = "0.26", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_System_JobObjects", "Win32_Security", "Win32_Storage_FileSystem"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+
 [profile.release]
 strip = true
 lto = true
