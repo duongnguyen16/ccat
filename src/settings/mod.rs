@@ -947,10 +947,10 @@ impl Settings {
             ui.add_space(6.0);
         }
 
-        providers::note(ui, "Warning: unencrypted backup contains API keys, OAuth tokens and Gemini cookies; keep private.", p.danger);
+        providers::note(ui, "Warning: unencrypted backup contains API keys and OAuth tokens; keep private.", p.danger);
         ui.add_space(10.0);
 
-        paragraph(ui, "Scope", "Includes app accounts, all named routing profiles, preferences, and cloud machines. Excludes Claude CLI login, environment secrets, browser profiles, and runtime logs or caches.");
+        paragraph(ui, "Scope", "Includes Antigravity, ChatGPT/Codex, Ollama and other non-web providers, named routing profiles, preferences, and cloud machines. Gemini Web accounts, cookies and provider settings are excluded and left untouched on restore, including imports from older backups. Also excludes Claude CLI login, environment secrets, browser profiles, and runtime logs or caches.");
         paragraph(ui, "Sessions", "Close other ccat sessions before restoring; relaunch sessions afterward.");
 
         if let Some(path) = self.pending_import.clone() {

@@ -226,3 +226,10 @@
 - **Why:** The core egui UI and in-process proxy engine are already cross-platform. Providing proper macOS path resolution, Terminal.app spawning, and a statusline script brings complete, seamless first-class support to macOS.
 - **Revert if:** Platform-specific maintenance overhead proves unsustainable.
 
+### [2026-11-06 10:40] Exclude Gemini Web from backup and restore
+- **Context:** Gemini Web browser-profile validation blocked exporting unrelated providers; the user explicitly chose to exclude Gemini Web after pulling the macOS support commit.
+- **Options:** A relax browser-path validation / B exclude Web data, retain support for Antigravity, ChatGPT/Codex, Ollama and other non-web providers
+- **Chosen:** B (user-selected)
+- **Why:** Export never reads Gemini accounts or cookies and removes Gemini provider records from the shared config. Older backups skip Gemini files and provider records; restore retains existing local Gemini provider settings and leaves its files untouched. Existing secure atomic writes, validation and rollback remain shared across Windows and macOS.
+- **Revert if:** The user explicitly requests portable Gemini Web backup support again.
+

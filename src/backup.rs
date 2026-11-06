@@ -1,5 +1,5 @@
-//! Portable, private backups of ccat-owned accounts and preferences (never browser profiles or CLI logins).
-use crate::providers::gemini_web::{self, store};
+//! Portable, private backups of ccat-owned accounts and preferences (excluding Gemini Web and CLI logins).
+use crate::providers::gemini_web::store::write_atomic_secure;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -50,7 +50,7 @@ pub fn export(path: &Path) -> Result<usize, String> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err("Backup exceeds the 32 MiB limit.".into());
     }
-    store::write_atomic_secure(path, &bytes)?;
+    write_atomic_secure(path, &bytes)?;
     Ok(count)
 }
 
@@ -103,12 +103,7 @@ fn safe_name(s: &str) -> bool {
 fn allowed(name: &str) -> bool {
     if matches!(
         name,
-        "config.json"
-            | "machines.json"
-            | "agent-token"
-            | "chatgpt/host-id"
-            | "gemini_web/accounts/accounts.json"
-            | "gemini_web/accounts/settings.json"
+        "config.json" | "machines.json" | "agent-token" | "chatgpt/host-id"
     ) {
         return true;
     }
@@ -117,14 +112,6 @@ fn allowed(name: &str) -> bool {
     }
     if let Some(n) = name.strip_prefix("chatgpt/") {
         return safe_name(n) && n.ends_with(".json");
-    }
-    if let Some(id) = name
-        .strip_prefix("gemini_web/accounts/")
-        .and_then(|s| s.strip_suffix(".cookie"))
-    {
-        return store::validate_id(id).is_ok()
-            && id.trim() == id
-            && safe_name(&format!("{id}.dpapi"));
     }
     false
 }
@@ -178,7 +165,7 @@ fn collect(root: &Path) -> Result<Backup, String> {
     .into_iter()
     .map(String::from)
     .collect();
-    for folder in ["profiles", "chatgpt", "gemini_web/accounts"] {
+    for folder in ["profiles", "chatgpt"] {
         let dir = target(root, folder)?;
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -192,8 +179,7 @@ fn collect(root: &Path) -> Result<Backup, String> {
                 .into_string()
                 .map_err(|_| "A backup filename is not valid Unicode.")?;
             let name = format!("{folder}/{file}");
-            let portable = name.strip_suffix(".dpapi").map(|s| format!("{s}.cookie"));
-            if allowed(&name) || portable.as_deref().is_some_and(allowed) {
+            if allowed(&name) {
                 names.push(name);
             }
         }
@@ -209,30 +195,44 @@ fn collect(root: &Path) -> Result<Backup, String> {
             Ok(m) if !m.is_file() => return Err(format!("Not a regular file: {name}")),
             Ok(_) => {}
         }
-        let (name, text) = if let Some(n) = name.strip_suffix(".dpapi") {
-            let bytes = gemini_web::dpapi_unprotect(&read_bytes(&path)?)?;
-            (
-                format!("{n}.cookie"),
-                String::from_utf8(bytes).map_err(|_| "Invalid Gemini cookie encoding.")?,
-            )
-        } else {
-            (name, read_text(&path)?)
-        };
+        let text = read_text(&path)?;
         size += text.len() as u64;
         if size > MAX_BYTES || backup.files.len() >= MAX_FILES {
             return Err("Too much data for one backup.".into());
         }
         backup.files.insert(name, text);
     }
+    exclude_web(&mut backup)?;
     validate(&backup)?;
     Ok(backup)
+}
+
+/// Old backups may contain Gemini files; ignore them without reading cookies or validating browser paths.
+fn exclude_web(backup: &mut Backup) -> Result<(), String> {
+    backup
+        .files
+        .retain(|name, _| !name.starts_with("gemini_web/"));
+    if let Some(text) = backup.files.get_mut("config.json") {
+        let mut config: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("Invalid config.json: {e}"))?;
+        if let Some(providers) = config
+            .get_mut("providers")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            providers.retain(|p| p["gemini_web"] != true);
+        }
+        *text = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn parse(text: &str) -> Result<Backup, String> {
     if text.len() as u64 > MAX_BYTES {
         return Err("Backup exceeds the 32 MiB limit.".into());
     }
-    let b: Backup = serde_json::from_str(text).map_err(|e| format!("Not a ccat backup: {e}"))?;
+    let mut b: Backup =
+        serde_json::from_str(text).map_err(|e| format!("Not a ccat backup: {e}"))?;
+    exclude_web(&mut b)?;
     validate(&b)?;
     Ok(b)
 }
@@ -280,25 +280,6 @@ fn validate(b: &Backup) -> Result<(), String> {
             } else if name == "machines.json" {
                 let _: Vec<crate::remote::Machine> =
                     serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-            } else if name == "gemini_web/accounts/accounts.json" {
-                let accounts: Vec<store::Account> =
-                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-                for a in accounts {
-                    store::validate_id(&a.id)?;
-                    if !safe_name(&format!("{}.dpapi", a.id)) {
-                        return Err("Unsafe Gemini account ID.".into());
-                    }
-                    store::validate_name(&a.name)?;
-                    if !a.profile.is_empty() {
-                        let profile = store::validate_profile_path(&a.profile)?;
-                        if !profile.components().all(|c| matches!(c, std::path::Component::Normal(n) if n.to_str().is_some_and(safe_name))) {
-                            return Err("Unsafe browser profile path.".into());
-                        }
-                    }
-                }
-            } else if name == "gemini_web/accounts/settings.json" {
-                let _: store::Settings =
-                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
             } else if !value.is_object() {
                 return Err("Expected a JSON object.".into());
             }
@@ -309,26 +290,45 @@ fn validate(b: &Backup) -> Result<(), String> {
     Ok(())
 }
 
-fn restore(root: &Path, backup: Backup) -> Result<usize, String> {
+fn restore(root: &Path, mut backup: Backup) -> Result<usize, String> {
+    exclude_web(&mut backup)?;
     validate(&backup)?;
-    // Prepare and validate everything, including encryption, before touching live files.
+    // Prepare and validate everything before touching live files.
     let mut writes = Vec::new();
     let mut preserved = 0u64;
     for (name, text) in &backup.files {
-        let (name, bytes) = if let Some(n) = name.strip_suffix(".cookie") {
-            (
-                format!("{n}.dpapi"),
-                gemini_web::dpapi_protect(text.as_bytes())?,
-            )
-        } else {
-            (name.clone(), text.as_bytes().to_vec())
-        };
-        let path = target(root, &name)?;
+        let mut bytes = text.as_bytes().to_vec();
+        let path = target(root, name)?;
         let old = match fs::symlink_metadata(&path) {
             Ok(_) => Some(read_bytes(&path).map_err(|e| format!("Cannot preserve {name}: {e}"))?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("Cannot preserve {name}: {e}")),
         };
+        if name == "config.json" {
+            if let Some(local) = &old {
+                let local: serde_json::Value = serde_json::from_slice(local)
+                    .map_err(|e| format!("Cannot preserve local Gemini settings: {e}"))?;
+                let web: Vec<_> = local["providers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["gemini_web"] == true)
+                    .cloned()
+                    .collect();
+                if !web.is_empty() {
+                    let mut config: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    if config.get("providers").is_none() {
+                        config["providers"] = serde_json::json!([]);
+                    }
+                    config["providers"]
+                        .as_array_mut()
+                        .ok_or("Invalid providers list")?
+                        .extend(web);
+                    bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         preserved += old.as_ref().map_or(0, |b| b.len() as u64);
         if preserved > MAX_BYTES {
             return Err(
@@ -340,7 +340,7 @@ fn restore(root: &Path, backup: Backup) -> Result<usize, String> {
     // Config last: sessions see the new account references only once credentials are in place.
     writes.sort_by_key(|(p, _, _)| p == &root.join("config.json"));
     for (i, (path, bytes, _)) in writes.iter().enumerate() {
-        if let Err(e) = store::write_atomic_secure(path, bytes) {
+        if let Err(e) = write_atomic_secure(path, bytes) {
             let mut failures = Vec::new();
             for (p, _, old) in writes[..=i].iter().rev() {
                 // The failed writer may have renamed before its final ACL check; compare rather than assume.
@@ -351,7 +351,7 @@ fn restore(root: &Path, backup: Backup) -> Result<usize, String> {
                     continue;
                 }
                 let result = match old {
-                    Some(b) => store::write_atomic_secure(p, b),
+                    Some(b) => write_atomic_secure(p, b),
                     None => match fs::remove_file(p) {
                         Ok(()) => Ok(()),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -389,12 +389,12 @@ mod tests {
         fs::write(p, text).unwrap();
     }
     #[test]
-    fn round_trip_accounts_profiles_preferences_and_portable_cookies() {
+    fn round_trip_other_providers_ignores_web_and_preserves_local_web() {
         let (src, dst) = (dir(), dir());
         put(
             &src,
             "config.json",
-            r#"{"bypass":true,"providers":[{"name":"Example","key":"test-only-key"}],"future_preference":42}"#,
+            r#"{"bypass":true,"providers":[{"name":"Antigravity","antigravity":true,"accounts":[{"email":"test@example.invalid","refresh":"test-refresh"}]},{"name":"ChatGPT","chatgpt":true},{"name":"Ollama","ollama":true,"key":"test-ollama-key"},{"name":"Example","key":"test-only-key"},{"name":"Gemini Web","gemini_web":true,"key":"must-not-export"}],"future_preference":42}"#,
         );
         put(&src, "profiles/Work.json", r#"{"tiers":[{},{},{},{}]}"#);
         put(&src, "machines.json", "[]");
@@ -404,29 +404,66 @@ mod tests {
         put(
             &src,
             "gemini_web/accounts/accounts.json",
-            r#"[{"id":"one","name":"Test","profile":"one"}]"#,
+            r#"[{"id":"one","name":"Test","profile":".gemini_profiles\\\\existing"}]"#,
         );
         put(&src, "gemini_web/accounts/settings.json", "{}");
-        store::save_cookie_in(&src.join("gemini_web"), "one", "test-only-cookie").unwrap();
+        put(
+            &src,
+            "gemini_web/accounts/one.dpapi",
+            "not-even-a-valid-cookie",
+        );
+        put(
+            &dst,
+            "config.json",
+            r#"{"providers":[{"name":"Local Gemini","gemini_web":true,"models":["keep-local-model"]}]}"#,
+        );
+        put(
+            &dst,
+            "gemini_web/accounts/accounts.json",
+            "leave-local-web-alone",
+        );
         put(&src, "usage.json", "{}");
         put(&src, "chatgpt/account.lock", "locked");
         put(&src, "gemini_web/profiles/one/secret", "browser-data");
         put(&dst, "profiles/Keep.json", r#"{"tiers":[{},{},{},{}]}"#);
-        let backup = collect(&src).unwrap();
-        assert_eq!(backup.files.len(), 9);
-        assert_eq!(
-            backup.files["gemini_web/accounts/one.cookie"],
-            "test-only-cookie"
+        let mut backup = collect(&src).unwrap();
+        assert_eq!(backup.files.len(), 6);
+        assert!(backup
+            .files
+            .keys()
+            .all(|name| !name.starts_with("gemini_web/")));
+        assert!(!backup.files["config.json"].contains("must-not-export"));
+        // Earlier backups may contain invalid browser paths or cookies from another Windows user.
+        backup.files.insert(
+            "gemini_web/accounts/accounts.json".into(),
+            "invalid-web-json".into(),
+        );
+        backup.files.insert(
+            "gemini_web/accounts/one.cookie".into(),
+            "must-not-import".into(),
         );
         let text = serde_json::to_string(&backup).unwrap();
-        assert_eq!(restore(&dst, parse(&text).unwrap()).unwrap(), 9);
+        assert_eq!(restore(&dst, parse(&text).unwrap()).unwrap(), 6);
+        let restored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dst.join("config.json")).unwrap()).unwrap();
+        assert_eq!(restored["bypass"], true);
+        assert_eq!(restored["future_preference"], 42);
         assert_eq!(
-            fs::read_to_string(dst.join("config.json")).unwrap(),
-            fs::read_to_string(src.join("config.json")).unwrap()
+            restored["providers"][0]["accounts"][0]["refresh"],
+            "test-refresh"
+        );
+        assert_eq!(restored["providers"][1]["chatgpt"], true);
+        assert_eq!(restored["providers"][2]["key"], "test-ollama-key");
+        assert_eq!(restored["providers"][3]["key"], "test-only-key");
+        assert_eq!(restored["providers"][4]["name"], "Local Gemini");
+        assert_eq!(restored["providers"][4]["models"][0], "keep-local-model");
+        assert_eq!(
+            fs::read_to_string(dst.join("gemini_web/accounts/accounts.json")).unwrap(),
+            "leave-local-web-alone"
         );
         assert_eq!(
-            store::cookie_in(&dst.join("gemini_web"), "one").unwrap(),
-            "test-only-cookie"
+            fs::read_to_string(dst.join("chatgpt/account.json")).unwrap(),
+            "{}"
         );
         assert!(dst.join("profiles/Keep.json").exists());
         assert!(!dst.join("usage.json").exists());
@@ -452,9 +489,8 @@ mod tests {
             "profiles/CON.json",
             "profiles/A.json:stream",
             "chatgpt/a.lock",
-            "gemini_web/accounts/a.dpapi",
-            "gemini_web/accounts/NUL.cookie",
-            "gemini_web/accounts/CON.cookie",
+            "unknown/accounts.json",
+            "chatgpt/NUL.json",
         ] {
             let mut files = BTreeMap::from([("config.json".into(), "{}".into())]);
             files.insert(name.into(), "{}".into());

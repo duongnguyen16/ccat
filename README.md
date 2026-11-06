@@ -156,7 +156,7 @@ Claude Code's `ENABLE_TOOL_SEARCH=true` loads tools on demand. ccat resolves dis
 
 ## Backup & restore
 
-Open **Settings → Backup & restore** on **This PC** to export or import a full ccat backup. It includes all ccat-managed provider accounts and credentials, API keys, named routing configurations, cloud machine connections, gateway settings, and app preferences. Gemini cookies are decrypted for transfer and encrypted again for the destination Windows user.
+Open **Settings → Backup & restore** on **This PC** to export or import a ccat backup. It includes Antigravity, ChatGPT/Codex, Ollama and other non-web provider accounts and credentials, API keys, named routing configurations, cloud machine connections, gateway settings, and app preferences. **Gemini Web is excluded:** its accounts, cookies, browser profiles and provider settings are neither exported nor restored. Older backups containing Gemini Web data are accepted with those entries skipped; existing local Gemini Web data and provider settings remain unchanged.
 
 **Backups are unencrypted and contain login secrets. Keep them private; never commit or share them.** Import validates the entire backup before writing, asks for confirmation, replaces matching saved files, and leaves unrelated local files in place. Close other ccat sessions before restoring and relaunch them afterward. A failed restore attempts to roll back every file it touched and reports any rollback failure.
 
