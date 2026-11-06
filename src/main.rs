@@ -699,6 +699,16 @@ fn visuals(p: &Pal, dark: bool) -> egui::Visuals {
 }
 
 fn setup(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc2::{class, msg_send};
+        use objc2::runtime::AnyObject;
+        let defs: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let cls = class!(NSString);
+        let key: *mut AnyObject = msg_send![cls, stringWithUTF8String: b"NSAutomaticCustomizeTouchBarMenuItemEnabled\0".as_ptr()];
+        let _: () = msg_send![defs, setBool: false, forKey: key];
+    }
+
     // Bundled Console fonts (font/, latin subset) first; Windows fonts back them up for other scripts.
     let mut fonts = FontDefinitions::default();
     let dir = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into())).join("Fonts");
@@ -1287,13 +1297,21 @@ impl App {
         ui.horizontal(|ui| {
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             if ui.add_sized([width, 30.0], egui::Button::new("Cancel").fill(p.hover).stroke(Stroke::NONE).corner_radius(6)).clicked() {
-                ui.send_viewport_cmd(ViewportCommand::Close);
+                self.cancel();
             }
             let launch = egui::Button::new(RichText::new("Launch").strong().color(LIGHT.fg)).fill(Color32::WHITE).stroke(Stroke::NONE).corner_radius(6);
             if ui.add_sized([width, 30.0], launch).clicked() {
                 self.launch(ui);
             }
         });
+    }
+
+    fn cancel(&mut self) {
+        profiles::sync(&profiles::dir(), &self.cfg);
+        if let Err(e) = save(&self.cfg, &self.loaded) {
+            eprintln!("ccat: could not save settings: {e}");
+        }
+        std::process::exit(0);
     }
 
 }
@@ -1343,7 +1361,7 @@ impl eframe::App for App {
             }
         }
         if !self.profile.active() && ui.input(|i| i.key_pressed(Key::Escape)) {
-            ui.send_viewport_cmd(ViewportCommand::Close);
+            self.cancel();
         }
         window(ui, |ui| self.launch_tab(ui, frame));
         let typing = ui.ctx().egui_wants_keyboard_input();

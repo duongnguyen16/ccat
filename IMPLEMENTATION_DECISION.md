@@ -226,3 +226,11 @@
 - **Why:** The core egui UI and in-process proxy engine are already cross-platform. Providing proper macOS path resolution, Terminal.app spawning, and a statusline script brings complete, seamless first-class support to macOS.
 - **Revert if:** Platform-specific maintenance overhead proves unsustainable.
 
+### [2026-11-06 03:40] Clean launcher cancellation on macOS
+- **Context:** Clicking "Cancel" or pressing Escape in the launcher on macOS caused an unhandled TouchBar KVO exception (`_NSTouchBarFinderObservation`) during animated window teardown.
+- **Options:** A keep ViewportCommand::Close and let window teardown race / B App::cancel() saves settings and exits cleanly via std::process::exit(0), plus disable TouchBar customization
+- **Chosen:** B (confidence ~98%)
+- **Why:** The sole intent of "Cancel" or Escape in the launcher CLI is to abort and return immediately to the terminal; saving state and exiting directly avoids AppKit display-cycle teardown crashes.
+- **Revert if:** The launcher is embedded inside another persistent window rather than running as a standalone launcher process.
+
+
